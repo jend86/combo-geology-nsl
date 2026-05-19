@@ -1,0 +1,43 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+*.lock
+.env
+
+data/
+code/
+
+# llama.cpp binary
+.llama/
+
+# unsloth artifacts
+unsloth_compiled_cache/
+models/
+
+# wandb artifacts
+wandb/*
+
+# Model cache
+.model-cache/
+
+# Runtime logs (vLLM container dumps, etc.)
+logs/
+
+# Forked-exploit Foundry RPC caches — regenerable via
+# scripts/warm_rpc_cache.py (~5 min per variation). Staged into the
+# anvil image at build time. Keep the dirs, ignore contents.
+tasks/forked_exploit_variations/*/rpc_cache/
+docker/forked-exploit-compose/staging/rpc_caches/*
+!docker/forked-exploit-compose/staging/rpc_caches/.gitkeep
+docker/forked-exploit-compose/data/rpc-cache/
+# Shared rpc-cache sqlite bound into every slot's rpc-cache-service; see
+# RPC_CACHE_HOST_DIR in docker/forked-exploit-compose/.env.
+data/rpc-cache/

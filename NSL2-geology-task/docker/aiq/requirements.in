@@ -1,0 +1,6 @@
+nvidia-nat-core
+nvidia-nat-langchain
+nvidia-nat-mcp
+langchain-openai
+omegaconf
+loguru

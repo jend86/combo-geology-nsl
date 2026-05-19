@@ -1,0 +1,96 @@
+model_name = "llama:bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF"
+gpu_memory_utilization = 0.85
+code_host_cache_path = "./code/test-loop-llama/code/"
+container_ids = ["special-learn-compose_service-a_1"]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"
+train_data_save_folder = "./data/test-loop-llama/train_data"
+
+[task]
+class = "tasks.memory_cleanup.MemoryCleanupTask"
+
+[inference]
+max_tokens = 2048
+timeout = 120
+
+[llama]
+
+[harness]
+name = "orchestrator_modes"
+
+[harness.orchestrator_modes]
+max_harness_iterations = 8
+scratchpad_max_chars = 5000
+orchestrator_prompt = """\
+You are in orchestrator mode. Review the scratchpad and decide what to do next.
+
+Available modes: investigator, explorer, recorder
+
+Current action budget: {budget_remaining}/{total_budget} actions
+Scratchpad:
+{scratchpad_content}
+
+Respond with:
+MODE: <investigator|explorer|recorder>
+INSTRUCTION: <what you want it to do>
+REASONING: <why>
+"""
+
+[harness.orchestrator_modes.modes.investigator]
+runs_code = true
+code_capability = "run_python"
+timeout_s = 30
+writes_scratchpad = true
+scratchpad_label = "Findings"
+prompt = "Investigate. Instruction: {instruction}\nScratchpad:\n{scratchpad_content}"
+
+[harness.orchestrator_modes.modes.explorer]
+runs_code = true
+code_capability = "run_python"
+publishes_metric = true
+timeout_s = 60
+writes_scratchpad = true
+scratchpad_label = "Results"
+prompt = "Explore. Instruction: {instruction}\nScratchpad:\n{scratchpad_content}"
+
+[harness.orchestrator_modes.modes.recorder]
+timeout_s = 30
+writes_scratchpad = true
+scratchpad_label = "Updated information"
+prompt = "Record findings. Instruction: {instruction}\nScratchpad:\n{scratchpad_content}"
+
+[generation]
+target_training_rows = 10
+max_episodes = 25
+container_restart_interval = 0        # disabled — rebuilds subsume restarts
+container_rebuild_interval = 10
+max_consecutive_verification_failures = 5
+variation_strategy = "round_robin"
+post_rebuild_wait_seconds = 3
+checkpoint_every_episode = true
+resume_from_checkpoint = false
+show_progress = true
+resource_snapshot_interval_episodes = 1
+generation_output_dir = "./data/test-loop-llama/generations"
+
+[training]
+base_model = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+max_steps = 25
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 1024
+adapter_output_dir = "./models/adapters/test-loop-llama"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 2
+training_window_size = 2
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true

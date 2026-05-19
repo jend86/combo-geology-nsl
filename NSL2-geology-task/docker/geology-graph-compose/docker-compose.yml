@@ -1,0 +1,48 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: docker/geology-graph-compose/Dockerfile.agent
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [agent-net]
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  g2v:
+    build:
+      context: ../..
+      dockerfile: docker/geology-graph-compose/Dockerfile.g2v
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    environment:
+      - PYTHONPATH=/opt/nsl
+      - G2V_PREVIEW_MAX_VOXELS=500000
+    volumes:
+      - ${GEOLOGY_POOL_DIR:-../../tasks/geology_graph/pools}:/workspace/pool:ro
+    tmpfs:
+      - /var/lib/g2v/workspace:rw,size=2g
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  analysis:
+    build:
+      context: .
+      dockerfile: Dockerfile.analysis
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    volumes:
+      - ${GEOLOGY_DATASET_DIR:-../../data/geology/36572_smolianova_1984}:/workspace/input:ro
+    tmpfs:
+      - /workspace/out:rw,size=512m
+    working_dir: /workspace
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+networks:
+  agent-net:
+    internal: true
+  task-net:
+    internal: true

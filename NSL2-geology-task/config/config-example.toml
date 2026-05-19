@@ -1,0 +1,353 @@
+# =============================================================================
+# Example NSL2 config — annotated reference for all AppConfig settings.
+#
+# Source of truth: src/typing/config.py (AppConfig).
+# Copy this file and trim the sections you don't need. Most fields have sane
+# defaults; only `model_name`, `code_host_cache_path`, `container_ids`, and
+# `train_data_save_folder` are strictly required at the top level.
+#
+# Two backends are supported for inference:
+#   - vLLM       → use AWQ/GPTQ checkpoints, configure under [vllm]
+#   - llama.cpp  → use GGUF checkpoints, configure under [llama]
+# Pick ONE; the prefix on `model_name` selects the backend.
+# =============================================================================
+
+# ---- Model + backend selection ---------------------------------------------
+# Prefix selects the backend:
+#   "vllm:<hf-repo>"   → vLLM server (see [vllm] below)
+#   "llama:<hf-repo>"  → llama.cpp server (see [llama] below)
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+# model_name = "llama:bartowski/Qwen2.5.1-Coder-7B-Instruct-GGUF"
+
+gpu_memory_utilization = 0.85  # vLLM only; fraction of VRAM the engine may use
+
+# ---- Code + data paths ------------------------------------------------------
+code_host_cache_path = "./code/example/code/"
+train_data_save_folder = "./data/example/train_data"
+
+# ---- Container topology -----------------------------------------------------
+# Either list the container names explicitly, or set dynamic_container=true to
+# infer them from the compose project at runtime (see container.py:187).
+container_ids = [
+    "example-compose-agent-service-1",
+    "example-compose-task-exec-service-1",
+]
+main_container_idx = 0
+
+dynamic_container = true
+docker_compose_dir = "./docker/example-compose"
+
+# =============================================================================
+# Task — the workload class and its task-specific config
+# =============================================================================
+[task]
+class = "tasks.memory_cleanup.MemoryCleanupTask"
+# class = "tasks.forked_exploit.ForkedExploitTask"
+# class = "tasks.crypto_exploit.CryptoExploitTask"
+
+[task.config]
+# Free-form dict passed to the task class. Schema is defined per-task.
+# Example for ForkedExploitTask:
+# defihacklabs_root = "/home/elijah/DeFiHackLabs"
+# variations_root = "tasks/forked_exploit_variations"
+# include_archive_variations = true
+
+# =============================================================================
+# Inference — sampling + request-level knobs (backend-agnostic)
+# =============================================================================
+[inference]
+temperature = 0.5
+max_tokens = 4096
+timeout = 300                  # per-request timeout in seconds
+# frequency_penalty = 0.0      # optional; omit to leave unset
+# presence_penalty = 0.0
+
+# =============================================================================
+# Harness — agent loop / orchestration config
+#
+# Two harness types are supported:
+#   - orchestrator_modes  → in-process multi-phase loop (default, shown below)
+#   - container           → dockerized external agent (e.g. ms-agent)
+# Pick ONE; set [harness].name accordingly.
+# =============================================================================
+[harness]
+name = "orchestrator_modes"
+
+[harness.orchestrator_modes]
+max_harness_iterations = 15      # max orchestrator harness iterations per episode
+scratchpad_max_chars = 32000     # hard cap on the agent scratchpad
+tool_output_max_chars = 20000    # truncation cap on each tool result
+# Modes are owned wholly by the harness — they are NOT task capabilities.
+# Each mode has a prompt, optional code-execution wiring, and scratchpad
+# disposition. The harness invokes ``code_capability`` (a real task MCP
+# tool) when the mode emits a code fence.
+orchestrator_prompt = """\
+You are in orchestrator mode. Review the scratchpad and decide what to do next. You cannot run code. Choose a mode to invoke and give it a specific instruction.
+
+Available modes: investigator, explorer, recorder
+
+Current action budget: {budget_remaining}/{total_budget} actions
+Scratchpad:
+{scratchpad_content}
+
+Respond with:
+MODE: <investigator|explorer|recorder>
+INSTRUCTION: <what you want it to do>
+REASONING: <why>
+"""
+
+[harness.orchestrator_modes.modes.investigator]
+runs_code = true
+code_capability = "run_python"
+timeout_s = 30
+writes_scratchpad = true
+scratchpad_label = "Findings"
+prompt = """\
+You are in investigator mode.
+Instruction: {instruction}
+
+Run code to fulfill this. Return what you found.
+Use Python standard library only. Focus on ONE specific diagnostic task.
+
+Format:
+```python
+# your diagnostic code here
+```
+
+Findings: <summary of what you discovered>
+Scratchpad:
+{scratchpad_content}
+"""
+
+[harness.orchestrator_modes.modes.explorer]
+runs_code = true
+code_capability = "run_python"
+publishes_metric = true
+timeout_s = 90
+writes_scratchpad = true
+scratchpad_label = "Results"
+prompt = """\
+You are in explorer mode.
+Instruction: {instruction}
+
+Write and execute cleanup code for this task. ONE OPERATION ONLY.
+Use Python standard library only. Focus on safely freeing disk space.
+
+Format:
+```python
+# your cleanup code here
+```
+
+Results: <what happened, space freed in KB, any issues>
+Scratchpad:
+{scratchpad_content}
+"""
+
+[harness.orchestrator_modes.modes.recorder]
+timeout_s = 30
+writes_scratchpad = true
+scratchpad_label = "Updated information"
+prompt = """\
+You are in recorder mode.
+Instruction: {instruction}
+
+Update the scratchpad with relevant information. No code execution.
+Focus on capturing important patterns, learnings, or state changes.
+
+Current scratchpad:
+{scratchpad_content}
+
+Updated information: <what you're adding/changing>
+"""
+
+# Repetition guard — parse-time detector for degenerate decoding loops.
+# Disabled by default (min_paragraphs = None). Opt in only when the workload
+# exhibits paragraph-level repetition collapse.
+[harness.orchestrator_modes.repetition_guard]
+# min_paragraphs = 8             # uncomment to enable
+similarity_threshold = 0.95
+min_paragraph_chars = 100
+window_size = 5
+first_hit_action = "warn_only"   # "truncate" | "warn_only"
+second_hit_action = "end_episode"  # "end_episode" | "warn_only"
+
+# -----------------------------------------------------------------------------
+# Alternative: ContainerHarness with ms-agent profile
+# Uncomment the block below (and comment out [harness.orchestrator_modes] above)
+# to run episodes through a Dockerized ms-agent instead of the in-process loop.
+# The agent discovers task capabilities via MCP — no mode vocabulary leaks.
+# -----------------------------------------------------------------------------
+# [harness]
+# name = "container"
+#
+# [harness.container]
+# profile = "ms_agent"
+# image = "nsl/ms-agent:0.1.0"
+# max_wall_seconds = 3600           # per-episode wall-clock cap
+# mem_limit = "2g"
+# # host mode: container shares the host netns → reaches MCP bridge directly.
+# network_mode = "host"             # "bridge" | "host" | "none"
+# inference_transport = "tcp"
+#
+# [harness.container.build]
+# context = "docker/ms-agent"
+# # dockerfile = "Dockerfile"       # default
+# # force = false                    # pass --rebuild-harness on CLI to force
+# build_args = { MS_AGENT_VERSION = "1.6.0", MCP_VERSION = "1.1.0", OMEGACONF_VERSION = "2.3.0", LOGURU_VERSION = "0.7" }
+#
+# [harness.container.profile_config]
+# model = "nsl-example"             # arbitrary model name for ms-agent
+# max_chat_round = 60               # max conversation rounds
+# tool_call_timeout = 90            # per-tool timeout (seconds)
+# transcript_tag = "episode"
+# # extra_yaml = { key = "value" }  # optional extra ms-agent YAML config
+#
+# NOTE: ms-agent always sends tool_choice="auto", so vLLM must be started
+# with enable_auto_tool_choice=true + a matching tool_call_parser.
+# See [vllm] section below.
+
+# =============================================================================
+# vLLM backend — used when model_name starts with "vllm:"
+# =============================================================================
+[vllm]
+served_model_name = "nsl-example"
+# chat_template_path = "./config/chat_templates/qwen3.jinja"
+# local_model_path = "/path/to/local/weights"  # skip HF download
+# lora_adapter_path = "./models/adapters/example/checkpoint-100"
+# compile_cache_dir = "./.vllm-compile-cache"
+
+# Tool-calling support (required for ContainerHarness / ms-agent).
+# enable_auto_tool_choice = true
+# tool_call_parser = "hermes"       # Qwen2.5: "hermes"; Gemma 4: "gemma4"
+# Reasoning parser — opt-in only, for hybrid-thinking models. Strips
+# <think>...</think> into reasoning_content so the tool-call parser sees
+# a clean message body. Do NOT set for non-thinking models — vLLM will
+# either reject startup or silently corrupt non-thinking output.
+# reasoning_parser = "qwen3"        # Qwen3 / Qwen3.5 / Qwen3.6 thinking
+
+max_model_len = 32768
+max_num_seqs = 10                # concurrent sequences per engine step
+# max_num_batched_tokens = 8192  # per-step prefill ingest cap; raise to push
+                                  # prefill throughput at small cost to decode
+                                  # step latency. Pairs well with chunked prefill.
+enable_chunked_prefill = true
+enable_prefix_caching = true       # reuse KV cache for shared prompt prefixes across concurrent requests
+
+# kv_cache_dtype = "fp8"          # halves KV cache size on Ada/Hopper; no
+                                  # measurable quality loss on AWQ/GPTQ. Lets
+                                  # max_num_seqs / max_model_len go further
+                                  # before OOM on tight 24 GB cards.
+
+# Hardware knobs — keep these in config, not in framework defaults.
+# tensor_parallel_size shards a single model across N GPUs (per-token NCCL
+# all-reduce; cheap with NVLink, expensive on PCIe-only systems).
+# data_parallel_size launches N independent replicas behind one endpoint —
+# vLLM's internal DP coordinator round-robins requests. Each replica must
+# fit the full model. max_num_seqs is per-replica under DP, so cluster
+# concurrency = max_num_seqs * data_parallel_size.
+# pipeline_parallel_size splits layers across N GPUs — only inter-stage
+# activation handoffs cross PCIe (much lighter than per-token all-reduce).
+# Use PP when the model doesn't fit on one GPU AND TP all-reduce is too
+# expensive (PCIe-only). Pipeline bubbles add some decode latency.
+# Decision: TP for "model too big for one GPU with NVLink"; DP for "model
+# fits, want more throughput"; PP for "model too big AND no NVLink".
+tensor_parallel_size = 2
+# data_parallel_size = 2
+# pipeline_parallel_size = 2
+disable_custom_all_reduce = true
+
+startup_timeout = 1200            # seconds to wait for engine boot
+enforce_eager = false             # true = disable CUDA graphs (debugging)
+cudagraph_mode = "piecewise"      # "full" | "piecewise" | "full_and_piecewise" | "none"
+
+# Extra environment variables passed to the vLLM subprocess.
+extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
+
+# =============================================================================
+# llama.cpp backend — used when model_name starts with "llama:"
+# Comment out [vllm] above and uncomment [llama] when switching backends.
+# =============================================================================
+# [llama]
+# lora_adapter_path = "./models/adapters/example/ggml-adapter.gguf"
+# startup_timeout = 600
+
+# =============================================================================
+# Generation — rollout loop + observability for the live display
+# =============================================================================
+[generation]
+target_training_rows = 200
+max_episodes = 50
+generation_timeout_s = 21600     # whole-run wall-clock cap; null = unbounded
+
+# Container lifecycle (per-slot in parallel mode).
+container_restart_interval = 0   # 0 = disabled (rebuilds subsume restarts)
+container_rebuild_interval = 10
+post_rebuild_wait_seconds = 10
+
+# Variation selection.
+variation_strategy = "round_robin"  # "round_robin" | "random"
+# variation_random_seed = 42
+
+# Checkpointing + resume.
+checkpoint_every_episode = true
+resume_from_checkpoint = true
+max_consecutive_verification_failures = 8
+
+# Parallelism — N concurrent worker threads, each with its own container slot.
+parallel_episodes = 10
+
+# Output path for raw rollouts (JSONL shards).
+generation_output_dir = "./data/example/generations"
+
+# Live-display knobs.
+show_progress = true
+resource_snapshot_interval_episodes = 1
+
+# =============================================================================
+# Training — SFT/LoRA loop config (consumed by the training harness)
+# =============================================================================
+[training]
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+# base_model = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"  # for llama.cpp dev loop
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/example"
+# wandb_project = "nsl2-example"
+
+export_format = "auto"           # "auto" | "lora" | "merged_16bit" | "gguf"
+gguf_quantize = "f16"            # only used when export_format produces GGUF
+
+# Wait for free GPU memory before launching the training subprocess.
+gpu_wait_timeout_seconds = 120
+gpu_wait_min_free_memory_fraction = 0.7
+
+# =============================================================================
+# Orchestration — outer loop that interleaves generation and training
+# =============================================================================
+[orchestration]
+num_generations = 2              # generation rounds per training cycle
+training_window_size = 2         # # of recent generation shards used per train
+
+# =============================================================================
+# Observability — metrics + recording
+# =============================================================================
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+# metrics_output_path = "./data/example/metrics.jsonl"
+hardware_tags = ["2xA100-80G"]
+load_tags = ["awq", "tp2"]
+
+# =============================================================================
+# PEFT — optional, for serving with a pre-trained adapter
+# =============================================================================
+# [peft]
+# base_model_path = "google/gemma-4-31b-it"
+# checkpoint_path = "./models/adapters/example/checkpoint-100"
+# device = "auto"

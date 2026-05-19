@@ -1,0 +1,5 @@
+FROM g2v:analysis
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["sh", "-c", "tail -f /dev/null"]

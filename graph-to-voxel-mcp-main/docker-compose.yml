@@ -1,0 +1,116 @@
+# Compose profiles for the two build targets — see
+# docs/design/09-docker-runtime.md §5.5 and §5.6.
+#
+# Two images are produced from this compose file:
+#   - g2v:representation  (mcp / cli / shell / test services; full runtime
+#                          incl. LoopStructural and the IC criterion)
+#   - g2v:analysis        (analysis service; shell + Python with pandas /
+#                          polars / duckdb / geopandas / rasterio / shapely.
+#                          Intentionally lacks `graph_to_voxel.refinement` so
+#                          shell access ≠ scoring access. See
+#                          docker/Dockerfile.analysis for the structural
+#                          guarantees.)
+#
+# Why `entrypoint:` not `command:` — `docker compose run --rm <svc> <args>`
+# replaces CMD with `<args>` but appends `<args>` after ENTRYPOINT. So we lock
+# the profile word in via entrypoint to let user args flow through cleanly.
+#
+# Quickstart:
+#   docker compose build mcp                # build representation image
+#   docker compose build analysis           # build analysis image
+#   docker compose run --rm cli --help      # ad-hoc CLI
+#   docker compose run --rm shell           # interactive python/bash
+#   docker compose run --rm mcp             # FastMCP stdio (one connection)
+#   docker compose run --rm test            # full pytest
+#   docker compose run --rm analysis bash   # interactive analysis shell
+
+x-g2v-volumes: &g2v-volumes
+  # Editable source — host edits show up immediately in-container.
+  - type: bind
+    source: ./
+    target: /opt/g2v
+  # MCP workspace store (action log JSONL + content-addressed blobs).
+  - type: bind
+    source: ./workspace
+    target: /var/lib/g2v/workspace
+  # Data ingest root (read-only — `data.ingest` must not mutate sources).
+  - type: bind
+    source: ./input
+    target: /workspace/input
+    read_only: true
+  # Agent working set (CSV/JSON/GeoJSON/PDF the agent is allowed to read+write).
+  - type: bind
+    source: ./data
+    target: /workspace/data
+  # Derived artefacts (zarr stores, VTK exports, IC reports, figures).
+  - type: bind
+    source: ./out
+    target: /workspace/out
+
+x-g2v-env: &g2v-env
+  G2V_WORKSPACE_ROOT: /var/lib/g2v/workspace
+  G2V_PREVIEW_MAX_TIME_S: "${G2V_PREVIEW_MAX_TIME_S:-10}"
+  G2V_PREVIEW_MAX_MEMORY_MB: "${G2V_PREVIEW_MAX_MEMORY_MB:-512}"
+  G2V_PREVIEW_MAX_VOXELS: "${G2V_PREVIEW_MAX_VOXELS:-500000}"
+  G2V_PREVIEW_MAX_POINTS: "${G2V_PREVIEW_MAX_POINTS:-10000}"
+  G2V_PREVIEW_ALLOW_MCUE: "${G2V_PREVIEW_ALLOW_MCUE:-false}"
+  G2V_WORKSPACE_MAX_BYTES: "${G2V_WORKSPACE_MAX_BYTES:-}"
+  G2V_PREVIEW_TTL_HOURS: "${G2V_PREVIEW_TTL_HOURS:-}"
+  G2V_GC_DRY_RUN: "${G2V_GC_DRY_RUN:-true}"
+  MPLBACKEND: Agg
+  PYVISTA_OFF_SCREEN: "true"
+
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.representation
+    image: g2v:representation
+    stdin_open: true
+    tty: false
+    volumes: *g2v-volumes
+    environment: *g2v-env
+    entrypoint: ["/usr/bin/tini", "--", "/opt/g2v/docker/entrypoint.sh", "mcp"]
+
+  cli:
+    image: g2v:representation
+    volumes: *g2v-volumes
+    environment: *g2v-env
+    entrypoint: ["/usr/bin/tini", "--", "/opt/g2v/docker/entrypoint.sh", "cli"]
+
+  shell:
+    image: g2v:representation
+    stdin_open: true
+    tty: true
+    volumes: *g2v-volumes
+    environment: *g2v-env
+    entrypoint: ["/usr/bin/tini", "--", "/opt/g2v/docker/entrypoint.sh", "shell"]
+
+  test:
+    image: g2v:representation
+    volumes: *g2v-volumes
+    environment: *g2v-env
+    entrypoint: ["/usr/bin/tini", "--", "/opt/g2v/docker/entrypoint.sh", "test"]
+
+  # Scorer-free analysis runtime. See docker/Dockerfile.analysis for the
+  # structural guarantees ("import graph_to_voxel.refinement" fails).
+  # No representation tooling; runs `sleep infinity` so consumers drive it
+  # via `docker exec`.
+  analysis:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.analysis
+    image: g2v:analysis
+    stdin_open: true
+    tty: true
+    volumes:
+      - type: bind
+        source: ./input
+        target: /workspace/input
+        read_only: true
+      - type: bind
+        source: ./out
+        target: /workspace/out
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"

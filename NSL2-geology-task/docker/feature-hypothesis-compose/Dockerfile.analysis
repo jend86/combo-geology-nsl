@@ -1,0 +1,38 @@
+# Analysis container for feature hypothesis task
+# Provides Python + shell environment for data analysis
+FROM python:3.12-slim-bookworm
+
+# Shell tooling and runtime libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ripgrep \
+      jq \
+      file \
+      less \
+      vim-tiny \
+      tini \
+      ca-certificates \
+      libgomp1 \
+      libexpat1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Analysis libraries (no scorer code)
+RUN pip install --no-cache-dir \
+      "pandas>=2.2" \
+      "polars>=1.0" \
+      "numpy>=1.26" \
+      "scipy>=1.12" \
+      "pyarrow>=16" \
+      "duckdb>=1.0" \
+      "geopandas>=1.0" \
+      "shapely>=2.0" \
+      "pyproj>=3.6" \
+      "scikit-learn>=1.4"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN mkdir -p /workspace/input /workspace/out
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]
