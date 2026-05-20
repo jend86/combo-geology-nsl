@@ -783,9 +783,6 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             return self._exec_submit_rewrite(containers, args, ctx)
         elif name.startswith("spatial_"):
             return self._exec_spatial_capability(containers, args, ctx, name)
-        elif name == "scoring_create_feature_layer":
-            # Bridge MCP tool call to capture results in episode context
-            return self._exec_scoring_mcp_bridge(containers, args, ctx, name)
         else:
             return CapabilityResult(name, success=False, error=f"Unknown capability: {name}")
     
@@ -1546,99 +1543,6 @@ finally:
                 capability_name,
                 success=False,
                 error=f"Spatial capability execution failed: {str(e)}",
-            )
-    
-    def _exec_scoring_mcp_bridge(
-        self,
-        containers: list[Container],
-        args: dict[str, Any],
-        ctx: CapabilityExecutionContext,
-        capability_name: str,
-    ) -> CapabilityResult:
-        """Bridge MCP scoring tool call and capture results in episode context."""
-        
-        print(f"🎯 DEBUG: Starting scoring capability: {capability_name}")
-        print(f"🎯 DEBUG: Args: {args}")
-        
-        # Set up environment for scoring operations
-        import sys
-        from pathlib import Path
-        
-        # Add voxel-features-mcp to path
-        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-        sys.path.append(vfm_path)
-        print(f"🎯 DEBUG: Added path: {vfm_path}")
-        
-        try:
-            # Import required scoring tools
-            print("🎯 DEBUG: Importing scoring modules...")
-            from voxel_features.spatial import SpatialVoxelStore
-            from voxel_features.store import COE_FAIRBAIRN_GRID
-            from voxel_features.mcp.tools.scoring_tools import (
-                scoring_create_feature_layer
-            )
-            print("🎯 DEBUG: ✅ Imports successful")
-            
-            # Get store directory from episode context
-            store_dir = ctx.episode_context.get("store_dir")
-            print(f"🎯 DEBUG: Store dir: {store_dir}")
-            if not store_dir:
-                return CapabilityResult(
-                    capability_name,
-                    success=False,
-                    error="No store directory available in episode context",
-                )
-            
-            # Create or get spatial store
-            print("🎯 DEBUG: Creating SpatialVoxelStore...")
-            store = SpatialVoxelStore(store_dir, COE_FAIRBAIRN_GRID)
-            print(f"🎯 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
-            
-            # Route to scoring.create_feature_layer MCP tool
-            print(f"🎯 DEBUG: Routing to tool: {capability_name}")
-            if capability_name == "scoring_create_feature_layer":
-                print("🎯 DEBUG: Calling scoring_create_feature_layer MCP function...")
-                result = scoring_create_feature_layer(store, **args)
-            else:
-                print(f"🎯 DEBUG: ❌ Unknown capability: {capability_name}")
-                return CapabilityResult(
-                    capability_name,
-                    success=False,
-                    error=f"Unknown scoring capability: {capability_name}",
-                )
-            
-            print(f"🎯 DEBUG: ✅ Tool result: {result}")
-            
-            # Store evaluation results in episode context for rewrite phase
-            if result.get("success"):
-                phase_records = ctx.episode_context.setdefault("phase_records", {})
-                
-                # Update translate phase record
-                layer_name = args.get("name", "")
-                if layer_name:
-                    translate_record = phase_records.setdefault("translate", {})
-                    translate_record["feature_layer_name"] = layer_name
-                    translate_record["timestamp"] = __import__('time').time()
-                
-                # Store evaluation results
-                phase_records["evaluate"] = result
-                print(f"🎯 DEBUG: Stored evaluation data in phase records")
-            
-            # Return result
-            return CapabilityResult(
-                capability_name,
-                output=result,
-                success=result.get("success", False),
-            )
-            
-        except Exception as e:
-            print(f"🎯 DEBUG: ❌ Exception in scoring capability: {e}")
-            import traceback
-            traceback.print_exc()
-            return CapabilityResult(
-                capability_name,
-                success=False,
-                error=f"Scoring capability execution failed: {str(e)}",
             )
     
     # ------------------------------------------------------------------
