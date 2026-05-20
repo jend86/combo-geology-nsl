@@ -64,8 +64,15 @@ else
     echo "⚠️  MCP function was not invoked"
 fi
 
-if grep -q "🎯 BIC.*Evaluation result:" test_output.log; then
+if grep -q "🎯 DEBUG.*Tool result.*bic_delta" test_output.log; then
     echo "✅ BIC evaluation completed"
+    # Extract BIC delta from logs
+    bic_line=$(grep "bic_delta" test_output.log | tail -1)
+    if echo "$bic_line" | grep -q "admitted.*True"; then
+        echo "📈 Layer was ADMITTED (improved compression)"
+    elif echo "$bic_line" | grep -q "admitted.*False"; then
+        echo "📉 Layer was REJECTED (worse compression)"
+    fi
 else
     echo "❌ BIC evaluation did not run"
 fi
