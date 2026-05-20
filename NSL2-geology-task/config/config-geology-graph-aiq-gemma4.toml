@@ -32,7 +32,7 @@
 #     mode noted in the parent config), the v2 mitigation is to drop
 #     force_tool_choice and add a task-side terminator capability.
 
-model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+model_name = "openrouter:openai/gpt-4o"
 gpu_memory_utilization = 0.90
 code_host_cache_path = "./code/geology-graph-aiq-gemma4/code/"
 container_ids = [

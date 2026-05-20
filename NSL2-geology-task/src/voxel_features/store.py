@@ -272,10 +272,10 @@ class VoxelStore:
         }
 
 
-# Default grid for Coe Fairbairn dataset - High resolution for spatial features
+# Default grid for Coe Fairbairn dataset
 COE_FAIRBAIRN_GRID = GridSpec(
     origin=(117.832397, -27.441096, 0.0),
     maximum=(117.973493, -27.300000, 80.0),
-    shape=(200, 200, 8),  # ~70m x 79m x 10m resolution, 320k total voxels
+    shape=(25, 25, 5),
     crs="EPSG:4326",
 )

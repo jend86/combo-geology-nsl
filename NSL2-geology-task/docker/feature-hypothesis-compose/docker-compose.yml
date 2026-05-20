@@ -11,8 +11,8 @@ services:
 
   vfm:
     build:
-      context: ../../..
-      dockerfile: NSL2-geology-task/docker/feature-hypothesis-compose/Dockerfile.vfm
+      context: ../..
+      dockerfile: docker/feature-hypothesis-compose/Dockerfile.vfm
     restart: unless-stopped
     tty: true
     stdin_open: true
@@ -22,8 +22,8 @@ services:
       - VFM_STORE_PATH=/workspace/store
       - VFM_KG_PATH=/workspace/knowledge
     volumes:
-      - ${FEATURE_STORE_DIR:-../../tasks/feature_hypothesis/store}:/workspace/store:rw
-      - ${FEATURE_KG_DIR:-../../tasks/feature_hypothesis/knowledge}:/workspace/knowledge:rw
+      - ${FEATURE_STORE_DIR:-../../data/feature-hypothesis/store}:/workspace/store:rw
+      - ${FEATURE_KG_DIR:-../../data/feature-hypothesis/knowledge}:/workspace/knowledge:rw
     tmpfs:
       - /workspace/tmp:rw,size=1g
     command: ["sh", "-c", "tail -f /dev/null"]

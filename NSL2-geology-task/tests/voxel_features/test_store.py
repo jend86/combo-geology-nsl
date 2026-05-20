@@ -14,8 +14,8 @@ def test_grid_spec():
     """Test grid specification."""
     grid = COE_FAIRBAIRN_GRID
     
-    assert grid.shape == (200, 200, 8)
-    assert grid.n_voxels == 200 * 200 * 8
+    assert grid.shape == (25, 25, 5)
+    assert grid.n_voxels == 25 * 25 * 5
     
     dx, dy, dz = grid.cell_size
     assert dx > 0
@@ -38,7 +38,7 @@ def test_add_layer():
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         
         # Create random values
-        values = np.random.rand(200, 200, 8)
+        values = np.random.rand(25, 25, 5)
         
         layer = store.add_layer(
             name="test_feature",
@@ -67,7 +67,7 @@ def test_mdl_with_layer():
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         
         # Add a layer
-        values = np.random.rand(200, 200, 8)
+        values = np.random.rand(25, 25, 5)
         store.add_layer("test", values, dtype="float")
         
         mdl = compute_mdl(store)
@@ -80,8 +80,8 @@ def test_mutual_information():
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         
         # Add two correlated layers
-        base = np.random.rand(200, 200, 8)
-        noise = np.random.rand(200, 200, 8) * 0.1
+        base = np.random.rand(25, 25, 5)
+        noise = np.random.rand(25, 25, 5) * 0.1
         
         store.add_layer("layer_a", base, dtype="float")
         store.add_layer("layer_b", base + noise, dtype="float")
@@ -96,11 +96,11 @@ def test_evaluate_new_layer_admitted():
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         
         # Add initial layer
-        initial = np.random.rand(200, 200, 8)
+        initial = np.random.rand(25, 25, 5)
         store.add_layer("initial", initial, dtype="float")
         
         # Add a different layer - should be admitted if it adds info
-        new_layer = np.random.rand(200, 200, 8)
+        new_layer = np.random.rand(25, 25, 5)
         
         result = evaluate_new_layer(
             store=store,
@@ -121,7 +121,7 @@ def test_evaluate_redundant_layer_rejected():
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         
         # Add initial layer
-        initial = np.random.rand(200, 200, 8)
+        initial = np.random.rand(25, 25, 5)
         store.add_layer("initial", initial, dtype="float")
         
         # Add exact duplicate - should be rejected (no compression gain)

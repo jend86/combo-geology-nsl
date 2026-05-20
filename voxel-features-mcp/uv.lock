@@ -1400,6 +1400,15 @@ wheels = [
 ]
 
 [[package]]
+name = "spatialite"
+version = "0.0.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/0c/aa040af6021236a6d90739b63eec0cab5541d4492cfb871e73f8d1e4e327/spatialite-0.0.3.tar.gz", hash = "sha256:a0761f239a52f326b14ce41ba61b6614dfcc808b978a0bec4a37c1de9ad9071e", size = 2820, upload-time = "2019-02-25T11:49:15.024Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/43/5d/ff0c1c7ca9b4d294029f9a2a2a2f668e8e33e7926135d7a86c35d855eb23/spatialite-0.0.3-py3-none-any.whl", hash = "sha256:3124f643688c8ba4e2ff200ef401cf7b57caa44db666cb78519784f98f662982", size = 4184, upload-time = "2019-02-25T11:49:13.308Z" },
+]
+
+[[package]]
 name = "sse-starlette"
 version = "3.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -1563,6 +1572,7 @@ geo = [
     { name = "geopandas" },
     { name = "pyproj" },
     { name = "shapely" },
+    { name = "spatialite" },
 ]
 mcp = [
     { name = "filelock" },
@@ -1585,6 +1595,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5" },
     { name = "scipy", specifier = ">=1.12" },
     { name = "shapely", marker = "extra == 'geo'", specifier = ">=2.0" },
+    { name = "spatialite", marker = "extra == 'geo'", specifier = ">=0.0.3" },
     { name = "typer", specifier = ">=0.12" },
 ]
 provides-extras = ["dev", "mcp", "data", "geo"]

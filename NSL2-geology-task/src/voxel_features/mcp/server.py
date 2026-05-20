@@ -17,47 +17,43 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from voxel_features.store import VoxelStore
-from voxel_features.spatial import SpatialVoxelStore
+from voxel_features.store import VoxelStore, GridSpec, COE_FAIRBAIRN_GRID
 from voxel_features.knowledge_graph import KnowledgeGraph
-from voxel_features.mcp.tools.feature_tools import (
-    feature_create, feature_get, feature_list, feature_delete
-)
-from voxel_features.mcp.tools.scoring_tools import (
-    scoring_compute_mdl, scoring_mutual_information,
-    scoring_marginal_contribution, scoring_evaluate_layer,
-    scoring_create_feature_layer
-)
-from voxel_features.mcp.tools.experiment_tools import (
-    experiment_record, experiment_get, experiment_list_admitted,
-    experiment_get_crossbreed_pairs, experiment_export_training
-)
-from voxel_features.mcp.tools.spatial_tools import (
-    spatial_add_point, spatial_add_line, spatial_query_region,
-    spatial_get_operations_log, spatial_coord_to_voxel
+from voxel_features.mcp.tools import (
+    feature_create,
+    feature_get,
+    feature_list,
+    feature_delete,
+    scoring_compute_mdl,
+    scoring_mutual_information,
+    scoring_marginal_contribution,
+    scoring_evaluate_layer,
+    experiment_record,
+    experiment_get,
+    experiment_list_admitted,
+    experiment_get_crossbreed_pairs,
+    experiment_export_training,
 )
 
 
 # Global state (initialized on first use)
-_store: SpatialVoxelStore | None = None
+_store: VoxelStore | None = None
 _kg: KnowledgeGraph | None = None
 
 
-def _get_store() -> SpatialVoxelStore:
-    """Get or create the spatial voxel store."""
+def _get_store() -> VoxelStore:
+    """Get or create the voxel store."""
     global _store
     if _store is None:
         store_path = Path(os.environ.get("VFM_STORE_PATH", "/tmp/voxel-features"))
         grid_json = os.environ.get("VFM_GRID_SPEC")
         
         if grid_json:
-            from voxel_features.store import GridSpec
             grid = GridSpec.from_dict(json.loads(grid_json))
         else:
-            from voxel_features.store import COE_FAIRBAIRN_GRID
             grid = COE_FAIRBAIRN_GRID
         
-        _store = SpatialVoxelStore(store_path, grid)
+        _store = VoxelStore(store_path, grid)
     return _store
 
 
@@ -166,26 +162,6 @@ TOOLS = [
             "required": ["name", "values"],
         },
     ),
-    Tool(
-        name="scoring.create_feature_layer",
-        description="Extract spatial layer and evaluate with BIC scoring",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string", 
-                    "description": "Name of existing spatial layer to evaluate"
-                },
-                "dtype": {
-                    "type": "string",
-                    "enum": ["float", "categorical", "boolean"],
-                    "default": "float",
-                    "description": "Data type for evaluation"
-                },
-            },
-            "required": ["name"],
-        },
-    ),
     # Experiment tools
     Tool(
         name="experiment.record",
@@ -242,85 +218,6 @@ TOOLS = [
             "required": ["output_path"],
         },
     ),
-    # Spatial tools
-    Tool(
-        name="spatial.add_point",
-        description="Add a point feature at geographic coordinates with radius",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Feature layer name"},
-                "longitude": {"type": "number", "description": "Longitude in degrees"},
-                "latitude": {"type": "number", "description": "Latitude in degrees"},
-                "depth_m": {"type": "number", "description": "Depth in meters"},
-                "value": {"type": "number", "description": "Feature value"},
-                "radius_m": {"type": "number", "default": 100, "description": "Radius of effect in meters"},
-                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
-                "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
-                "metadata": {"type": "object", "description": "Optional metadata"},
-                "hypothesis_uri": {"type": "string"},
-                "experiment_id": {"type": "string"},
-            },
-            "required": ["name", "longitude", "latitude", "depth_m", "value"],
-        },
-    ),
-    Tool(
-        name="spatial.add_line",
-        description="Add a line feature between two points (e.g. fault, vein)",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Feature layer name"},
-                "start_longitude": {"type": "number", "description": "Start longitude in degrees"},
-                "start_latitude": {"type": "number", "description": "Start latitude in degrees"},
-                "start_depth_m": {"type": "number", "description": "Start depth in meters"},
-                "end_longitude": {"type": "number", "description": "End longitude in degrees"},
-                "end_latitude": {"type": "number", "description": "End latitude in degrees"},
-                "end_depth_m": {"type": "number", "description": "End depth in meters"},
-                "value": {"type": "number", "description": "Feature value"},
-                "width_m": {"type": "number", "default": 50, "description": "Width of line in meters"},
-                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
-                "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
-                "metadata": {"type": "object", "description": "Optional metadata"},
-                "hypothesis_uri": {"type": "string"},
-                "experiment_id": {"type": "string"},
-            },
-            "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
-                        "end_longitude", "end_latitude", "end_depth_m", "value"],
-        },
-    ),
-    Tool(
-        name="spatial.query_region",
-        description="Query existing features within a geographic region",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "center_longitude": {"type": "number", "description": "Center longitude in degrees"},
-                "center_latitude": {"type": "number", "description": "Center latitude in degrees"},
-                "center_depth_m": {"type": "number", "description": "Center depth in meters"},
-                "radius_m": {"type": "number", "description": "Query radius in meters"},
-            },
-            "required": ["center_longitude", "center_latitude", "center_depth_m", "radius_m"],
-        },
-    ),
-    Tool(
-        name="spatial.coord_to_voxel",
-        description="Convert geographic coordinates to voxel indices",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "longitude": {"type": "number", "description": "Longitude in degrees"},
-                "latitude": {"type": "number", "description": "Latitude in degrees"},
-                "depth_m": {"type": "number", "description": "Depth in meters"},
-            },
-            "required": ["longitude", "latitude", "depth_m"],
-        },
-    ),
-    Tool(
-        name="spatial.get_operations_log",
-        description="Get history of spatial operations for debugging",
-        inputSchema={"type": "object", "properties": {}},
-    ),
 ]
 
 
@@ -348,8 +245,6 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return scoring_marginal_contribution(store, **arguments)
     elif name == "scoring.evaluate_layer":
         return scoring_evaluate_layer(store, **arguments)
-    elif name == "scoring.create_feature_layer":
-        return scoring_create_feature_layer(store, **arguments)
     
     # Experiment tools
     elif name == "experiment.record":
@@ -362,18 +257,6 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return experiment_get_crossbreed_pairs(kg, **arguments)
     elif name == "experiment.export_training":
         return experiment_export_training(kg, **arguments)
-    
-    # Spatial tools
-    elif name == "spatial.add_point":
-        return spatial_add_point(store, **arguments)
-    elif name == "spatial.add_line":
-        return spatial_add_line(store, **arguments)
-    elif name == "spatial.query_region":
-        return spatial_query_region(store, **arguments)
-    elif name == "spatial.coord_to_voxel":
-        return spatial_coord_to_voxel(store, **arguments)
-    elif name == "spatial.get_operations_log":
-        return spatial_get_operations_log(store)
     
     else:
         return {"success": False, "error": f"Unknown tool: {name}"}

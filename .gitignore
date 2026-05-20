@@ -8,7 +8,7 @@ __pycache__/
 *.so
 .Python
 .env
-.venv
+.venv/
 env/
 venv/
 

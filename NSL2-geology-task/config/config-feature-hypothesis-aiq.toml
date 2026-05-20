@@ -8,17 +8,15 @@
 #   - Rewriting Agent: Rewrite (creates training pairs + knowledge graph nodes)
 #
 # Pre-flight checklist:
-#   1. Ensure voxel_features symlink exists:
-#        ln -sf ../../../voxel-features-mcp/voxel_features tasks/voxel_features
-#   2. Build Docker images:
+#   1. Build Docker images:
 #        docker compose -f docker/feature-hypothesis-compose/docker-compose.yml build
-#   3. Build harness images:
+#   2. Build harness images:
 #        uv run python scripts/build_harness_images.py \
 #          --config config/config-feature-hypothesis-aiq.toml
-#   4. Confirm Coe Fairbairn dataset is at ../Coe Fairbairn/
+#   3. Confirm Coe Fairbairn dataset is at ../Coe Fairbairn/
 
-model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
-gpu_memory_utilization = 0.90
+model_name = "openrouter:anthropic/claude-3.5-haiku"
+# gpu_memory_utilization = 0.90  # Not needed for OpenRouter
 code_host_cache_path = "./code/feature-hypothesis/code/"
 container_ids = [
   "feature-hypothesis-compose-agent-1",

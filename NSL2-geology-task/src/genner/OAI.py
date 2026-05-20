@@ -173,6 +173,10 @@ class OAIGenner(Genner):
             request_model = self._resolve_model(messages)
             request_messages = self._prepare_messages(messages)
             logger.debug(f"OpenAI model: {request_model}")
+            for i, msg in enumerate(request_messages):
+                role = msg.get("role", "?")
+                content = msg.get("content") or ""
+                logger.debug(f"  [{i}] {role}: {str(content)[:2000]}")
             extra_kwargs: Dict[str, Any] = {}
             frequency_penalty = getattr(self.config, "frequency_penalty", None)
             if frequency_penalty is not None:
@@ -204,6 +208,7 @@ class OAIGenner(Genner):
                 content = ""
             elif not isinstance(content, str):
                 content = str(content)
+            logger.debug(f"  [assistant]: {str(content)[:2000]}")
             # When vLLM is started with --reasoning-parser, <think>...</think>
             # is split off into a separate `reasoning_content` field. Re-wrap
             # so trajectories and next-turn assistant replay retain the

@@ -6,6 +6,7 @@ from src.typing.config import AppConfig
 
 from .claude import setup_claude
 from .llama import setup_llama
+from .openrouter import setup_openrouter
 from .sglang import setup_sglang
 from .vllm import setup_vllm
 
@@ -16,6 +17,7 @@ BackendContextFactory = Callable[[AppConfig], AbstractContextManager[Any]]
 _BACKEND_CONTEXT_FACTORIES: dict[str, BackendContextFactory] = {
     "claude": setup_claude,
     "llama": setup_llama,
+    "openrouter": setup_openrouter,
     "sglang": setup_sglang,
     "vllm": setup_vllm,
 }

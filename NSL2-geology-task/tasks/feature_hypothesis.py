@@ -12,6 +12,7 @@ Architecture:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -58,11 +59,11 @@ _ANALYSIS_INPUT = "/workspace/input"
 _ANALYSIS_OUT = "/workspace/out"
 
 
-# Coe Fairbairn grid specification
+# Coe Fairbairn grid specification - High resolution for spatial features
 _COE_FAIRBAIRN_GRID = {
     "origin": [117.832397, -27.441096, 0.0],
     "maximum": [117.973493, -27.300000, 80.0],
-    "shape": [25, 25, 5],
+    "shape": [200, 200, 8],  # ~70m x 79m x 10m resolution, 320k total voxels
     "crs": "EPSG:4326",
 }
 
@@ -72,60 +73,53 @@ _SYSTEM_PROMPT = """You are in mineral exploration mode.
 Your goal is to identify informative feature layers that would improve compression 
 of a voxel-based world model. You are rewarded when adding a feature layer improves BIC on a ridge regression of the overall world model.
 
-## Dataset
-
-You have access to the Coe Fairbairn dataset:
-- geochemDrillhole.csv: 3D drillhole samples with 80+ element assays (Au, Cu, etc.)
-- geochemSurface.csv: Surface samples
-- other csvs: Mining tenement boundaries and history
-- description.md files: detailed descriptions of maps
-- WAMEX reports: OCR'd exploration reports (JSON chunks)
-
 ## Grid
 
 The voxel grid covers:
 - Longitude: 117.832° to 117.973°
 - Latitude: -27.441° to -27.300°
 - Depth: 0 to 80m
-- Resolution: 25 × 25 × 5 voxels
+- Resolution: 200 × 200 × 8 voxels (~70m × 79m × 10m per voxel)
 
 ## Scoring
 
+The workflow converts geographic analysis results into 3D feature layers through spatial operations:
+1. **Analysis phase** identifies geological patterns in coordinate data
+2. **Translation phase** converts findings to spatial commands (spatial_add_point, spatial_add_line)  
+3. **Automatic voxel mapping** projects geographic coordinates onto the 200×200×8 grid
+4. **BIC evaluation** tests if the new spatial feature improves joint prediction
+
 Feature layers are evaluated by:
-- Joint prediction score (each layer ~ all others via ridge regression)
-- BIC - n*ln(MSE) + k*ln(n) 
+- BIC - n*ln(MSE) + k*ln(n) (joint ridge regression across all layers)
 
 A layer is admitted if bic_delta < 0.
 
 ## Capabilities
 
+**Phase 1-3 (Hypothesis & Analysis):**
 - analysis_shell: Execute Python code in a sandbox with polars/duckdb/scipy
-- record_phase: Record workflow phase completion
 - hypothesis_create: Register a falsifiable hypothesis
 - submit_code: Submit code for execution (coding agent only)
-- create_feature_layer: Create a 3D feature layer in the voxel store
+
+**Phase 4 (Spatial Translation):**
+- spatial_add_point: Add point features at geographic coordinates with radius of effect
+- spatial_add_line: Add linear features (faults, veins) between two 3D points
+- spatial_query_region: Query existing spatial features in a geographic region
+- spatial_coord_to_voxel: Convert geographic coordinates to voxel indices
+- spatial_get_operations_log: Get history of spatial operations
+
+**Phase 5 (Rewrite):**
+- record_phase: Record workflow phase completion
 """
 
 
 _DATASET_OVERVIEW = """## Coe Fairbairn Dataset Overview
 
-### geochemDrillhole.csv (primary)
-- 1299 drillhole samples with 3D coordinates
-- Key columns: longitude, latitude, maxdepth_drill
-- Assays: au_ppm, cu_ppm, ag_ppm, as_ppm, plus ~80 REE and trace elements
-
-### geochemSurface.csv
-- Surface geochemistry samples
-- Similar element suite
-
-### tenements.csv  
-- Tenement boundaries and ownership history
-- Can be used for spatial features (proximity to boundaries, etc.)
-
-### WAMEX Reports
-- OCR'd exploration reports in JSON chunks
-- Historical geological interpretations
-- Lithology descriptions, structural geology notes
+- geochemDrillhole.csv: 3D drillhole samples with 80+ element assays (Au, Cu, etc.) and 3D coordinates
+- geochemSurface.csv: Surface samples with coodinates
+- other csvs: Mining tenement boundaries and history
+- description.md files: detailed descriptions of maps
+- WAMEX reports: OCR'd exploration reports (JSON chunks)
 """
 
 
@@ -315,12 +309,12 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         system_instruction = _SYSTEM_PROMPT + "\n\n" + _DATASET_OVERVIEW
         
         return TaskPromptSpec(
-            system=system_instruction,
-            mission=mission,
+            system_instruction=system_instruction,
             environment_context=env_context,
+            capabilities=self.list_capabilities(variation, episode_context),
         )
     
-    def build_workflow(
+    def workflow(
         self,
         variation: Variation,
         episode_context: dict[str, Any],
@@ -355,22 +349,22 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
         return Workflow(
-            initial_step="survey",
-            steps={
+            steps=(
                 # HYPOTHESIS AGENT: Phase 1
-                "survey": WorkflowStep(
+                WorkflowStep(
                     name="survey",
+                    is_entry=True,
                     prompt=(
                         "Phase 1: Survey\n\n"
                         "Explore the dataset to identify feature opportunities.\n\n"
                         "Use analysis_shell to:\n"
                         "- Read file headers and schemas\n"
-                        "- Check data distributions\n"
                         "- Identify interesting patterns\n\n"
                         "Find 2-3 promising feature layer candidates.\n\n"
                         "Close with:\n"
                         "  record_phase(phase='survey', candidates=[...])"
                     ),
+                    inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
                         "record_phase",
@@ -380,27 +374,19 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 ),
                 
                 # HYPOTHESIS AGENT: Phase 2
-                "hypothesise": WorkflowStep(
+                WorkflowStep(
                     name="hypothesise",
                     prompt=(
                         "Phase 2: Hypothesise\n\n"
                         "Pick one candidate and state a falsifiable hypothesis.\n\n"
                         "Include a data_spec with:\n"
-                        "- files: which files to use\n"
-                        "- columns: which columns are relevant\n"
-                        "- analysis: what analysis to perform\n"
-                        "- output: what output format to produce\n\n"
-                        "Example:\n"
-                        "  hypothesis: 'High Au correlates with elevated Y in drillholes'\n"
-                        "  data_spec: {\n"
-                        "    files: ['geochemDrillhole.csv'],\n"
-                        "    columns: ['au_ppm', 'y_ppm', 'longitude', 'latitude', 'maxdepth_drill'],\n"
-                        "    analysis: 'OLS regression with spatial output',\n"
-                        "    output: '3D array of predicted values'\n"
-                        "  }\n\n"
+                        "- files: list of data sources to analyze\n"
+                        "- analysis: analytical approach\n"
+                        "- output: what the output should represent\n\n"
                         "Close with:\n"
                         "  record_phase(phase='hypothesise', hypothesis=..., data_spec=...)"
                     ),
+                    inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
                         "record_phase",
@@ -410,84 +396,132 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 ),
                 
                 # CODING AGENT: Phase 3 (isolated, stateless)
-                "code": WorkflowStep(
+                WorkflowStep(
                     name="code",
                     prompt=(
                         "Phase 3: Code\n\n"
-                        "Write Python code to test the hypothesis.\n\n"
-                        "You have access to: polars, duckdb, scipy, numpy.\n"
-                        "Data is at: /workspace/input/amalgamated_csvs/\n\n"
-                        "The code should:\n"
-                        "1. Load the specified data\n"
-                        "2. Perform the analysis\n"
-                        "3. Output a result summary\n"
-                        "4. Optionally output a 3D array for the feature layer\n\n"
+                        "Analyze data to test the hypothesis. Focus on producing data artifacts.\n\n"
+                        "1. Call phase_get(phase='hypothesise') to get enhanced hypothesis and data_spec\n"
+                        "2. Write analysis code to test the hypothesis:\n"
+                        "   - Load and examine data from data_spec\n"
+                        "   - Perform statistical analysis, correlation, classification\n"
+                        "   - Create filtered DataFrames, computed arrays, summary statistics\n"
+                        "   - Test geological relationships and patterns\n\n"
+                        "3. Store results in variables (DataFrames, arrays, dicts, etc.)\n"
+                        "   These will be automatically captured as artifacts for the translate phase.\n\n"
+                        "4. Print clear analysis summary and conclusions\n\n"
+                        "DO NOT attempt 3D interpolation or voxel creation - that's the translate agent's job.\n"
+                        "Focus on proving/disproving the hypothesis and creating useful data artifacts.\n\n"
+                        "Available libraries: pandas, numpy, scipy\n"
+                        "Use try/except blocks for robust file handling.\n\n"
                         "Close with:\n"
                         "  submit_code(code=..., expected_output='...')"
                     ),
-                    context_mode="isolated",  # Fresh context for coding agent
+                    context_mode="isolated",
+                    inherit_all_capabilities=False,
                     capabilities=(
+                        "phase_get",
                         "submit_code",
-                        "phase_get",  # Can retrieve hypothesis from previous phase
                     ),
                     terminator_capabilities=("submit_code",),
                     next_steps=("translate",),
                 ),
                 
-                # HYPOTHESIS AGENT: Phase 4 (resumed)
-                "translate": WorkflowStep(
+                # HYPOTHESIS AGENT: Phase 4 (isolated)
+                WorkflowStep(
                     name="translate",
                     prompt=(
-                        "Phase 4: Translate\n\n"
-                        "Convert the analysis output to a voxel feature layer.\n\n"
-                        "Consider:\n"
-                        "- For surface-only data: how to handle subsurface cells?\n"
-                        "- For partial coverage: how to handle missing areas?\n"
-                        "- What dtype: float, categorical, boolean?\n\n"
-                        "Call create_feature_layer with the 3D array.\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='translate', feature_layer_name=...)"
+                        "Phase 4: Translate (Spatial Data Processor)\n\n"
+                        "🚨 CRITICAL: You are NOT an analyst! You are a spatial command generator.\n"
+                        "The analysis is already done - your job is to convert findings to spatial operations.\n\n"
+                        "Your role: Convert existing analysis artifacts into spatial feature commands.\n"
+                        "The system automatically maps these to the 200×200×8 voxel grid.\n\n"
+                        "1. Call get_experiment_summary() to get hypothesis, data_spec, and analysis results\n"
+                        "2. Review the analysis artifacts already produced by previous phases:\n"
+                        "   - *.csv: Filtered/processed DataFrames\n"
+                        "   - *.npy: Computed arrays or matrices\n"
+                        "   - *.pkl: Complex objects or analysis results\n"
+                        "   - *.txt: Scalar values and summaries\n"
+                        "   DO NOT re-run analysis - use the existing results!\n\n"
+                        "3. Data preprocessing (convert strings, handle missing data, etc.):\n"
+                        "   - Convert lithology strings to boolean: 'clay' → has_clay=True\n"
+                        "   - Handle missing values: interpolate or flag as unknown\n"
+                        "   - Standardize units and coordinate systems\n"
+                        "   - Clean and validate data before spatial mapping\n\n"
+                        "4. Generate spatial commands based on analysis findings:\n"
+                        "   Grid bounds: lon 117.832°-117.973°, lat -27.441°--27.300°, depth 0-80m\n"
+                        "   Resolution: ~70m × 79m × 10m per voxel (200×200×8 total)\n\n"
+                        "   **For drill hole data with coordinates:**\n"
+                        "   spatial_add_point(name='copper_grade_dh001', longitude=117.918, latitude=-27.407, depth_m=45, value=0.85, radius_m=100)\n\n"
+                        "   **For geological structures (faults, veins):**\n"
+                        "   spatial_add_line(name='fault_main', start_longitude=117.911, start_latitude=-27.407, start_depth_m=0, end_longitude=117.913, end_latitude=-27.406, end_depth_m=60, value=1.0, width_m=75)\n\n"
+                        "   **For statistical results without coordinates:**\n"
+                        "   - Use geological knowledge: 'near Emily Well' → find well coordinates\n"
+                        "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
+                        "   - Apply geological expertise about ore distribution\n\n"
+                        "5. **CRITICAL**: Create exactly ONE coherent feature layer:\n"
+                        "   - Instead of separate Cu, Au, As → create 'mineralization_potential'\n"
+                        "   - Use geological expertise: weighted combination, intersection zones\n"
+                        "   - ALL spatial operations must use the SAME layer name\n"
+                        "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
+                        "            spatial_add_line(name='mineralization_potential', ...) \n"
+                        "   - Focus on the single most predictive geological feature\n\n"
+                        "6. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
+                        "7. **MANDATORY TO COMPLETE THIS PHASE**:\n"
+                        "   🚨 YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
+                        "   \n"
+                        "   AFTER all spatial operations, call:\n"
+                        "   scoring_create_feature_layer(name='the_same_layer_name_you_used')\n"
+                        "   \n"
+                        "   Example workflow:\n"
+                        "   1. spatial_add_point(name='copper_potential', ...)\n"
+                        "   2. spatial_add_line(name='copper_potential', ...)\n"
+                        "   3. scoring_create_feature_layer(name='copper_potential')  ← REQUIRED!\n"
+                        "   \n"
+                        "   This call triggers BIC evaluation. WITHOUT IT, THE PHASE FAILS!\n\n"
+                        "Focus on geological intelligence, not array mathematics!"
                     ),
+                    context_mode="isolated",
+                    inherit_all_capabilities=False,
                     capabilities=(
-                        "create_feature_layer",
-                        "phase_get",
-                        "record_phase",
+                        "get_experiment_summary",
+                        "spatial_add_point",
+                        "spatial_add_line", 
+                        "spatial_query_region",
+                        "spatial_coord_to_voxel",
+                        "spatial_get_operations_log",
+                        "scoring_create_feature_layer",
                     ),
-                    terminator_capabilities=("record_phase",),
-                    next_steps=("evaluate",),
-                ),
-                
-                # FRAMEWORK: Phase 5 (automated)
-                "evaluate": WorkflowStep(
-                    name="evaluate",
-                    prompt="[AUTOMATED] Framework computes BIC/MI scores.",
-                    capabilities=(),  # No agent capabilities
-                    terminator_capabilities=(),
+                    terminator_capabilities=("scoring_create_feature_layer",),
                     next_steps=("rewrite",),
-                    max_tool_calls=0,  # Auto-advance
                 ),
                 
-                # REWRITING AGENT: Phase 6
-                "rewrite": WorkflowStep(
+                # REWRITING AGENT: Phase 5
+                WorkflowStep(
                     name="rewrite",
                     prompt=(
-                        "Phase 6: Rewrite\n\n"
-                        "An experiment was conducted. Write it up as:\n"
-                        "1. A knowledge graph node (for future crossbreeding)\n"
-                        "2. A training prompt/response pair\n\n"
-                        "You will see the hypothesis, code, result, and Ridge CV and BIC scores.\n\n"
-                        "Close with:\n"
-                        "  submit_rewrite(graph_node=..., training_pair=...)"
+                        "Phase 5: Rewrite\n\n"
+                        "An experiment was conducted. Write it up as a training pair.\n\n"
+                        "1. Call get_experiment_summary() to retrieve the experiment data.\n"
+                        "2. Call submit_rewrite(training_pair={...}) to close the phase.\n\n"
+                        "The training_pair must be a JSON object with exactly two fields:\n"
+                        "  prompt:   A description of the dataset context and the hypothesis "
+                        "being tested. What patterns in the data suggested this hypothesis?\n"
+                        "  response: What analysis was performed, what was found, and why "
+                        "the result is or isn't informative for mineral exploration.\n\n"
+                        "Do NOT include the BIC score in your response — "
+                        "it will be appended automatically."
                     ),
-                    context_mode="isolated",  # Fresh context for rewriting agent
+                    context_mode="isolated",
+                    inherit_all_capabilities=False,
                     capabilities=(
-                        "phase_get",
+                        "get_experiment_summary",
                         "submit_rewrite",
                     ),
                     terminator_capabilities=("submit_rewrite",),
-                    next_steps=(),  # Terminal
+                    next_steps=(),
                 ),
-            },
+            ),
         )
     
     def _crossbreed_workflow(
@@ -498,15 +532,15 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         """Crossbreed workflow: starts with crossbreed prompt instead of survey."""
         
         # Same as survey but skip survey phase
-        base_workflow = self._survey_workflow(variation, episode_context)
-        
-        # Modify to start at hypothesise with crossbreed context
         crossbreed_ctx = episode_context.get("crossbreed_context", {})
         parent_ids = crossbreed_ctx.get("parent_ids", [])
         
-        base_workflow.initial_step = "hypothesise"
-        base_workflow.steps["hypothesise"] = WorkflowStep(
+        base_workflow = self._survey_workflow(variation, episode_context)
+        
+        # Build replacement steps tuple: swap survey for crossbreed hypothesise as entry
+        crossbreed_hypothesise = WorkflowStep(
             name="hypothesise",
+            is_entry=True,
             prompt=(
                 "Phase 2: Hypothesise (Crossbreed Mode)\n\n"
                 f"Parent experiments: {parent_ids}\n\n"
@@ -517,6 +551,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
                 f"parent_experiments={parent_ids})"
             ),
+            inherit_all_capabilities=False,
             capabilities=(
                 "analysis_shell",
                 "record_phase",
@@ -524,8 +559,12 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             terminator_capabilities=("record_phase",),
             next_steps=("code",),
         )
-        
-        return base_workflow
+        new_steps = tuple(
+            crossbreed_hypothesise if s.name == "hypothesise" else s
+            for s in base_workflow.steps
+            if s.name != "survey"
+        )
+        return Workflow(steps=new_steps)
     
     # ------------------------------------------------------------------
     # Capabilities
@@ -580,6 +619,15 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 },
             ),
             Capability(
+                name="get_experiment_summary",
+                description=(
+                    "Retrieve all phase data for the current experiment in one call. "
+                    "Returns hypothesis, data_spec, result_summary, feature_layer_name, "
+                    "dtype, bic_delta, admitted, and mutual_info."
+                ),
+                schema={"type": "object", "properties": {}},
+            ),
+            Capability(
                 name="submit_code",
                 description="Submit code for execution (coding agent only).",
                 schema={
@@ -592,43 +640,134 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 },
             ),
             Capability(
-                name="create_feature_layer",
-                description="Create a 3D feature layer in the voxel store.",
+                name="submit_rewrite",
+                description=(
+                    "Submit the training pair for this experiment. "
+                    "The knowledge graph node is generated automatically."
+                ),
                 schema={
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string"},
-                        "values": {"type": "array", "description": "3D array (25x25x5)"},
+                        "training_pair": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "response": {"type": "string"},
+                            },
+                            "required": ["prompt", "response"],
+                        },
+                    },
+                    "required": ["training_pair"],
+                },
+            ),
+            # Spatial tool capabilities
+            Capability(
+                name="spatial_add_point",
+                description="Add a point feature at geographic coordinates with radius of effect.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "longitude": {"type": "number", "description": "Longitude in degrees"},
+                        "latitude": {"type": "number", "description": "Latitude in degrees"},
+                        "depth_m": {"type": "number", "description": "Depth in meters"},
+                        "value": {"type": "number", "description": "Feature value"},
+                        "radius_m": {"type": "number", "description": "Radius of effect in meters"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
                         "metadata": {"type": "object"},
                     },
-                    "required": ["name", "values"],
+                    "required": ["name", "longitude", "latitude", "depth_m", "value"],
                 },
             ),
             Capability(
-                name="submit_rewrite",
-                description="Submit the rewritten experiment record (rewriting agent only).",
+                name="spatial_add_line",
+                description="Add a line feature between two geographic points (e.g., fault, vein).",
                 schema={
                     "type": "object",
                     "properties": {
-                        "graph_node": {"type": "object"},
-                        "training_pair": {"type": "object"},
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "start_longitude": {"type": "number", "description": "Start longitude in degrees"},
+                        "start_latitude": {"type": "number", "description": "Start latitude in degrees"},
+                        "start_depth_m": {"type": "number", "description": "Start depth in meters"},
+                        "end_longitude": {"type": "number", "description": "End longitude in degrees"},
+                        "end_latitude": {"type": "number", "description": "End latitude in degrees"},
+                        "end_depth_m": {"type": "number", "description": "End depth in meters"},
+                        "value": {"type": "number", "description": "Feature value"},
+                        "width_m": {"type": "number", "description": "Width of line in meters"},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "metadata": {"type": "object"},
                     },
-                    "required": ["graph_node", "training_pair"],
+                    "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
+                                "end_longitude", "end_latitude", "end_depth_m", "value"],
+                },
+            ),
+            Capability(
+                name="spatial_query_region",
+                description="Query existing features within a geographic region.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "center_longitude": {"type": "number", "description": "Center longitude in degrees"},
+                        "center_latitude": {"type": "number", "description": "Center latitude in degrees"},
+                        "center_depth_m": {"type": "number", "description": "Center depth in meters"},
+                        "radius_m": {"type": "number", "description": "Query radius in meters"},
+                    },
+                    "required": ["center_longitude", "center_latitude", "center_depth_m", "radius_m"],
+                },
+            ),
+            Capability(
+                name="spatial_coord_to_voxel",
+                description="Convert geographic coordinates to voxel indices for validation.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "longitude": {"type": "number", "description": "Longitude in degrees"},
+                        "latitude": {"type": "number", "description": "Latitude in degrees"},
+                        "depth_m": {"type": "number", "description": "Depth in meters"},
+                    },
+                    "required": ["longitude", "latitude", "depth_m"],
+                },
+            ),
+            Capability(
+                name="spatial_get_operations_log",
+                description="Get history of spatial operations for debugging and review.",
+                schema={"type": "object", "properties": {}},
+            ),
+            Capability(
+                name="scoring_create_feature_layer",
+                description="Extract spatial layer and evaluate with BIC scoring.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string", 
+                            "description": "Name of existing spatial layer to evaluate"
+                        },
+                        "dtype": {
+                            "type": "string",
+                            "enum": ["float", "categorical", "boolean"],
+                            "default": "float",
+                            "description": "Data type for evaluation"
+                        },
+                    },
+                    "required": ["name"],
                 },
             ),
         ]
     
     def execute_capability(
         self,
-        containers: list[Container],
         invocation: CapabilityInvocation,
+        containers: list[Container],
+        variation: Variation,
         ctx: CapabilityExecutionContext,
     ) -> CapabilityResult:
         """Execute a capability invocation."""
         
         name = invocation.name
-        args = invocation.arguments or {}
+        args = invocation.input or {}
         
         if name == "analysis_shell":
             return self._exec_analysis_shell(containers, args, ctx)
@@ -636,12 +775,17 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             return self._exec_record_phase(args, ctx)
         elif name == "phase_get":
             return self._exec_phase_get(args, ctx)
+        elif name == "get_experiment_summary":
+            return self._exec_get_experiment_summary(containers, ctx)
         elif name == "submit_code":
             return self._exec_submit_code(containers, args, ctx)
-        elif name == "create_feature_layer":
-            return self._exec_create_feature_layer(containers, args, ctx)
         elif name == "submit_rewrite":
             return self._exec_submit_rewrite(containers, args, ctx)
+        elif name.startswith("spatial_"):
+            return self._exec_spatial_capability(containers, args, ctx, name)
+        elif name == "scoring_create_feature_layer":
+            # Bridge MCP tool call to capture results in episode context
+            return self._exec_scoring_mcp_bridge(containers, args, ctx, name)
         else:
             return CapabilityResult(name, success=False, error=f"Unknown capability: {name}")
     
@@ -660,17 +804,126 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         if analysis is None:
             return CapabilityResult("analysis_shell", success=False, error="No analysis container")
         
-        # Execute code
+        # Check if this is translate phase - if so, auto-detect voxel arrays
+        current_step = ctx.episode_context.get("current_step", "")
+        if "translate" in current_step:
+            return self._exec_analysis_shell_with_voxel_detection(analysis, code, ctx)
+        
+        # Normal execution for other phases
         cmd = ["python", "-c", code]
         try:
-            result = exec_run_with_timeout(analysis, cmd, timeout=60)
-            output = coerce_exec_result(result)
+            result = exec_run_with_timeout(analysis, cmd, timeout_s=60)
+            exit_code, raw = coerce_exec_result(result)
+            stdout = raw.decode(errors="replace")
             return CapabilityResult(
                 "analysis_shell",
-                output={"stdout": output.get("stdout", ""), "stderr": output.get("stderr", "")},
-                success=output.get("exit_code", 1) == 0,
-                error=output.get("stderr") if output.get("exit_code", 1) != 0 else None,
+                output={"stdout": stdout, "stderr": ""},
+                success=exit_code == 0,
+                error=stdout if exit_code != 0 else None,
             )
+        except Exception as e:
+            return CapabilityResult("analysis_shell", success=False, error=str(e))
+    
+    def _exec_analysis_shell_with_voxel_detection(
+        self,
+        analysis: Container,
+        code: str,
+        ctx: CapabilityExecutionContext,
+    ) -> CapabilityResult:
+        """Execute analysis_shell code with automatic voxel array detection and feature layer creation."""
+        
+        # Wrap user code to automatically detect and save (200, 200, 8) voxel arrays
+        wrapped_code = '''
+import numpy as np
+import pickle
+import os
+
+# Store original locals to compare later
+_original_locals = set(locals().keys())
+
+try:
+    # Execute user's analysis code
+''' + code + '''
+    
+    print("\\n" + "="*50)
+    print("VOXEL DETECTION - CHECKING FOR (200,200,8) ARRAYS")
+    print("="*50)
+    
+    # Check for voxel arrays in final namespace
+    _final_locals = locals().copy()
+    _voxel_arrays_found = []
+    
+    for var_name, obj in _final_locals.items():
+        if (not var_name.startswith('_') and 
+            var_name not in _original_locals and 
+            var_name not in ['np', 'pickle', 'os']):
+            
+            try:
+                if isinstance(obj, np.ndarray) and obj.shape == (200, 200, 8):
+                    print(f"Found voxel array '{var_name}': shape {obj.shape}, dtype {obj.dtype}")
+                    _voxel_arrays_found.append({
+                        'name': var_name,
+                        'array': obj,
+                        'dtype': str(obj.dtype)
+                    })
+                elif isinstance(obj, np.ndarray) and len(obj.shape) > 3:
+                    print(f"WARNING: Multidimensional array '{var_name}' with shape {obj.shape} detected")
+                    print(f"  Only (200,200,8) arrays are accepted. Please reduce to single feature.")
+                    
+            except Exception as check_err:
+                print(f"Error checking '{var_name}': {check_err}")
+    
+    print(f"\\nTotal voxel arrays detected: {len(_voxel_arrays_found)}")
+    
+    # Auto-save voxel arrays as feature layers
+    _feature_layers_created = []
+    for voxel_info in _voxel_arrays_found:
+        try:
+            # Convert 3D voxel array to feature layer
+            voxel_array = voxel_info['array']
+            layer_name = voxel_info['name']
+            dtype = 'float' if 'float' in voxel_info['dtype'] else 'int'
+                
+            # Convert to Python list and save
+            voxel_list = voxel_array.tolist()
+            
+            # Here we would call create_feature_layer, but we'll mark it for the wrapper
+            print(f"AUTO-SAVE: {layer_name} -> feature layer (dtype: {dtype})")
+            _feature_layers_created.append({
+                'name': layer_name,
+                'values': voxel_list,
+                'dtype': dtype
+            })
+            
+        except Exception as save_err:
+            print(f"Failed to auto-save '{voxel_info['name']}': {save_err}")
+    
+    print(f"\\nFEATURE_LAYERS_TO_CREATE: {len(_feature_layers_created)}")
+    for layer in _feature_layers_created:
+        print(f"  - {layer['name']} ({layer['dtype']})")
+    print("="*50)
+    
+except Exception as user_code_error:
+    print(f"ERROR in user analysis code: {user_code_error}")
+    import traceback
+    traceback.print_exc()
+'''
+        
+        # Execute wrapped code
+        cmd = ["python", "-c", wrapped_code]
+        try:
+            result = exec_run_with_timeout(analysis, cmd, timeout_s=60)
+            exit_code, raw = coerce_exec_result(result)
+            stdout = raw.decode(errors="replace")
+            
+            
+            return CapabilityResult(
+                "analysis_shell",
+                output={"stdout": stdout, "stderr": ""},
+                success=exit_code == 0,
+                error=stdout if exit_code != 0 else None,
+            )
+            
         except Exception as e:
             return CapabilityResult("analysis_shell", success=False, error=str(e))
     
@@ -715,12 +968,119 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 error=f"Phase '{phase}' not found",
             )
         
+        output = phase_records[phase].copy()
+        
+        # Auto-enhance data_spec for coding phase
+        if phase == "hypothesise" and "data_spec" in output:
+            output["data_spec"] = self._enhance_data_spec(output["data_spec"])
+        
         return CapabilityResult(
             "phase_get",
-            output=phase_records[phase],
+            output=output,
             success=True,
         )
     
+    def _enhance_data_spec(self, data_spec: dict[str, Any]) -> dict[str, Any]:
+        """Enhance data_spec with file-type-specific technical guidance for coding agent."""
+        import os
+        enhanced = data_spec.copy()
+        files = enhanced.get("files", [])
+        
+        # Add file-specific guidance
+        file_specs = []
+        for file_path in files:
+            if file_path.endswith('.csv'):
+                if 'geochemDrillhole' in file_path:
+                    filename = os.path.basename(file_path)  # Extract just filename from any path
+                    full_path = f"/workspace/input/amalgamated_csvs/{filename}"
+                    file_specs.append({
+                        "file": file_path,
+                        "full_path": full_path,
+                        "type": "csv",
+                        "columns": ["longitude", "latitude", "maxdepth_drill", "au_ppm", "cu_ppm", "ag_ppm", "as_ppm", "al_ppm", "ba_ppm", "ca_ppm", "co_ppm", "cr_ppm", "fe_ppm", "k_ppm", "mg_ppm", "mn_ppm", "na_ppm", "ni_ppm", "pb_ppm", "s_ppm", "ti_ppm", "zn_ppm"],
+                        "spatial_cols": ["longitude", "latitude", "maxdepth_drill"],
+                        "note": "3D drillhole geochemistry data - use pd.read_csv(full_path)"
+                    })
+                elif 'geochemSurface' in file_path:
+                    filename = os.path.basename(file_path)  # Extract just filename from any path
+                    full_path = f"/workspace/input/amalgamated_csvs/{filename}"
+                    file_specs.append({
+                        "file": file_path,
+                        "full_path": full_path,
+                        "type": "csv", 
+                        "columns": ["longitude", "latitude", "au_ppm", "cu_ppm", "ag_ppm", "as_ppm"],
+                        "spatial_cols": ["longitude", "latitude"],
+                        "note": "2D surface geochemistry data - use pd.read_csv(full_path)"
+                    })
+                elif 'tenements' in file_path:
+                    filename = os.path.basename(file_path)  # Extract just filename from any path  
+                    full_path = f"/workspace/input/amalgamated_csvs/{filename}"
+                    file_specs.append({
+                        "file": file_path,
+                        "full_path": full_path,
+                        "type": "csv",
+                        "columns": ["tenement", "wkt_geometry", "longitude", "latitude"],
+                        "spatial_cols": ["longitude", "latitude"],
+                        "note": "Tenement boundaries and ownership - use pd.read_csv(full_path)"
+                    })
+                else:
+                    file_specs.append({"file": file_path, "type": "csv", "note": "Check columns with df.columns"})
+            elif file_path.endswith('.json') or 'wamex' in file_path.lower():
+                file_specs.append({
+                    "file": file_path,
+                    "type": "json",
+                    "fields": ["target_commodity_wamex", "abstract_wamex", "project_wamex"],
+                    "note": "Use keyword search for geological terms, commodities"
+                })
+            elif file_path.endswith('.md'):
+                file_specs.append({
+                    "file": file_path,
+                    "type": "markdown",
+                    "method": "grep/search",
+                    "note": "Use grep for keywords, never read full file"
+                })
+            elif file_path.endswith('.geojson'):
+                file_specs.append({
+                    "file": file_path,
+                    "type": "geojson",
+                    "geometry": "polygons/points",
+                    "properties": "varies by file",
+                    "note": "Spatial data with attributes"
+                })
+        
+        enhanced["file_specs"] = file_specs
+        return enhanced
+    
+    def _exec_get_experiment_summary(
+        self,
+        containers: list[Container],
+        ctx: CapabilityExecutionContext,
+    ) -> CapabilityResult:
+        """Return all phase data in one call for translate and rewrite agents."""
+        phase_records = ctx.episode_context.get("phase_records", {})
+        hypothesise = phase_records.get("hypothesise", {})
+        code = phase_records.get("code", {})
+        translate = phase_records.get("translate", {})
+        evaluate = phase_records.get("evaluate", {})
+        
+        return CapabilityResult(
+            "get_experiment_summary",
+            output={
+                "hypothesis": hypothesise.get("hypothesis", ""),
+                "data_spec": hypothesise.get("data_spec", {}),
+                "code_executed": code.get("code_executed", ""),
+                "result_summary": code.get("result_summary", ""),
+                "artifact_directory": code.get("artifact_directory", ""),
+                "artifact_files": code.get("artifact_files", []),
+                "feature_layer_name": translate.get("feature_layer_name", ""),
+                "dtype": translate.get("dtype", "float"),
+                "bic_delta": evaluate.get("bic_delta"),
+                "admitted": evaluate.get("admitted", False),
+                "mutual_info": evaluate.get("mutual_info", {}),
+            },
+            success=True,
+        )
+
     def _exec_submit_code(
         self,
         containers: list[Container],
@@ -737,66 +1097,136 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         if analysis is None:
             return CapabilityResult("submit_code", success=False, error="No analysis container")
         
-        cmd = ["python", "-c", code]
-        try:
-            result = exec_run_with_timeout(analysis, cmd, timeout=120)
-            output = coerce_exec_result(result)
+        # Create artifact directory
+        episode_id = ctx.episode_context.get("episode_id", "unknown")
+        artifact_dir = f"/tmp/artifacts/{episode_id}"
+        
+        # Wrap user code with automatic artifact capture
+        indented_code = '\n'.join("    " + line for line in code.split('\n'))
+        
+        # Use string concatenation to avoid f-string variable scope issues
+        wrapped_code = '''
+import os
+import glob
+import pickle
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# Create artifact directory and common output directories
+artifact_dir = "''' + artifact_dir + '''"
+os.makedirs(artifact_dir, exist_ok=True)
+os.makedirs("/workspace/output", exist_ok=True)  # Fix common user code issue
+
+# Store original locals to compare later
+_original_locals = set(locals().keys())
+
+try:
+    # Execute user's analysis code
+''' + indented_code + '''
+
+except Exception as user_code_error:
+    print(f"ERROR in user code: {user_code_error}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    # Always attempt artifact capture, even if user code failed
+    print("\\n" + "="*50)
+    print("ANALYSIS COMPLETE - CAPTURING ARTIFACTS")
+    print("="*50)
+    
+    # Capture artifacts from final namespace
+    _final_locals = locals().copy()
+    _artifacts_saved = []
+    
+    for var_name, obj in _final_locals.items():
+        if (not var_name.startswith('_') and 
+            var_name not in _original_locals and 
+            var_name not in ['artifact_dir', 'os', 'glob', 'pickle', 'pd', 'np', 'Path']):
             
-            # Store code and result
+            try:
+                if isinstance(obj, pd.DataFrame) and not obj.empty:
+                    filepath = f"{artifact_dir}/{var_name}_dataframe.csv"
+                    obj.to_csv(filepath, index=False)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved DataFrame '{var_name}' -> {filepath}")
+                    print(f"  Shape: {obj.shape}, Columns: {list(obj.columns)}")
+                
+                elif isinstance(obj, np.ndarray):
+                    filepath = f"{artifact_dir}/{var_name}_array.npy" 
+                    np.save(filepath, obj)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved numpy array '{var_name}' -> {filepath}")
+                    print(f"  Shape: {obj.shape}, dtype: {obj.dtype}")
+                
+                elif isinstance(obj, (dict, list, tuple)) and len(str(obj)) < 10000:
+                    filepath = f"{artifact_dir}/{var_name}_object.pkl"
+                    with open(filepath, 'wb') as f:
+                        pickle.dump(obj, f)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved object '{var_name}' -> {filepath}")
+                    print(f"  Type: {type(obj)}, Size: {len(str(obj))} chars")
+                
+                elif isinstance(obj, (int, float, str, bool)):
+                    # Save simple scalars as JSON-like format
+                    filepath = f"{artifact_dir}/{var_name}_scalar.txt"
+                    with open(filepath, 'w') as f:
+                        f.write(var_name + ": " + str(obj) + "\\ntype: " + type(obj).__name__)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved scalar '{var_name}' -> {filepath}")
+                    print(f"  Value: {obj}")
+                
+            except Exception as save_err:
+                print(f"Failed to save '{var_name}': {save_err}")
+    
+    # List all artifacts in directory
+    all_artifacts = glob.glob(f"{artifact_dir}/*")
+    print(f"\\nARTIFACTS_DIRECTORY: {artifact_dir}")
+    print(f"ARTIFACTS_SAVED: {all_artifacts}")
+    print("="*50)
+'''
+        
+        cmd = ["python", "-c", wrapped_code]
+        try:
+            result = exec_run_with_timeout(analysis, cmd, timeout_s=120)
+            exit_code, raw = coerce_exec_result(result)
+            stdout = raw.decode(errors="replace")
+            
+            # Extract artifact information from stdout
+            artifact_files = []
+            if "ARTIFACTS_SAVED:" in stdout:
+                import re
+                artifacts_match = re.search(r"ARTIFACTS_SAVED: \[(.*?)\]", stdout)
+                if artifacts_match:
+                    artifacts_str = artifacts_match.group(1)
+                    # Parse the list of file paths
+                    artifact_files = [f.strip().strip("'\"") for f in artifacts_str.split(",") if f.strip()]
+            
+            # Store code and result with artifact information
             phase_records = ctx.episode_context.setdefault("phase_records", {})
             phase_records["code"] = {
                 "code_executed": code,
-                "result_summary": output.get("stdout", ""),
-                "success": output.get("exit_code", 1) == 0,
+                "result_summary": stdout,
+                "artifact_directory": artifact_dir,
+                "artifact_files": artifact_files,
+                "success": exit_code == 0,
                 "timestamp": time.time(),
             }
             
             return CapabilityResult(
                 "submit_code",
                 output={
-                    "stdout": output.get("stdout", ""),
-                    "stderr": output.get("stderr", ""),
-                    "success": output.get("exit_code", 1) == 0,
+                    "stdout": stdout,
+                    "stderr": "",
+                    "success": exit_code == 0,
+                    "artifact_directory": artifact_dir,
+                    "artifact_files": artifact_files,
                 },
                 success=True,
             )
         except Exception as e:
             return CapabilityResult("submit_code", success=False, error=str(e))
-    
-    def _exec_create_feature_layer(
-        self,
-        containers: list[Container],
-        args: dict[str, Any],
-        ctx: CapabilityExecutionContext,
-    ) -> CapabilityResult:
-        """Create a feature layer in the voxel store."""
-        name = args.get("name", "")
-        values = args.get("values", [])
-        dtype = args.get("dtype", "float")
-        metadata = args.get("metadata", {})
-        
-        if not name or not values:
-            return CapabilityResult(
-                "create_feature_layer",
-                success=False,
-                error="name and values are required",
-            )
-        
-        # Store for later evaluation
-        phase_records = ctx.episode_context.setdefault("phase_records", {})
-        phase_records["translate"] = {
-            "feature_layer_name": name,
-            "feature_values": values,
-            "dtype": dtype,
-            "metadata": metadata,
-            "timestamp": time.time(),
-        }
-        
-        return CapabilityResult(
-            "create_feature_layer",
-            output={"name": name, "dtype": dtype, "staged": True},
-            success=True,
-        )
     
     def _exec_submit_rewrite(
         self,
@@ -804,22 +1234,412 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         args: dict[str, Any],
         ctx: CapabilityExecutionContext,
     ) -> CapabilityResult:
-        """Submit rewritten experiment record."""
-        graph_node = args.get("graph_node", {})
-        training_pair = args.get("training_pair", {})
+        """Submit rewritten experiment record. Auto-generates graph node and appends BIC."""
+        import pickle
+        import json
+        from pathlib import Path
+        from datetime import datetime
         
-        # Store terminal record
+        training_pair = args.get("training_pair", {})
+
+        phase_records = ctx.episode_context.get("phase_records", {})
+        hypothesise = phase_records.get("hypothesise", {})
+        code = phase_records.get("code", {})
+        translate = phase_records.get("translate", {})
+        evaluate = phase_records.get("evaluate", {})
+
+        # Auto-generate graph node from phase records
+        graph_node = {
+            "hypothesis": hypothesise.get("hypothesis", ""),
+            "data_spec": hypothesise.get("data_spec", {}),
+            "experiment_summary": code.get("result_summary", ""),
+            "feature_layer_name": translate.get("feature_layer_name", ""),
+            "outcome": {
+                "bic_delta": evaluate.get("bic_delta"),
+                "admitted": evaluate.get("admitted", False),
+                "mutual_info": evaluate.get("mutual_info", {}),
+            },
+        }
+
+        # Auto-append BIC result to training pair response
+        bic_delta = evaluate.get("bic_delta")
+        admitted = evaluate.get("admitted", False)
+        if isinstance(training_pair.get("response"), str) and bic_delta is not None:
+            verdict = "Admitted" if admitted else "Not admitted"
+            training_pair["response"] += (
+                f"\n\nResult: {bic_delta:.4f} BIC delta. {verdict}."
+            )
+
+        # Prepare training record for persistence
+        episode_id = ctx.episode_context.get("episode_id", "")
+        store_dir = ctx.episode_context.get("store_dir", "")
+        
+        # Extract data paths - need to get base data directory
+        if store_dir:
+            data_base_path = Path(store_dir).parent.parent  # from store/coe_fairbairn to data/feature-hypothesis
+        else:
+            data_base_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/data/feature-hypothesis")
+        
+        training_record = {
+            'prompt': training_pair.get('prompt', ''),
+            'response': training_pair.get('response', ''),
+            'bic_delta': bic_delta,
+            'episode_id': episode_id,
+            'timestamp': time.time(),
+            'admitted': admitted,
+            'layer_name': translate.get('feature_layer_name', ''),
+            'metadata': {
+                'hypothesis': hypothesise.get('hypothesis', ''),
+                'grid_bounds': ctx.episode_context.get('grid_spec', {}),
+                'mutual_info': evaluate.get('mutual_info', {}),
+                'experiment_summary': code.get('result_summary', '')
+            }
+        }
+        
+        # Save training data (ALL experiments)
+        try:
+            training_dir = data_base_path / "training"
+            training_file = training_dir / "training_pairs.pkl"
+            
+            # Load existing records or create new list
+            existing_records = []
+            if training_file.exists():
+                with open(training_file, 'rb') as f:
+                    existing_records = pickle.load(f)
+            
+            # Append new record
+            existing_records.append(training_record)
+            
+            # Save back to file
+            with open(training_file, 'wb') as f:
+                pickle.dump(existing_records, f)
+                
+        except Exception as e:
+            print(f"Warning: Failed to save training data: {e}")
+        
+        # Save to knowledge graph (ONLY successful experiments)
+        if admitted and bic_delta is not None and bic_delta < 0:
+            try:
+                knowledge_dir = data_base_path / "knowledge" / "coe_fairbairn"
+                experiments_file = knowledge_dir / "experiments.jsonl"
+                crossbreed_file = knowledge_dir / "crossbreed_index.jsonl"
+                
+                # Generate node ID
+                node_id = f"exp_{episode_id}" if episode_id else f"exp_{int(time.time())}"
+                
+                # Create knowledge graph record
+                kg_record = {
+                    "node_id": node_id,
+                    "prompt": training_pair.get('prompt', ''),
+                    "response": training_pair.get('response', ''),
+                    "bic_delta": bic_delta,
+                    "artifact_links": {
+                        "layer_file": f"store/coe_fairbairn/layers/{translate.get('feature_layer_name', '')}.npy" if translate.get('feature_layer_name') else None,
+                        "spatial_ops": f"store/coe_fairbairn/spatial.db:experiment_{episode_id}" if episode_id else None
+                    },
+                    "parent_node_1": None,  # TODO: Add crossbreed parent tracking
+                    "parent_node_2": None,
+                    "timestamp": datetime.now().isoformat(),
+                    "mutual_info": evaluate.get('mutual_info', {}),
+                    "layer_name": translate.get('feature_layer_name', ''),
+                    "hypothesis": hypothesise.get('hypothesis', '')
+                }
+                
+                # Append to experiments.jsonl
+                with open(experiments_file, 'a') as f:
+                    f.write(json.dumps(kg_record) + '\n')
+                
+                # Calculate mutual information with existing experiments and update crossbreed index
+                self._update_crossbreed_index(knowledge_dir, node_id, evaluate.get('mutual_info', {}))
+                
+            except Exception as e:
+                print(f"Warning: Failed to save knowledge graph data: {e}")
+
         ctx.episode_context["terminal_record"] = {
             "graph_node": graph_node,
             "training_pair": training_pair,
             "timestamp": time.time(),
         }
-        
+
         return CapabilityResult(
             "submit_rewrite",
-            output={"recorded": True},
+            output={"recorded": True, "training_saved": True, "knowledge_saved": admitted},
             success=True,
         )
+    
+    def _update_crossbreed_index(
+        self,
+        knowledge_dir: Path,
+        new_node_id: str,
+        new_mutual_info: dict[str, float]
+    ) -> None:
+        """Update crossbreed index with mutual information scores for new experiment."""
+        import json
+        from datetime import datetime
+        
+        try:
+            experiments_file = knowledge_dir / "experiments.jsonl"
+            crossbreed_file = knowledge_dir / "crossbreed_index.jsonl"
+            
+            # Read existing experiments to calculate MI with each
+            existing_experiments = []
+            if experiments_file.exists():
+                with open(experiments_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                exp = json.loads(line)
+                                existing_experiments.append(exp)
+                            except json.JSONDecodeError:
+                                continue
+            
+            # Calculate mutual information between new experiment and all existing ones
+            new_mi_records = []
+            for existing_exp in existing_experiments:
+                if existing_exp['node_id'] == new_node_id:
+                    continue  # Skip self
+                
+                # Get mutual information score between layer names
+                mi_score = 0.0
+                new_layer = new_mutual_info
+                existing_layer = existing_exp.get('mutual_info', {})
+                
+                # Look for cross-references in mutual info dictionaries
+                if existing_exp.get('layer_name') in new_layer:
+                    mi_score = new_layer[existing_exp['layer_name']]
+                elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
+                    mi_score = existing_layer[locals()['layer_name']]
+                
+                # Create pair record
+                pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
+                mi_record = {
+                    "pair_id": pair_id,
+                    "node_1": new_node_id,
+                    "node_2": existing_exp['node_id'],
+                    "mutual_information": mi_score,
+                    "calculated_at": datetime.now().isoformat()
+                }
+                new_mi_records.append(mi_record)
+            
+            # Append new MI records to crossbreed index
+            if new_mi_records:
+                with open(crossbreed_file, 'a') as f:
+                    for record in new_mi_records:
+                        f.write(json.dumps(record) + '\n')
+                        
+        except Exception as e:
+            print(f"Warning: Failed to update crossbreed index: {e}")
+    
+    def _exec_spatial_capability(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+        capability_name: str,
+    ) -> CapabilityResult:
+        """Execute spatial tool capability via voxel-features-mcp."""
+        
+        print(f"🔧 DEBUG: Starting spatial capability: {capability_name}")
+        print(f"🔧 DEBUG: Args: {args}")
+        
+        # Set up environment for spatial operations
+        import sys
+        from pathlib import Path
+        
+        # Add voxel-features-mcp to path
+        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+        sys.path.append(vfm_path)
+        print(f"🔧 DEBUG: Added path: {vfm_path}")
+        
+        try:
+            # Import required spatial tools
+            print("🔧 DEBUG: Importing spatial modules...")
+            from voxel_features.spatial import SpatialVoxelStore
+            from voxel_features.store import COE_FAIRBAIRN_GRID
+            from voxel_features.mcp.tools.spatial_tools import (
+                spatial_add_point, spatial_add_line, spatial_query_region,
+                spatial_coord_to_voxel, spatial_get_operations_log
+            )
+            print("🔧 DEBUG: ✅ Imports successful")
+            
+            # Get store directory from episode context
+            store_dir = ctx.episode_context.get("store_dir")
+            print(f"🔧 DEBUG: Episode context keys: {list(ctx.episode_context.keys())}")
+            print(f"🔧 DEBUG: Store dir: {store_dir}")
+            if not store_dir:
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error="No store directory available in episode context",
+                )
+            
+            # Create or get spatial store
+            print("🔧 DEBUG: Creating SpatialVoxelStore...")
+            store = SpatialVoxelStore(store_dir, COE_FAIRBAIRN_GRID)
+            print(f"🔧 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
+            print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
+            
+            # Validate coordinates if this is a spatial operation with coordinates
+            if capability_name in ["spatial_add_point", "spatial_add_line"]:
+                if "longitude" in args and "latitude" in args:
+                    lon, lat = args["longitude"], args["latitude"]
+                    in_bounds = (store.grid.origin[0] <= lon <= store.grid.maximum[0] and 
+                                store.grid.origin[1] <= lat <= store.grid.maximum[1])
+                    print(f"🔧 DEBUG: Coordinate validation - lon={lon:.6f}, lat={lat:.6f}, in_bounds={in_bounds}")
+                    
+                    if not in_bounds:
+                        return CapabilityResult(
+                            capability_name,
+                            success=False,
+                            error=f"Coordinates ({lon:.6f}, {lat:.6f}) outside grid bounds",
+                        )
+            
+            # Route to appropriate spatial tool function
+            print(f"🔧 DEBUG: Routing to tool: {capability_name}")
+            if capability_name == "spatial_add_point":
+                print("🔧 DEBUG: Calling spatial_add_point...")
+                result = spatial_add_point(store, **args)
+            elif capability_name == "spatial_add_line":
+                print("🔧 DEBUG: Calling spatial_add_line...")
+                result = spatial_add_line(store, **args)
+            elif capability_name == "spatial_query_region":
+                print("🔧 DEBUG: Calling spatial_query_region...")
+                result = spatial_query_region(store, **args)
+            elif capability_name == "spatial_coord_to_voxel":
+                print("🔧 DEBUG: Calling spatial_coord_to_voxel...")
+                result = spatial_coord_to_voxel(store, **args)
+            elif capability_name == "spatial_get_operations_log":
+                print("🔧 DEBUG: Calling spatial_get_operations_log...")
+                result = spatial_get_operations_log(store)
+            else:
+                print(f"🔧 DEBUG: ❌ Unknown capability: {capability_name}")
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error=f"Unknown spatial capability: {capability_name}",
+                )
+            
+            print(f"🔧 DEBUG: ✅ Tool result: {result}")
+            
+            # Update translate phase with layer name for later evaluation
+            if result.get("success") and result.get("layer_name"):
+                phase_records = ctx.episode_context.setdefault("phase_records", {})
+                translate_record = phase_records.setdefault("translate", {})
+                if not translate_record.get("feature_layer_name"):
+                    translate_record["feature_layer_name"] = result["layer_name"]
+                    translate_record["timestamp"] = __import__('time').time()
+                    print(f"🔧 DEBUG: Stored layer name '{result['layer_name']}' for later evaluation")
+            
+            # Return result
+            return CapabilityResult(
+                capability_name,
+                output=result,
+                success=result.get("success", False),
+            )
+            
+        except Exception as e:
+            print(f"🔧 DEBUG: ❌ Exception in spatial capability: {e}")
+            import traceback
+            traceback.print_exc()
+            return CapabilityResult(
+                capability_name,
+                success=False,
+                error=f"Spatial capability execution failed: {str(e)}",
+            )
+    
+    def _exec_scoring_mcp_bridge(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+        capability_name: str,
+    ) -> CapabilityResult:
+        """Bridge MCP scoring tool call and capture results in episode context."""
+        
+        print(f"🎯 DEBUG: Starting scoring capability: {capability_name}")
+        print(f"🎯 DEBUG: Args: {args}")
+        
+        # Set up environment for scoring operations
+        import sys
+        from pathlib import Path
+        
+        # Add voxel-features-mcp to path
+        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+        sys.path.append(vfm_path)
+        print(f"🎯 DEBUG: Added path: {vfm_path}")
+        
+        try:
+            # Import required scoring tools
+            print("🎯 DEBUG: Importing scoring modules...")
+            from voxel_features.spatial import SpatialVoxelStore
+            from voxel_features.store import COE_FAIRBAIRN_GRID
+            from voxel_features.mcp.tools.scoring_tools import (
+                scoring_create_feature_layer
+            )
+            print("🎯 DEBUG: ✅ Imports successful")
+            
+            # Get store directory from episode context
+            store_dir = ctx.episode_context.get("store_dir")
+            print(f"🎯 DEBUG: Store dir: {store_dir}")
+            if not store_dir:
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error="No store directory available in episode context",
+                )
+            
+            # Create or get spatial store
+            print("🎯 DEBUG: Creating SpatialVoxelStore...")
+            store = SpatialVoxelStore(store_dir, COE_FAIRBAIRN_GRID)
+            print(f"🎯 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
+            
+            # Route to scoring.create_feature_layer MCP tool
+            print(f"🎯 DEBUG: Routing to tool: {capability_name}")
+            if capability_name == "scoring_create_feature_layer":
+                print("🎯 DEBUG: Calling scoring_create_feature_layer MCP function...")
+                result = scoring_create_feature_layer(store, **args)
+            else:
+                print(f"🎯 DEBUG: ❌ Unknown capability: {capability_name}")
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error=f"Unknown scoring capability: {capability_name}",
+                )
+            
+            print(f"🎯 DEBUG: ✅ Tool result: {result}")
+            
+            # Store evaluation results in episode context for rewrite phase
+            if result.get("success"):
+                phase_records = ctx.episode_context.setdefault("phase_records", {})
+                
+                # Update translate phase record
+                layer_name = args.get("name", "")
+                if layer_name:
+                    translate_record = phase_records.setdefault("translate", {})
+                    translate_record["feature_layer_name"] = layer_name
+                    translate_record["timestamp"] = __import__('time').time()
+                
+                # Store evaluation results
+                phase_records["evaluate"] = result
+                print(f"🎯 DEBUG: Stored evaluation data in phase records")
+            
+            # Return result
+            return CapabilityResult(
+                capability_name,
+                output=result,
+                success=result.get("success", False),
+            )
+            
+        except Exception as e:
+            print(f"🎯 DEBUG: ❌ Exception in scoring capability: {e}")
+            import traceback
+            traceback.print_exc()
+            return CapabilityResult(
+                capability_name,
+                success=False,
+                error=f"Scoring capability execution failed: {str(e)}",
+            )
     
     # ------------------------------------------------------------------
     # State measurement and rewards
@@ -877,6 +1697,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         self,
         initial: FeatureHypothesisState,
         final: FeatureHypothesisState,
+        artifacts: EpisodeArtifacts,
     ) -> TaskReward:
         """Compute reward based on BIC improvement."""
         
@@ -941,14 +1762,23 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
         """Check if there are crossbreed pairs available."""
-        kg_index = Path(variation.kg_dir) / "experiments.json"
-        if not kg_index.exists():
+        experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+        if not experiments_file.exists():
             return False
         try:
-            with open(kg_index) as f:
-                data = json.load(f)
-            admitted = [exp for exp in data.values() if exp.get("admitted")]
-            return len(admitted) >= 2
+            # Count successful experiments in JSONL format
+            admitted_count = 0
+            with open(experiments_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            exp = json.loads(line)
+                            if exp.get("bic_delta", 0) < 0:  # Successful experiments only
+                                admitted_count += 1
+                        except json.JSONDecodeError:
+                            continue
+            return admitted_count >= 2
         except Exception:
             return False
     
@@ -956,49 +1786,93 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         self,
         variation: FeatureHypothesisVariation,
     ) -> dict[str, Any]:
-        """Get crossbreed prompt and parent IDs using KnowledgeGraph."""
-        import sys
-        sys.path.append(str(Path(__file__).parent.parent.parent / "voxel-features-mcp"))
+        """Get crossbreed prompt and parent IDs using JSONL knowledge graph."""
+        import json
         
         try:
-            from voxel_features.knowledge_graph import KnowledgeGraph
+            experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+            crossbreed_file = Path(variation.kg_dir) / "crossbreed_index.jsonl"
             
-            # Load knowledge graph
-            kg = KnowledgeGraph(variation.kg_dir)
-            kg.load()
-            
-            # Get best crossbreed pairs (prefers high performance + low MI)
-            pairs = kg.get_crossbreed_pairs(
-                max_pairs=1,  # Just need one pair
-                prefer_orthogonal=True,  # Prefer low mutual information
-            )
-            
-            if not pairs:
+            if not experiments_file.exists():
                 return {}
             
-            exp_a, exp_b = pairs[0]
+            # Load all successful experiments
+            experiments = []
+            with open(experiments_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            exp = json.loads(line)
+                            if exp.get("bic_delta", 0) < 0:  # Only successful experiments
+                                experiments.append(exp)
+                        except json.JSONDecodeError:
+                            continue
+            
+            if len(experiments) < 2:
+                return {}
+            
+            # Load mutual information index if available
+            mi_index = {}
+            if crossbreed_file.exists():
+                with open(crossbreed_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                mi_record = json.loads(line)
+                                pair_id = mi_record["pair_id"]
+                                mi_index[pair_id] = mi_record["mutual_information"]
+                            except (json.JSONDecodeError, KeyError):
+                                continue
+            
+            # Find best crossbreed pair (high BIC improvement + low MI)
+            best_pair = None
+            best_score = float('-inf')
+            
+            for i, exp_a in enumerate(experiments):
+                for exp_b in experiments[i+1:]:
+                    # Calculate combined BIC improvement
+                    bic_a = abs(exp_a.get("bic_delta", 0))
+                    bic_b = abs(exp_b.get("bic_delta", 0))
+                    combined_bic = bic_a + bic_b
+                    
+                    # Get mutual information (prefer low MI = orthogonal features)
+                    pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
+                    mi_score = mi_index.get(pair_id, 0.0)
+                    
+                    # Combined score: high BIC improvement, low MI
+                    pair_score = combined_bic - mi_score
+                    
+                    if pair_score > best_score:
+                        best_score = pair_score
+                        best_pair = (exp_a, exp_b)
+            
+            if not best_pair:
+                return {}
+            
+            exp_a, exp_b = best_pair
             
             prompt = (
                 f"These experiments both improved the world model:\n\n"
-                f"Experiment 1: \"{exp_a.hypothesis}\"\n"
-                f"- Result: {exp_a.result_summary}\n"
-                f"- Feature: {exp_a.feature_layer_name}\n"
-                f"- BIC improvement: {abs(exp_a.bic_delta or 0):.2f}\n\n"
-                f"Experiment 2: \"{exp_b.hypothesis}\"\n"
-                f"- Result: {exp_b.result_summary}\n"
-                f"- Feature: {exp_b.feature_layer_name}\n"
-                f"- BIC improvement: {abs(exp_b.bic_delta or 0):.2f}\n\n"
+                f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_a.get('layer_name', '')}\n"
+                f"- BIC improvement: {abs(exp_a.get('bic_delta', 0)):.2f}\n\n"
+                f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_b.get('layer_name', '')}\n"
+                f"- BIC improvement: {abs(exp_b.get('bic_delta', 0)):.2f}\n\n"
                 f"Given that both patterns exist in the data, what new hypothesis "
                 f"would you propose that combines or builds on these findings?"
             )
             
             return {
                 "prompt": prompt,
-                "parent_ids": [exp_a.id, exp_b.id],
+                "parent_ids": [exp_a["node_id"], exp_b["node_id"]],
             }
         except Exception as e:
-            # Fallback to simple selection if KnowledgeGraph fails
-            print(f"Warning: KnowledgeGraph failed, using simple selection: {e}")
+            print(f"Warning: JSONL crossbreed failed, using simple fallback: {e}")
             return self._get_crossbreed_context_simple(variation)
     
     def _get_crossbreed_context_simple(
@@ -1006,42 +1880,47 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         variation: FeatureHypothesisVariation,
     ) -> dict[str, Any]:
         """Simple fallback crossbreed selection - just first two admitted."""
-        kg_index = Path(variation.kg_dir) / "experiments.json"
-        if not kg_index.exists():
+        experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+        if not experiments_file.exists():
             return {}
         
         try:
-            with open(kg_index) as f:
-                data = json.load(f)
+            # Load first two successful experiments from JSONL
+            experiments = []
+            with open(experiments_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            exp = json.loads(line)
+                            if exp.get("bic_delta", 0) < 0:  # Only successful experiments
+                                experiments.append(exp)
+                                if len(experiments) >= 2:
+                                    break  # Just need first two
+                        except json.JSONDecodeError:
+                            continue
             
-            admitted = [
-                (exp_id, exp) 
-                for exp_id, exp in data.items() 
-                if exp.get("admitted")
-            ]
-            
-            if len(admitted) < 2:
+            if len(experiments) < 2:
                 return {}
             
-            # Simple: just take first two
-            exp_a_id, exp_a = admitted[0]
-            exp_b_id, exp_b = admitted[1]
+            exp_a, exp_b = experiments[0], experiments[1]
             
             prompt = (
                 f"These experiments both improved the world model:\n\n"
                 f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
-                f"- Result: {exp_a.get('result_summary', '')}\n"
-                f"- Feature: {exp_a.get('feature_layer_name', '')}\n\n"
+                f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_a.get('layer_name', '')}\n\n"
                 f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
-                f"- Result: {exp_b.get('result_summary', '')}\n"
-                f"- Feature: {exp_b.get('feature_layer_name', '')}\n\n"
+                f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_b.get('layer_name', '')}\n\n"
                 f"Given that both patterns exist in the data, what new hypothesis "
                 f"would you propose that combines or builds on these findings?"
             )
             
             return {
                 "prompt": prompt,
-                "parent_ids": [exp_a_id, exp_b_id],
+                "parent_ids": [exp_a["node_id"], exp_b["node_id"]],
             }
         except Exception:
             return {}
+
