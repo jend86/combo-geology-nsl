@@ -1,0 +1,32 @@
+# Voxel Features MCP server
+# Build context: NSL2-geology-task root (docker/feature-hypothesis-compose/docker-compose.yml)
+FROM python:3.12-slim-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tini \
+      ca-certificates \
+      libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies for voxel-features-mcp
+RUN pip install --no-cache-dir \
+    "numpy>=1.26" \
+    "scipy>=1.12" \
+    "pydantic>=2.7" \
+    "typer>=0.12" \
+    "mcp>=1.9" \
+    "filelock>=3.13"
+
+# Copy voxel_features module from src/
+COPY src/voxel_features /opt/vfm/voxel_features
+
+ENV PYTHONPATH=/opt/vfm \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN mkdir -p /workspace/store /workspace/knowledge /workspace/tmp
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]

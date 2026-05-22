@@ -1,0 +1,3 @@
+{"type":"intermediate_step","payload":{"event_type":"LLM_END","name":"shim_llm","data":{"output":"First answer."},"metadata":{}}}
+{"type":"intermediate_step","payload":{"event_type":"TOOL_END","name":"capabilities__run_python","data":{"output":"ok"},"metadata":{}}}
+{"type":"intermediate_step","payload":{"event_type":"LLM_END","name":"shim_llm","data":{"output":"Second answer."},"metadata":{}}}

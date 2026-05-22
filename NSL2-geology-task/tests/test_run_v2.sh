@@ -1,0 +1,38 @@
+#!/bin/bash
+# Test run using V2 workflow with BIC evaluation
+
+echo "🧪 Testing Feature Hypothesis V2 Workflow"
+echo "=========================================="
+
+# Check if .env has been updated
+if grep -q "your-openrouter-api-key-here" .env; then
+    echo "ERROR: Please update .env with your actual OpenRouter API key"
+    exit 1
+fi
+
+echo "📋 Using V2 task: tasks.feature_hypothesis_v2.FeatureHypothesisTaskV2"
+echo "🎯 Expected flow: translate → evaluate_spatial_layer → rewrite"
+echo ""
+
+# Run single episode with V2 workflow
+echo "🚀 Running single episode with V2 workflow..."
+uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml
+
+echo ""
+echo "📊 Checking results..."
+
+# Check if data was persisted
+if [ -f "./data/feature-hypothesis/training/training_pairs.pkl" ]; then
+    echo "✅ Training data saved successfully"
+else
+    echo "❌ Training data not saved"
+fi
+
+if [ -f "./data/feature-hypothesis/knowledge/coe_fairbairn/experiments.jsonl" ]; then
+    echo "✅ Knowledge graph data saved successfully"
+else
+    echo "❌ Knowledge graph data not saved"
+fi
+
+echo ""
+echo "🎯 V2 Test completed!"

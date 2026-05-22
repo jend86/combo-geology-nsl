@@ -1,0 +1,98 @@
+# Minimal verification run for the geology graph-refinement task.
+# Based on config-memory-cleanup-msagent.toml: vLLM + Qwen2.5-Coder-7B-AWQ
+# serving, Dockerized ms-agent harness, and Qwen2.5 training base metadata.
+
+model_name = "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
+code_host_cache_path = "./code/geology-graph-msagent/code/"
+container_ids = [
+  "geology-graph-compose-agent-1",
+  "geology-graph-compose-g2v-1",
+  "geology-graph-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/geology-graph-compose"
+train_data_save_folder = "./data/geology-graph-msagent/train_data"
+
+[vllm]
+max_model_len = 32000
+max_num_seqs = 4
+enable_chunked_prefill = true
+enable_prefix_caching = true
+chat_template_path = "config/chat_templates/qwen2.5-instruct.jinja"
+enable_auto_tool_choice = true
+tool_call_parser = "hermes"
+
+[task]
+class = "tasks.geology_graph.GeologyGraphTask"
+
+[task.config]
+docker_compose_dir = "./docker/geology-graph-compose"
+dataset_dir = "./data/geology/36572_smolianova_1984"
+pool_root = "./data/geology-graph-msagent/pools"
+# Pin one variation so four sequential episodes cover roughly two bootstrap
+# seed episodes followed by regular refinement, assuming seed admission passes.
+variation_names = ["smolianova_basic"]
+t_steady = 60.0
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "ms_agent"
+image = "nsl/ms-agent:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/ms-agent"
+build_args = { MS_AGENT_VERSION = "1.6.0", MCP_VERSION = "1.1.0", OMEGACONF_VERSION = "2.3.0", LOGURU_VERSION = "0.7" }
+
+[harness.container.profile_config]
+model = "nsl-geology-graph"
+# Doubled from the original 24; mirrors the doubled task-side per-step caps
+# in geology_graph.py episode_constraints().
+max_chat_round = 48
+tool_call_timeout = 360
+transcript_tag = "episode"
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 14400
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+parallel_episodes = 1
+target_training_rows = 4
+# Regular-workflow episode budget. Bootstrap episodes are counted against
+# `max_bootstrap_episodes` instead, since their success rate is structurally
+# low (the agent is composing a seed graph from nothing).
+max_episodes = 20
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+resume_from_checkpoint = false
+generation_output_dir = "./data/geology-graph-msagent/generations"
+
+[training]
+base_model = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+max_steps = 20
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 4096
+adapter_output_dir = "./models/adapters/geology-graph-msagent"
+wandb_project = "geology-prototype"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 1
+training_window_size = 1
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["verification", "geology-graph", "bootstrap-smoke"]

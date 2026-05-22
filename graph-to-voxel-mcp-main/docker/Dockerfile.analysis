@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1.7
+# graph-to-voxel-mcp ANALYSIS runtime — see
+# docs/design/09-docker-runtime.md §5.6.
+#
+# Companion image to `Dockerfile.representation`. Provides a shell + Python
+# environment for raw-dataset analysis (grep, file reads, pandas / polars /
+# DuckDB, GeoPandas / rasterio / shapely). Used by consumers (e.g. the
+# negative-space-learning geology-graph refinement task) that want to give an
+# agent shell access to mounted data without exposing the IC criterion or any
+# code path under `graph_to_voxel.refinement`.
+#
+# Build target:
+#   docker build -f docker/Dockerfile.analysis -t g2v:analysis .
+#
+# Hard constraints (asserted by tests/integration/test_analysis_image.py):
+#   - `import graph_to_voxel.refinement` fails (ModuleNotFoundError).
+#   - `import graph_to_voxel` fails (the package is not installed).
+#   - `import loopstructural` fails.
+# These are the structural guarantees that "shell access ≠ scoring access".
+#
+# Why this is a separate Dockerfile rather than another build target of the
+# representation image: the structural guarantee we want is "the scorer
+# package is not on PYTHONPATH". A multi-stage Dockerfile that copies a venv
+# from a `representation` stage cannot make that guarantee without
+# selectively pruning site-packages, which is fragile. Starting from a clean
+# `python:3.12-slim-bookworm` and installing only the analysis libraries is
+# the simplest way to make the import test impossible to pass.
+#
+# Why pip instead of uv + lockfile: the analysis surface is a different
+# dependency closure from the representation runtime. Reusing `uv.lock` would
+# force the analysis image into version pins driven by LoopStructural /
+# Pydantic / FastMCP. Pip with floor constraints keeps the analysis image
+# independent without thrashing the representation lockfile on every bump.
+
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS analysis
+
+# Native runtime libs and shell tooling.
+# - ripgrep / jq / file / less / vim-tiny: command-line workhorses for the
+#   analysis_shell capability.
+# - tini: PID 1 reaping.
+# - libgomp1: OpenMP runtime for numpy/scipy/pandas BLAS paths.
+# - libexpat1: pulled in transitively by some geo libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ripgrep \
+      jq \
+      file \
+      less \
+      vim-tiny \
+      tini \
+      ca-certificates \
+      libgomp1 \
+      libexpat1 \
+ && rm -rf /var/lib/apt/lists/*
+
+# Floor pins (no upper caps; matches the representation runtime's `data` and
+# `geo` extras groups in pyproject.toml). The constraint shape is "as old as
+# tested, as new as available" — let pip resolve to current wheels.
+#
+# NOT installed (and asserted absent by the smoke tests): `graph_to_voxel`,
+# `loopstructural`, `xarray`, `zarr`, `pyvista`, `matplotlib`, `mcp`,
+# `filelock`. These belong in the representation image.
+RUN pip install --no-cache-dir \
+      "pandas>=2.2" \
+      "polars>=1.0" \
+      "numpy>=1.26" \
+      "scipy>=1.12" \
+      "pyarrow>=16" \
+      "duckdb>=1.0" \
+      "geopandas>=1.0" \
+      "rasterio>=1.3" \
+      "shapely>=2.0" \
+      "pyproj>=3.6" \
+      "fiona>=1.10"
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Match the representation image's workspace layout for ergonomics. Consumers
+# typically bind-mount their dataset over /workspace/input read-only and a
+# scratch tmpfs over /workspace/out.
+RUN mkdir -p /workspace/input /workspace/out
+
+WORKDIR /workspace
+
+# tini as PID 1 (signal handling) + `sleep infinity` so the container stays
+# alive for `docker exec` from a consumer task. There is no service in this
+# image — it is a passive shell host driven entirely by exec_run.
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sleep", "infinity"]

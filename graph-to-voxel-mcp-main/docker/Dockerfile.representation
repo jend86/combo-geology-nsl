@@ -1,0 +1,115 @@
+# syntax=docker/dockerfile:1.7
+# graph-to-voxel-mcp REPRESENTATION runtime — see
+# docs/design/09-docker-runtime.md §5.6 for the representation/analysis split.
+#
+# This image carries the full graph-to-voxel runtime: schema, engine,
+# LoopStructural, the IC criterion (`graph_to_voxel.refinement`), the FastMCP
+# server, scorer entrypoints, and headless VTK/matplotlib. Build target:
+#   docker build -f docker/Dockerfile.representation -t g2v:representation .
+#
+# Consumers that want a *scorer-free* shell/Python environment for raw-dataset
+# analysis (the geology-graph refinement task being one) should build
+# `docker/Dockerfile.analysis` instead. That image intentionally omits
+# `graph_to_voxel.refinement` so shell access does not imply criterion access.
+#
+# Strategy: Approach A (python:3.12-slim + uv) with a multi-stage split.
+# Stage `builder` resolves and installs Python deps from the committed uv.lock
+# into /opt/venv. Stage `runtime` carries only the runtime shared libraries
+# needed for VTK off-screen rendering, matplotlib `Agg`, and OpenMP.
+#
+# The image bundles five optional extras from pyproject.toml:
+#   - mcp  (FastMCP server runtime)
+#   - viz  (PyVista + matplotlib, headless)
+#   - data (DuckDB + pyarrow for data engineering)
+#   - geo  (geopandas + rasterio + shapely + pyproj + fiona)
+#   - dev  (pytest stack so `pytest -q` works in-container)
+#
+# GemPy / kriging / PDF tooling from the design's intent list are intentionally
+# omitted in v0: no in-tree consumer needs them, so excluding keeps the image
+# in the ~1–1.5 GB range. They can land as a future `:full` variant when an
+# actual dependency exists.
+
+ARG PYTHON_VERSION=3.12
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+
+# uv from the published image, no system pollution.
+COPY --from=ghcr.io/astral-sh/uv:0.5 /uv /uvx /usr/local/bin/
+
+# Build-only deps. scipy/numpy/loopstructural ship manylinux wheels, but git is
+# required by uv when a transitive dep is resolved from a VCS source, and
+# build-essential covers any pure-sdist fallback.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential \
+      git \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PYTHON=/usr/local/bin/python3.12
+
+WORKDIR /opt/g2v
+
+# Resolve dependencies first so a source-only edit doesn't bust this layer.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-install-project \
+      --extra mcp --extra viz --extra data --extra geo --extra dev
+
+# Bring in the project tree and install it editable on top of the cached venv.
+COPY graph_to_voxel ./graph_to_voxel
+COPY docker/entrypoint.sh ./docker/entrypoint.sh
+RUN uv sync --frozen \
+      --extra mcp --extra viz --extra data --extra geo --extra dev \
+ && chmod +x ./docker/entrypoint.sh
+
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS runtime
+
+# Runtime-only shared libs:
+# - libgl1 / libegl1 / libxrender1: VTK off-screen, matplotlib backends.
+# - libgomp1: OpenMP runtime used by scipy/sklearn/numpy.
+# - fonts-dejavu-core: matplotlib needs at least one font on disk.
+# - tini: PID 1 reaping so signals reach the Python process cleanly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgl1 \
+      libegl1 \
+      libxrender1 \
+      libgomp1 \
+      fonts-dejavu-core \
+      tini \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# The venv is hard-linked to /opt/venv in both stages so PATH+VIRTUAL_ENV
+# activate without sourcing anything.
+ENV PATH=/opt/venv/bin:$PATH \
+    VIRTUAL_ENV=/opt/venv \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLBACKEND=Agg \
+    PYVISTA_OFF_SCREEN=true \
+    G2V_WORKSPACE_ROOT=/var/lib/g2v/workspace \
+    G2V_PREVIEW_MAX_TIME_S=10 \
+    G2V_PREVIEW_MAX_MEMORY_MB=512 \
+    G2V_PREVIEW_MAX_VOXELS=500000 \
+    G2V_PREVIEW_MAX_POINTS=10000 \
+    G2V_PREVIEW_ALLOW_MCUE=false
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /opt/g2v /opt/g2v
+
+# Workspace store + conventional mount points. The compose file overlays bind
+# mounts on top; in standalone `docker run`, these are usable on their own.
+RUN mkdir -p \
+      /var/lib/g2v/workspace \
+      /workspace/input \
+      /workspace/data \
+      /workspace/out
+
+WORKDIR /opt/g2v
+
+# stdio MCP transport — no ports exposed. HTTP/SSE is a future variant.
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/g2v/docker/entrypoint.sh"]
+CMD ["mcp"]

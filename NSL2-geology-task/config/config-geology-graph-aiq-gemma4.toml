@@ -1,0 +1,169 @@
+# Geology graph-refinement task via AIQ harness, driven by Gemma 4 31B AWQ.
+#
+# Forked from config-geology-graph-aiq.toml (same task, same AIQ harness, same
+# Docker compose project). The deltas are model + engine + parallelism, lifted
+# from config-forked-exploit-msagent.toml so we re-use the validated Gemma 4
+# vLLM topology on this device (2× RTX 4090, no NVLink):
+#
+#   - model_name + tool_call_parser swapped to the Gemma 4 family
+#   - vLLM topology pinned to PP=2, fp8 KV, piecewise cudagraph
+#   - parallel_episodes lifted to match max_num_seqs (10)
+#   - training base_model swapped to the Gemma 4 unsloth bnb-4bit shadow
+#
+# Why a separate config rather than overriding fields ad-hoc: the AIQ
+# profile_config is task-shaped (max_iterations / force_tool_choice /
+# function_group_name) while the vLLM block is hardware-shaped — keeping them
+# co-located in one file makes the "run geology on Gemma 4" knob a single
+# `--config` argument.
+#
+# Pre-flight checklist (separate g2v base images live in graph-to-voxel-mcp):
+#   1. cd ~/graph-to-voxel-mcp && \
+#        docker build -f docker/Dockerfile.representation -t g2v:representation . && \
+#        docker build -f docker/Dockerfile.analysis -t g2v:analysis .
+#   2. uv run python scripts/build_harness_images.py \
+#        --config config/config-geology-graph-aiq-gemma4.toml
+#   3. Confirm data/geology/36572_smolianova_1984/ is populated (the analysis
+#      container mounts it read-only at /workspace/input).
+#
+# Known risks carried over from the parent AIQ config:
+#   - force_tool_choice=true compels a tool call on every turn. Gemma 4's
+#     gemma4-parser tool envelope has not been validated under AIQ on this
+#     task; if we see 1-turn / 0-tool-call episodes (the dhjjal-style failure
+#     mode noted in the parent config), the v2 mitigation is to drop
+#     force_tool_choice and add a task-side terminator capability.
+
+model_name = "openrouter:openai/gpt-4o"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/geology-graph-aiq-gemma4/code/"
+container_ids = [
+  "geology-graph-compose-agent-1",
+  "geology-graph-compose-g2v-1",
+  "geology-graph-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/geology-graph-compose"
+train_data_save_folder = "./data/geology-graph-aiq-gemma4/train_data"
+
+[inference]
+timeout = 300
+# max_tokens intentionally omitted → OAIGenner skips the kwarg and vLLM sizes
+# each request as (max_model_len - prompt_tokens). See parent msagent config.
+
+[vllm]
+# Two RTX 4090s without NVLink — same hardware as forked-exploit-msagent, so
+# the same TP/DP/PP trajectory applies: TP=2 bottlenecks on PCIe all-reduce,
+# DP=2 OOMs (Gemma 4 31B AWQ weights ~17 GB per replica on 24 GB cards), PP=2
+# splits layers ~half/half so each card holds ~8.5 GB of weights and leaves
+# headroom for activations + KV. PP requires the upstream gemma4 fix landed in
+# vLLM PR #40786 (2026-04-29); src/backend/vllm.py pins a nightly containing
+# it. See docs/design/vllm-gemma4-pp-upstream-bug.md.
+startup_timeout = 2400
+tensor_parallel_size = 1
+pipeline_parallel_size = 2
+kv_cache_dtype = "fp8"
+enable_chunked_prefill = true
+enable_prefix_caching = true
+# 64k — geology graph-refinement episodes accumulate long tool-call
+# transcripts (record_phase + seed_submit + report_metric every step), and
+# the parent 32k cap was clipping the back half of regular-workflow refine
+# loops. Gemma 4 31B AWQ supports well beyond 64k; the binding constraint
+# here is KV cache footprint under PP=2 + fp8 KV on 2× 24 GB. At
+# max_num_seqs=10 the total KV slot budget is ~640k tokens, still below
+# the qwen3 sibling config's 960k (120k × 8) which fits the same hardware.
+# See config-forked-exploit-msagent-qwen3.toml for the longer-context
+# reference point.
+max_model_len = 65536
+# max_num_seqs is global under PP (not per-replica); match the 10 concurrent
+# AIQ agents declared in [generation] below.
+max_num_seqs = 10
+max_num_batched_tokens = 8192
+cudagraph_mode = "piecewise"
+extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
+# AIQ's OpenAI shim sends `tool_choice: "auto"` (or "required" when
+# force_tool_choice is on), so vLLM must be launched with auto-tool-choice +
+# an explicit parser. Gemma 4's envelope
+# (`<|tool_call>call:NAME{key:<|"|>val<|"|>}<tool_call|>`) is recognised only
+# by vLLM's `gemma4` parser — hermes/qwen parsers do not match it.
+enable_auto_tool_choice = true
+tool_call_parser = "gemma4"
+
+[task]
+class = "tasks.geology_graph.GeologyGraphTask"
+
+[task.config]
+docker_compose_dir = "./docker/geology-graph-compose"
+dataset_dir = "./data/geology/36572_smolianova_1984"
+pool_root = "./data/geology-graph-aiq-gemma4/pools"
+variation_names = ["smolianova_basic"]
+t_steady = 60.0
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-geology-graph"
+agent_type = "tool_calling_agent"
+# Per-step iteration budget for NAT's tool_calling_agent. Doubled from the
+# original 20; mirrors the doubled task-side per-step caps in
+# geology_graph.py episode_constraints().
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+# Compels vLLM's structured-outputs backend to emit a tool call on every turn.
+# Trade-off: blocks free-form "final answer" turns inside a step, which is
+# fine for geology (every step closes with record_phase / seed_submit /
+# report_metric). See parent config and the gemma4 risk note in the header.
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 14400
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# Matches vLLM max_num_seqs above so the engine stays well-batched without
+# queuing AIQ workers behind each other.
+parallel_episodes = 10
+target_training_rows = 4500
+max_episodes = 500
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+resume_from_checkpoint = false
+generation_output_dir = "./data/geology-graph-aiq-gemma4/generations"
+
+[training]
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+# 2048 mirrors forked-exploit-msagent — Gemma 4 31B QLoRA on 24 GB is
+# memory-sensitive, so keep the training seq below the inference cap.
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/geology-graph-aiq-gemma4"
+wandb_project = "geology-prototype"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 12
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["verification", "geology-graph", "bootstrap-smoke", "aiq", "gemma4"]

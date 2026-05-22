@@ -1,0 +1,54 @@
+# Keep the build context lean — only ship the source tree, lock + project
+# metadata, and the docker entrypoint. Everything else is host-side state.
+
+# VCS + editor + IDE
+.git
+.github
+.idea
+.vscode
+
+# Build/cache artefacts
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.eggs
+build/
+dist/
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+.coverage.*
+coverage.xml
+htmlcov
+
+# Local environments
+.venv
+venv
+env
+.python-version
+.nix-*
+result
+result-*
+
+# Workspace/output dirs that should never be baked into the image
+workspace
+out
+examples/out
+notebooks
+scripts
+data
+input
+
+# Tests / docs aren't needed inside the image (the runtime profile that runs
+# pytest mounts them via the compose volumes). Keep image size honest.
+docs
+tests
+
+# Editor backups + OS noise
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

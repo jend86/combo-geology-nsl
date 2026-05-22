@@ -1,0 +1,91 @@
+# config-memory-cleanup-msagent.toml — drives memory_cleanup through the
+# Dockerized ms-agent harness.
+#
+# Same task (tasks.memory_cleanup.MemoryCleanupTask) as
+# config-parallel-test.toml; the only difference is [harness], which
+# selects the ContainerHarness + ms_agent profile instead of the
+# in-process OrchestratorModeHarness.
+#
+# The memory_cleanup task declares one MCP tool: run_python.
+# ms-agent sees it as nsl---run_python and can invoke it directly —
+# no mode-shaped capabilities leak into the task contract.
+model_name = "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
+code_host_cache_path = "./code/memory-cleanup-msagent/code/"
+container_ids = ["special-learn-compose_service-a_1"]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/special-learn-compose"
+train_data_save_folder = "./data/memory-cleanup-msagent/train_data"
+
+[vllm]
+max_model_len = 32000
+max_num_seqs = 16
+enable_chunked_prefill = true
+enable_prefix_caching = true
+# Override Qwen's default chat template so tool calls are emitted as Hermes
+# JSON inside <tool_call> tags, which vLLM can parse natively.
+chat_template_path = "config/chat_templates/qwen2.5-instruct.jinja"
+# ms-agent always sends `tool_choice: "auto"`, so vLLM must be started
+# with --enable-auto-tool-choice + a parser. Qwen2.5 uses Hermes-style
+# tool calling.
+enable_auto_tool_choice = true
+tool_call_parser = "hermes"
+
+[task]
+class = "tasks.memory_cleanup.MemoryCleanupTask"
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "ms_agent"
+image = "nsl/ms-agent:0.1.0"
+max_wall_seconds = 3600
+mem_limit = "2g"
+# host mode: container shares the host netns → reaches the shim + MCP
+# bridge listening on 127.0.0.1:<ephemeral> directly.
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/ms-agent"
+build_args = { MS_AGENT_VERSION = "1.6.0", MCP_VERSION = "1.1.0", OMEGACONF_VERSION = "2.3.0", LOGURU_VERSION = "0.7" }
+
+[harness.container.profile_config]
+model = "nsl-memory-cleanup"
+max_chat_round = 12
+tool_call_timeout = 90
+transcript_tag = "episode"
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 21600
+max_consecutive_verification_failures = 8
+container_rebuild_interval = 10
+parallel_episodes = 12
+target_training_rows = 2000
+max_episodes = 1000
+checkpoint_every_episode = true
+resume_from_checkpoint = true
+generation_output_dir = "./data/memory-cleanup-msagent/generations"
+
+[training]
+base_model = "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 4096
+adapter_output_dir = "./models/adapters/memory-cleanup-msagent"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 5
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
