@@ -12,7 +12,7 @@
 This system **automatically discovers geological patterns** from 3D mineral exploration data using a sophisticated multi-agent architecture. It combines:
 
 - **🤖 Multi-Agent Intelligence**: 4 specialized AI agents working in isolation to prevent gaming
-- **📊 Advanced Statistical Scoring**: Geological coherence + ESA-BIC for sparse data handling  
+- **📊 Two-Stage Geological Scoring**: Predictive capacity test + ESA-BIC complexity assessment  
 - **🌐 3D Voxel Modeling**: 200×200×8 voxel grids covering exploration areas
 - **🧬 Geological Interpolation**: Sphere-of-influence modeling for realistic feature extension
 - **⚡ Async Execution**: Budget-controlled parallel processing with Docker isolation
@@ -36,11 +36,20 @@ This system **automatically discovers geological patterns** from 3D mineral expl
 
 ## 🚀 Key Features
 
-### **Enhanced Statistical Scoring**
-- **Geological Interpolation**: Extends sparse features within 548m influence radius using inverse distance weighting
-- **ESA-BIC (Effective Sample Size Adjusted BIC)**: Robust handling of sparse geological data with appropriate sparsity penalties
-- **Spatial Autocorrelation Correction**: Moran's I prevents spatial gaming of scoring metrics
-- **Performance Optimized**: Sub-second execution on 320K voxel grids
+### **Two-Stage Geological Scoring**
+**Revolutionary approach that separates predictive capacity from complexity assessment, solving the fundamental flaw where BIC was measuring prediction quality twice.**
+
+**Stage 1 - Predictive Capacity Test:**
+- **Bidirectional Masking**: Tests 20% held-out data to verify geological understanding
+- **Direction A**: Can new layer improve prediction of existing layers?
+- **Direction B**: Can existing layers predict the new layer well?
+- **Pass Criteria**: Either direction shows R² improvement ≥ 0.01
+
+**Stage 2 - Complexity Assessment:**
+- **ESA-BIC (Effective Sample Size Adjusted BIC)**: Applied only after Stage 1 passes
+- **Geological Interpolation**: 548m influence radius using inverse distance weighting  
+- **Adaptive Thresholds**: BIC acceptance varies based on Stage 1 performance
+- **Spatial Autocorrelation Correction**: Moran's I prevents cheat-code layers
 
 ### **Multi-Agent Architecture** 
 - **Hypothesis Agent**: Analyzes geological data, proposes feature hypotheses
@@ -65,7 +74,7 @@ Multi-agent task orchestration system:
 
 ### **voxel-features-mcp/**
 Core geological intelligence and spatial processing:
-- **Enhanced BIC Scoring**: Geological interpolation + ESA-BIC for sparse data
+- **Two-Stage Scoring System**: Predictive capacity test + ESA-BIC complexity assessment
 - **Spatial Operations**: Point/line/region feature creation with geological influence modeling
 - **Voxel Store**: 3D feature layer management with versioning and persistence
 - **Knowledge Graph**: Experiment tracking, feature relationships, crossbreeding selection
@@ -185,7 +194,10 @@ cd NSL2-geology-task && ./test_fixed_workflow.sh
 
 ## 🧬 Scientific Innovation
 
-### **Geological Interpolation**
+### **Two-Stage Geological Scoring**
+Revolutionary approach that separates predictive capacity from complexity assessment. Solves the fundamental flaw where BIC was measuring prediction quality twice (R² correlation + MSE in BIC = double-counting). Now Stage 1 tests actual geological understanding via masked prediction tests, while Stage 2 applies complexity assessment only for geologically meaningful layers.
+
+### **Geological Interpolation** 
 Novel approach that extends sparse geological features within geologically reasonable influence zones, treating the system as a "useful model" rather than strictly "realistic model" for statistical analysis.
 
 ### **ESA-BIC for Sparse Data**
