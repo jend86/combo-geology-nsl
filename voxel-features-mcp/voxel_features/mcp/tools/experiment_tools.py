@@ -172,6 +172,49 @@ def experiment_get_crossbreed_pairs(
     }
 
 
+def experiment_list_recent(
+    kg: KnowledgeGraph,
+    max_experiments: int = 10,
+) -> dict[str, Any]:
+    """
+    List recent experiments for hypothesis deduplication.
+    
+    Returns recent experiments (both admitted and rejected) to help agents
+    avoid repeating similar hypotheses during exploration phases.
+    
+    Args:
+        max_experiments: Maximum number of recent experiments to return
+    
+    Returns:
+        List of recent experiment summaries with hypotheses and outcomes
+    """
+    # Get all experiments and sort by timestamp (most recent first)
+    all_experiments = kg.list_all()
+    recent_experiments = sorted(
+        all_experiments,
+        key=lambda exp: exp.timestamp,
+        reverse=True
+    )[:max_experiments]
+    
+    return {
+        "success": True,
+        "count": len(recent_experiments),
+        "recent_experiments": [
+            {
+                "id": exp.id,
+                "hypothesis": exp.hypothesis,
+                "rationale": exp.rationale,
+                "feature_layer_name": exp.feature_layer_name,
+                "admitted": exp.admitted,
+                "mdl_delta": exp.mdl_delta,
+                "timestamp": exp.timestamp,
+                "result_summary": exp.result_summary[:200] + "..." if len(exp.result_summary) > 200 else exp.result_summary,  # Truncate for brevity
+            }
+            for exp in recent_experiments
+        ],
+    }
+
+
 def experiment_export_training(
     kg: KnowledgeGraph,
     output_path: str,

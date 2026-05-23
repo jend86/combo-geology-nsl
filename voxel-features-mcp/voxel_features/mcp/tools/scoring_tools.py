@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal
+import time
 
 import numpy as np
 
@@ -143,15 +144,18 @@ def scoring_create_feature_layer(
     This extracts values from an existing spatial layer created by spatial_add_point 
     or spatial_add_line operations, then evaluates whether it improves compression.
     
+    Layer names are automatically made unique by appending timestamps to prevent
+    collisions when models accidentally give different useful layers the same name.
+    
     Args:
-        name: Name of existing spatial layer to evaluate
+        name: Base name for spatial layer to evaluate
         dtype: Data type for evaluation
     
     Returns:
         bic_delta: Change in BIC (negative = improved)
         admitted: Whether layer was kept in store
         mutual_info: MI with each existing layer
-        layer_name: Name of the evaluated layer
+        layer_name: Unique name assigned to the evaluated layer
     """
     try:
         # Check if this is a spatial store that supports get_layer_values
@@ -171,16 +175,23 @@ def scoring_create_feature_layer(
         # Extract layer values from spatial operations
         arr = store.get_layer_values(name)
         
-        # Remove the layer temporarily to allow re-evaluation
+        # Create unique layer name with timestamp to prevent collisions
+        timestamp = int(time.time() * 1000)  # millisecond precision
+        unique_name = f"{name}_{timestamp}"
+        
+        # Remove the original spatial layer (temporary)
         store.remove_layer(name)
         
-        # Run BIC evaluation
+        # Run BIC evaluation with unique name
         result = scoring.evaluate_new_layer(
             store=store,
-            layer_name=name,
+            layer_name=unique_name,
             layer_values=arr,
             layer_dtype=dtype,
         )
+        
+        # Update result to reflect the unique name used
+        result["layer_name"] = unique_name
         
         return {
             "success": True,

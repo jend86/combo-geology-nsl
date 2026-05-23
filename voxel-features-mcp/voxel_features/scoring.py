@@ -204,7 +204,11 @@ def compute_pairwise_r_squared(
     layer_dtypes: list[str]
 ) -> np.ndarray:
     """
-    Compute pairwise R² values between all layer combinations.
+    DEPRECATED: Compute pairwise R² values between all layer combinations.
+    
+    WARNING: This function is deprecated and will be removed in a future version.
+    Use compute_pairwise_mae() instead, which provides better handling of sparse
+    geological data and unified continuous modeling.
     
     Uses appropriate correlation method based on data types:
     - Boolean ↔ Boolean: Phi coefficient (χ² based correlation)
@@ -218,6 +222,13 @@ def compute_pairwise_r_squared(
     Returns:
         Symmetric matrix of R² values
     """
+    import warnings
+    warnings.warn(
+        "compute_pairwise_r_squared is deprecated and will be removed. "
+        "Use compute_pairwise_mae for better sparse geological data handling.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     n_layers = len(layer_values)
     r_squared_matrix = np.zeros((n_layers, n_layers))
     
@@ -254,7 +265,7 @@ def compute_pairwise_r_squared(
                 r_squared_matrix[i, j] = r_squared
                 r_squared_matrix[j, i] = r_squared
     
-    return r_squared_matrix
+    return r_squared_matrix  # DEPRECATED - use compute_pairwise_mae instead
 
 
 def phi_coefficient(x: np.ndarray, y: np.ndarray) -> float:
@@ -414,241 +425,6 @@ def compute_moran_correction(
     correction = 1.0 / (1.0 + avg_moran)
     
     return max(0.1, min(1.0, correction))  # Clamp to reasonable range
-
-
-# =============================================================================
-# Adaptive Multi-Resolution for Sparse Geological Grids
-# =============================================================================
-
-def compute_local_data_density(
-    layer_values: np.ndarray,
-    shape: tuple[int, int, int],
-    window_size: tuple[int, int, int] = (20, 20, 2)
-) -> np.ndarray:
-    """
-    Analyze local data density across the grid to inform resolution decisions.
-    
-    Args:
-        layer_values: Flattened layer array
-        shape: Original (nx, ny, nz) grid shape
-        window_size: Size of analysis windows for density calculation
-        
-    Returns:
-        3D density map showing data coverage in each region
-    """
-    # Reshape to 3D for analysis
-    layer_3d = layer_values.reshape(shape)
-    
-    # Initialize density map
-    density_map = np.zeros(shape)
-    
-    # Calculate density in overlapping windows
-    wx, wy, wz = window_size
-    for x in range(0, shape[0], wx//2):
-        for y in range(0, shape[1], wy//2):
-            for z in range(0, shape[2], wz//2):
-                # Define window bounds
-                x_end = min(x + wx, shape[0])
-                y_end = min(y + wy, shape[1])
-                z_end = min(z + wz, shape[2])
-                
-                # Extract window
-                window = layer_3d[x:x_end, y:y_end, z:z_end]
-                
-                # Calculate density (proportion of non-zero values)
-                total_voxels = window.size
-                data_voxels = np.count_nonzero(window)
-                density = data_voxels / total_voxels if total_voxels > 0 else 0.0
-                
-                # Assign density to all voxels in window
-                density_map[x:x_end, y:y_end, z:z_end] = np.maximum(
-                    density_map[x:x_end, y:y_end, z:z_end], density
-                )
-    
-    return density_map
-
-
-def create_adaptive_resolution_map(
-    density_map: np.ndarray,
-    shape: tuple[int, int, int]
-) -> dict:
-    """
-    Assign resolution levels based on local data density.
-    
-    Args:
-        density_map: 3D density map from compute_local_data_density
-        shape: Original grid shape
-        
-    Returns:
-        Dict with resolution assignments and aggregation info
-    """
-    # Resolution thresholds and corresponding scales
-    thresholds = {
-        'full': 0.01,      # > 1% coverage → full resolution
-        'medium': 0.001,   # 0.1-1% → medium resolution (4x4x2 blocks)
-        'coarse': 0.0001,  # 0.01-0.1% → coarse resolution (8x8x4 blocks) 
-        'regional': 0.0    # < 0.01% → regional resolution (20x20x8 blocks)
-    }
-    
-    # Scale factors for each resolution level
-    scale_factors = {
-        'full': (1, 1, 1),
-        'medium': (4, 4, 2),
-        'coarse': (8, 8, 4),
-        'regional': (20, 20, 8)
-    }
-    
-    # Create resolution assignment map
-    resolution_map = np.full(shape, 'regional', dtype='U8')
-    
-    for level, threshold in thresholds.items():
-        if level == 'regional':
-            continue  # Already initialized
-        mask = density_map >= threshold
-        resolution_map[mask] = level
-    
-    return {
-        'resolution_map': resolution_map,
-        'scale_factors': scale_factors,
-        'density_map': density_map
-    }
-
-
-def aggregate_sparse_regions(
-    layer_values: np.ndarray,
-    resolution_info: dict,
-    shape: tuple[int, int, int]
-) -> tuple[np.ndarray, int]:
-    """
-    Aggregate sparse regions into larger blocks while preserving dense areas.
-    
-    Uses maximum pooling to preserve geological signal in sparse data.
-    
-    Args:
-        layer_values: Flattened layer array  
-        resolution_info: Resolution map and scale factors
-        shape: Original grid shape
-        
-    Returns:
-        Tuple of (aggregated_values, effective_sample_count)
-    """
-    layer_3d = layer_values.reshape(shape)
-    resolution_map = resolution_info['resolution_map']
-    scale_factors = resolution_info['scale_factors']
-    
-    # Track effective samples
-    effective_samples = 0
-    aggregated_data = []
-    
-    # Process each resolution level
-    for resolution_level in ['full', 'medium', 'coarse', 'regional']:
-        # Find regions at this resolution level
-        mask = resolution_map == resolution_level
-        if not np.any(mask):
-            continue
-            
-        scale_x, scale_y, scale_z = scale_factors[resolution_level]
-        
-        # Aggregate data at this resolution level
-        if scale_x == 1 and scale_y == 1 and scale_z == 1:
-            # Full resolution - use original data where mask is True
-            masked_data = layer_3d * mask
-            non_zero_data = masked_data[masked_data != 0]
-            if len(non_zero_data) > 0:
-                aggregated_data.extend(non_zero_data)
-                effective_samples += len(non_zero_data)
-        else:
-            # Downsample using maximum pooling
-            nx, ny, nz = shape
-            new_nx = max(1, nx // scale_x)
-            new_ny = max(1, ny // scale_y) 
-            new_nz = max(1, nz // scale_z)
-            
-            for i in range(new_nx):
-                for j in range(new_ny):
-                    for k in range(new_nz):
-                        # Define block boundaries
-                        x_start, x_end = i * scale_x, min((i + 1) * scale_x, nx)
-                        y_start, y_end = j * scale_y, min((j + 1) * scale_y, ny)
-                        z_start, z_end = k * scale_z, min((k + 1) * scale_z, nz)
-                        
-                        # Extract block
-                        data_block = layer_3d[x_start:x_end, y_start:y_end, z_start:z_end]
-                        mask_block = mask[x_start:x_end, y_start:y_end, z_start:z_end]
-                        
-                        # Only process if this block is assigned to current resolution
-                        if np.any(mask_block):
-                            # Use maximum pooling to preserve geological signal
-                            block_max = np.max(data_block * mask_block)
-                            if block_max > 0:
-                                aggregated_data.append(block_max)
-                                effective_samples += 1
-    
-    # Convert to array and add zeros to maintain some zero representation
-    aggregated_array = np.array(aggregated_data) if aggregated_data else np.array([])
-    
-    return aggregated_array, effective_samples
-
-
-def compute_effective_sample_size(
-    layer_values_list: list[np.ndarray],
-    grid: 'GridSpec',
-    shape: tuple[int, int, int]
-) -> tuple[list[np.ndarray], int]:
-    """
-    Compute effective sample sizes for all layers using adaptive resolution.
-    
-    Args:
-        layer_values_list: List of flattened layer arrays
-        grid: Grid specification  
-        shape: Original grid shape
-        
-    Returns:
-        Tuple of (adaptively_aggregated_layers, total_effective_samples)
-    """
-    if not layer_values_list:
-        return [], 0
-    
-    # Analyze data density across all layers
-    combined_density = np.zeros(shape)
-    for layer_values in layer_values_list:
-        layer_density = compute_local_data_density(layer_values, shape)
-        combined_density = np.maximum(combined_density, layer_density)
-    
-    # Create unified resolution map based on combined density
-    resolution_info = create_adaptive_resolution_map(combined_density, shape)
-    
-    # Aggregate all layers using the same resolution map
-    aggregated_layers = []
-    layer_sample_counts = []
-    
-    for layer_values in layer_values_list:
-        aggregated_layer, layer_samples = aggregate_sparse_regions(
-            layer_values, resolution_info, shape
-        )
-        aggregated_layers.append(aggregated_layer)
-        layer_sample_counts.append(layer_samples)
-    
-    # Find the maximum effective samples across all layers
-    max_effective_samples = max(layer_sample_counts) if layer_sample_counts else 0
-    
-    # Pad all layers to have the same effective sample size
-    # This ensures pairwise R² calculations work correctly
-    padded_layers = []
-    for aggregated_layer in aggregated_layers:
-        if len(aggregated_layer) < max_effective_samples:
-            # Pad with zeros to reach consistent size
-            padding_needed = max_effective_samples - len(aggregated_layer)
-            padded_layer = np.concatenate([aggregated_layer, np.zeros(padding_needed)])
-        elif len(aggregated_layer) > max_effective_samples:
-            # Truncate to consistent size (shouldn't happen with current logic)
-            padded_layer = aggregated_layer[:max_effective_samples]
-        else:
-            padded_layer = aggregated_layer
-        
-        padded_layers.append(padded_layer)
-    
-    return padded_layers, max_effective_samples
 
 
 # =============================================================================
@@ -854,54 +630,490 @@ def compute_geological_interpolation(
     return interpolated
 
 
-def compute_esa_bic(
-    system_coherence: float,
-    spatial_correction: float,
-    n_layers: int,
-    effective_samples: int,
-    total_voxels: int
-) -> float:
+# =============================================================================
+# Cross-Validation Framework for Geological Data
+# =============================================================================
+
+def create_geological_cv_split(
+    interpolated_layers: list[np.ndarray], 
+    test_fraction: float = 0.2,
+    min_test_signal_ratio: float = 0.01
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Compute Effective Sample Size Adjusted BIC.
+    Create 80/20 cross-validation split with geological constraints.
     
-    Applies density-weighted penalty to standard BIC calculation
-    to account for sparsity in geological data.
+    Ensures the test set contains adequate geological signal (non-zero values)
+    while maintaining random sampling for unbiased evaluation.
     
     Args:
-        system_coherence: Average R² across layer pairs
-        spatial_correction: Moran's I correction factor
-        n_layers: Number of layers
-        effective_samples: Effective sample size from adaptive resolution
-        total_voxels: Total number of voxels in grid
+        interpolated_layers: List of interpolated flattened layer arrays
+        test_fraction: Fraction of data for testing (default 0.2 = 20%)
+        min_test_signal_ratio: Minimum ratio of non-zero values in test set
         
     Returns:
-        ESA-BIC score (lower = better)
+        Tuple of (train_mask, test_mask) boolean arrays
     """
-    # Standard BIC components
-    n_params = n_layers * (n_layers - 1) // 2
-    n_samples = max(effective_samples, n_layers)
+    if not interpolated_layers:
+        return np.array([]), np.array([])
+        
+    n_voxels = len(interpolated_layers[0])
+    n_test = int(n_voxels * test_fraction)
     
-    # Base coherence term
-    coherence_term = -system_coherence * spatial_correction
+    # Find voxels with geological signal (non-zero in any layer)
+    signal_mask = np.zeros(n_voxels, dtype=bool)
+    for layer in interpolated_layers:
+        signal_mask |= (layer != 0)
     
-    # Standard complexity penalty
-    if n_samples > 0 and n_params > 0:
-        complexity_penalty = n_params * np.log(n_samples) / n_samples
+    signal_indices = np.where(signal_mask)[0]
+    non_signal_indices = np.where(~signal_mask)[0]
+    
+    # Calculate minimum number of signal voxels needed in test set
+    min_test_signal = max(1, int(n_test * min_test_signal_ratio))
+    min_test_signal = min(min_test_signal, len(signal_indices))
+    
+    # Create test set with guaranteed geological signal
+    np.random.seed(42)  # Reproducible splits
+    
+    if len(signal_indices) >= min_test_signal:
+        # Randomly select signal voxels for test set
+        test_signal_indices = np.random.choice(
+            signal_indices, 
+            size=min_test_signal, 
+            replace=False
+        )
+        
+        # Fill remaining test slots from all remaining voxels
+        remaining_indices = np.setdiff1d(np.arange(n_voxels), test_signal_indices)
+        remaining_test_size = n_test - min_test_signal
+        
+        if remaining_test_size > 0 and len(remaining_indices) > 0:
+            additional_test_indices = np.random.choice(
+                remaining_indices,
+                size=min(remaining_test_size, len(remaining_indices)),
+                replace=False
+            )
+            test_indices = np.concatenate([test_signal_indices, additional_test_indices])
+        else:
+            test_indices = test_signal_indices
     else:
-        complexity_penalty = 0.0
+        # Fallback: random selection if insufficient signal
+        test_indices = np.random.choice(n_voxels, size=n_test, replace=False)
     
-    standard_bic = coherence_term + complexity_penalty
+    # Create boolean masks
+    test_mask = np.zeros(n_voxels, dtype=bool)
+    test_mask[test_indices] = True
+    train_mask = ~test_mask
     
-    # Effective Sample Size Adjustment
-    density_weight = effective_samples / max(total_voxels, 1)
-    density_weight = max(density_weight, 0.001)  # Minimum threshold for numerical stability
+    return train_mask, test_mask
+
+
+def validate_geological_split(
+    train_mask: np.ndarray, 
+    test_mask: np.ndarray, 
+    layer_values: list[np.ndarray]
+) -> dict:
+    """
+    Validate cross-validation split has adequate geological signal distribution.
     
-    # Apply sparsity penalty: penalize low-density datasets more heavily
-    sparsity_penalty = 1.0 + np.log(1.0 / density_weight)
+    Args:
+        train_mask: Boolean mask for training data
+        test_mask: Boolean mask for test data  
+        layer_values: List of layer arrays to analyze
+        
+    Returns:
+        Dict with split statistics and validation results
+    """
+    stats = {
+        'train_size': np.sum(train_mask),
+        'test_size': np.sum(test_mask),
+        'train_signal_count': 0,
+        'test_signal_count': 0,
+        'train_signal_ratio': 0.0,
+        'test_signal_ratio': 0.0,
+        'validation_passed': False
+    }
     
-    esa_bic = standard_bic * sparsity_penalty
+    if not layer_values or len(layer_values) == 0:
+        return stats
     
-    return esa_bic
+    # Count non-zero values (geological signal) in each split
+    for layer in layer_values:
+        train_signal = np.sum(layer[train_mask] != 0)
+        test_signal = np.sum(layer[test_mask] != 0)
+        
+        stats['train_signal_count'] += train_signal
+        stats['test_signal_count'] += test_signal
+    
+    # Calculate signal ratios
+    if stats['train_size'] > 0:
+        stats['train_signal_ratio'] = stats['train_signal_count'] / stats['train_size']
+    if stats['test_size'] > 0:
+        stats['test_signal_ratio'] = stats['test_signal_count'] / stats['test_size']
+    
+    # Validation criteria
+    has_test_signal = stats['test_signal_count'] > 0
+    reasonable_split = 0.15 <= (stats['test_size'] / (stats['train_size'] + stats['test_size'])) <= 0.25
+    
+    stats['validation_passed'] = has_test_signal and reasonable_split
+    
+    return stats
+
+
+# =============================================================================
+# MAE Prediction Framework for Unified Continuous Modeling  
+# =============================================================================
+
+def fit_continuous_predictor(
+    target_layer: np.ndarray, 
+    predictor_layers: list[np.ndarray], 
+    train_mask: np.ndarray
+) -> dict:
+    """
+    Fit linear regression model treating all geological layers as continuous.
+    
+    Boolean geological layers (faults, ore zones) are treated as 0/1 continuous
+    variables, enabling a unified prediction framework.
+    
+    Args:
+        target_layer: Target layer to predict (flattened)
+        predictor_layers: List of predictor layer arrays (flattened)
+        train_mask: Boolean mask for training voxels
+        
+    Returns:
+        Dict with fitted parameters and prediction function
+    """
+    if not predictor_layers or len(predictor_layers) == 0:
+        # No predictors - return mean prediction
+        mean_target = np.mean(target_layer[train_mask]) if np.sum(train_mask) > 0 else 0.0
+        return {
+            'coefficients': np.array([mean_target]),
+            'intercept': 0.0,
+            'n_predictors': 0,
+            'n_train_samples': np.sum(train_mask),
+            'prediction_type': 'mean'
+        }
+    
+    # Extract training data
+    train_target = target_layer[train_mask]
+    train_predictors = np.column_stack([layer[train_mask] for layer in predictor_layers])
+    
+    n_train = len(train_target)
+    n_predictors = train_predictors.shape[1]
+    
+    if n_train < 2:
+        # Insufficient training data
+        return {
+            'coefficients': np.zeros(n_predictors),
+            'intercept': 0.0,
+            'n_predictors': n_predictors,
+            'n_train_samples': n_train,
+            'prediction_type': 'insufficient_data'
+        }
+    
+    try:
+        # Use sklearn for robust linear regression if available
+        from sklearn.linear_model import LinearRegression
+        
+        model = LinearRegression()
+        model.fit(train_predictors, train_target)
+        
+        return {
+            'coefficients': model.coef_,
+            'intercept': model.intercept_,
+            'n_predictors': n_predictors,
+            'n_train_samples': n_train,
+            'prediction_type': 'sklearn_linear'
+        }
+        
+    except ImportError:
+        # Fallback: numpy least squares
+        try:
+            # Add intercept column
+            X_with_intercept = np.column_stack([np.ones(n_train), train_predictors])
+            coeffs_with_intercept, _, _, _ = np.linalg.lstsq(X_with_intercept, train_target, rcond=None)
+            
+            return {
+                'coefficients': coeffs_with_intercept[1:],  # Exclude intercept
+                'intercept': coeffs_with_intercept[0],
+                'n_predictors': n_predictors,
+                'n_train_samples': n_train,
+                'prediction_type': 'numpy_lstsq'
+            }
+        except np.linalg.LinAlgError:
+            # Ultimate fallback: correlation-based prediction
+            correlations = np.array([
+                np.corrcoef(predictor_layer[train_mask], train_target)[0, 1] 
+                if np.var(predictor_layer[train_mask]) > 0 else 0.0
+                for predictor_layer in predictor_layers
+            ])
+            correlations = np.nan_to_num(correlations, 0.0)
+            
+            return {
+                'coefficients': correlations,
+                'intercept': np.mean(train_target),
+                'n_predictors': n_predictors,
+                'n_train_samples': n_train,
+                'prediction_type': 'correlation_fallback'
+            }
+
+
+def compute_out_of_sample_mae(
+    target_layer: np.ndarray,
+    predictor_layers: list[np.ndarray],
+    train_mask: np.ndarray,
+    test_mask: np.ndarray
+) -> float:
+    """
+    Compute Mean Absolute Error on held-out test data.
+    
+    Uses unified continuous approach: all layers treated as continuous
+    (boolean geological features automatically handled as 0/1).
+    
+    Args:
+        target_layer: Target layer to predict (flattened)
+        predictor_layers: List of predictor layer arrays (flattened)
+        train_mask: Boolean mask for training voxels
+        test_mask: Boolean mask for test voxels
+        
+    Returns:
+        Mean Absolute Error on test data
+    """
+    n_test = np.sum(test_mask)
+    
+    if n_test == 0:
+        return 0.0  # No test data
+    
+    # Fit model on training data
+    model_params = fit_continuous_predictor(target_layer, predictor_layers, train_mask)
+    
+    # Extract test data
+    test_target = target_layer[test_mask]
+    
+    if model_params['prediction_type'] == 'mean':
+        # Predict mean for all test samples
+        predictions = np.full(n_test, model_params['coefficients'][0])
+    else:
+        # Make predictions using fitted model
+        test_predictors = np.column_stack([layer[test_mask] for layer in predictor_layers])
+        predictions = test_predictors @ model_params['coefficients'] + model_params['intercept']
+    
+    # Compute Mean Absolute Error
+    mae = np.mean(np.abs(test_target - predictions))
+    
+    return float(mae)
+
+
+# =============================================================================
+# Laplace Likelihood BIC for MAE-Based Geological Scoring
+# =============================================================================
+
+def mae_to_laplace_likelihood(
+    mae_values: np.ndarray, 
+    n_samples: int
+) -> float:
+    """
+    Convert Mean Absolute Error to Laplace likelihood.
+    
+    MAE corresponds exactly to the maximum likelihood estimation
+    for the Laplace (double exponential) distribution, making this
+    the theoretically correct likelihood for MAE-based predictions.
+    
+    Args:
+        mae_values: Array of MAE values from pairwise predictions
+        n_samples: Number of effective samples used in predictions
+        
+    Returns:
+        Log-likelihood under Laplace distribution
+    """
+    if len(mae_values) == 0 or n_samples <= 0:
+        return 0.0
+    
+    # System-wide MAE (average of pairwise MAEs)
+    system_mae = np.mean(mae_values)
+    
+    # Handle edge case of perfect prediction (MAE = 0)
+    if system_mae <= 1e-10:
+        # Perfect prediction gets very high likelihood
+        return n_samples * 10.0  # Arbitrary large positive value
+    
+    # Laplace likelihood: L = (1/(2*b))^n * exp(-sum(|x_i - mu_i|)/b)
+    # where b = MAE for maximum likelihood estimation
+    # Log-likelihood: log(L) = -n*log(2*MAE) - sum(|errors|)/MAE
+    # Since sum(|errors|) = n*MAE for our case:
+    # log(L) = -n*log(2*MAE) - n*MAE/MAE = -n*log(2*MAE) - n
+    
+    log_likelihood = -n_samples * np.log(2 * system_mae) - n_samples
+    
+    return float(log_likelihood)
+
+
+def compute_geological_bic(
+    mae_matrix: np.ndarray, 
+    n_layers: int, 
+    n_effective_samples: int,
+    spatial_correction: float = 1.0
+) -> float:
+    """
+    Compute BIC score from MAE matrix using Laplace likelihood.
+    
+    This provides a unified, theoretically sound BIC calculation
+    that directly uses the same metric (MAE) for both prediction 
+    assessment and information criterion evaluation.
+    
+    Args:
+        mae_matrix: Symmetric matrix of pairwise MAE values
+        n_layers: Number of geological layers
+        n_effective_samples: Effective sample size from interpolated data
+        spatial_correction: Moran's I spatial autocorrelation correction
+        
+    Returns:
+        BIC score (lower = better geological model)
+    """
+    if n_layers <= 1:
+        # Single layer or no layers - no meaningful BIC
+        return 0.0
+    
+    # Extract off-diagonal MAE values (exclude self-correlations)
+    mask = ~np.eye(n_layers, dtype=bool)
+    off_diagonal_maes = mae_matrix[mask]
+    
+    # Remove any NaN or infinite values
+    valid_maes = off_diagonal_maes[np.isfinite(off_diagonal_maes)]
+    
+    if len(valid_maes) == 0:
+        # No valid predictions - return neutral BIC
+        return 0.0
+    
+    # Convert MAE to Laplace log-likelihood
+    log_likelihood = mae_to_laplace_likelihood(valid_maes, n_effective_samples)
+    
+    # Apply spatial autocorrelation correction
+    corrected_log_likelihood = log_likelihood * spatial_correction
+    
+    # Calculate number of parameters (pairwise prediction coefficients)
+    n_parameters = n_layers * (n_layers - 1) // 2
+    
+    # BIC = -2 * log_likelihood + k * log(n)
+    bic = -2 * corrected_log_likelihood + n_parameters * np.log(max(n_effective_samples, n_layers))
+    
+    return float(bic)
+
+
+def system_mae_to_coherence(
+    mae_matrix: np.ndarray
+) -> float:
+    """
+    Convert system MAE to a coherence-like metric for compatibility.
+    
+    Lower MAE = higher coherence, scaled to [0, 1] range.
+    This maintains compatibility with existing code that expects
+    coherence metrics while using the more robust MAE foundation.
+    
+    Args:
+        mae_matrix: Symmetric matrix of pairwise MAE values
+        
+    Returns:
+        Coherence score (higher = better, range ~[0, 1])
+    """
+    if mae_matrix.size == 0:
+        return 0.0
+    
+    # Extract off-diagonal MAEs
+    n_layers = mae_matrix.shape[0]
+    if n_layers <= 1:
+        return 1.0  # Perfect coherence for single layer
+    
+    mask = ~np.eye(n_layers, dtype=bool)
+    off_diagonal_maes = mae_matrix[mask]
+    
+    # Remove invalid values
+    valid_maes = off_diagonal_maes[np.isfinite(off_diagonal_maes) & (off_diagonal_maes >= 0)]
+    
+    if len(valid_maes) == 0:
+        return 0.0
+    
+    # System MAE (average prediction error)
+    system_mae = np.mean(valid_maes)
+    
+    # Convert to coherence: coherence = exp(-MAE)
+    # This maps MAE=0 -> coherence=1, MAE=1 -> coherence~0.37, etc.
+    coherence = np.exp(-system_mae)
+    
+    return float(coherence)
+
+
+# =============================================================================
+# MAE-Based Coherence Functions (Replaces R² System)
+# =============================================================================
+
+def compute_pairwise_mae(
+    layer_values: list[np.ndarray],
+    layer_dtypes: list[str],  # Ignored - all treated as continuous
+    grid: 'GridSpec'
+) -> np.ndarray:
+    """
+    Compute pairwise MAE values between all layer combinations.
+    
+    Replaces compute_pairwise_r_squared with unified continuous approach.
+    All geological layers (boolean faults, continuous grades) treated as
+    continuous variables using cross-validated MAE prediction.
+    
+    Args:
+        layer_values: List of interpolated flattened layer arrays
+        layer_dtypes: List of data types (ignored - unified continuous approach)
+        grid: GridSpec for spatial information
+        
+    Returns:
+        Symmetric matrix of MAE values (lower = better prediction)
+    """
+    n_layers = len(layer_values)
+    if n_layers == 0:
+        return np.array([])
+    
+    mae_matrix = np.zeros((n_layers, n_layers))
+    
+    # Create cross-validation split once for all predictions
+    train_mask, test_mask = create_geological_cv_split(layer_values)
+    
+    # Validate the split
+    split_stats = validate_geological_split(train_mask, test_mask, layer_values)
+    if not split_stats['validation_passed']:
+        print(f"Warning: CV split validation failed - {split_stats}")
+        # Continue with fallback to avoid breaking the workflow
+        if split_stats['test_size'] == 0:
+            # No test data - return zero MAE matrix
+            return mae_matrix
+    
+    # Compute pairwise MAEs
+    for i in range(n_layers):
+        for j in range(n_layers):
+            if i == j:
+                mae_matrix[i, j] = 0.0  # Perfect self-prediction
+            elif i < j:  # Only compute upper triangle
+                # Predict layer i using layer j
+                mae_i_from_j = compute_out_of_sample_mae(
+                    target_layer=layer_values[i],
+                    predictor_layers=[layer_values[j]],
+                    train_mask=train_mask,
+                    test_mask=test_mask
+                )
+                
+                # Predict layer j using layer i  
+                mae_j_from_i = compute_out_of_sample_mae(
+                    target_layer=layer_values[j],
+                    predictor_layers=[layer_values[i]],
+                    train_mask=train_mask,
+                    test_mask=test_mask
+                )
+                
+                # Use average bidirectional MAE
+                avg_mae = (mae_i_from_j + mae_j_from_i) / 2.0
+                
+                mae_matrix[i, j] = avg_mae
+                mae_matrix[j, i] = avg_mae  # Symmetric matrix
+    
+    return mae_matrix
+
 
 
 def create_spatial_mask(
@@ -1211,56 +1423,52 @@ def geological_coherence_score(
     grid: 'GridSpec',
     shape: tuple[int, int, int],
     enable_masking_test: bool = True,
-    masking_test_threshold: float = 0.0001  # Lowered for sparse geological data
+    masking_test_threshold: float = 0.01  # MAE improvement threshold
 ) -> dict:
     """
-    Compute geological coherence score using two-stage evaluation.
+    Compute geological coherence score using MAE + Laplace likelihood BIC.
     
-    Two-Stage System:
-    Stage 1 - Predictive Capacity Test: Does new layer improve system-wide prediction?
-    Stage 2 - Complexity Assessment: Is predictive improvement worth the added complexity?
+    Unified continuous approach: All geological layers (boolean faults, continuous
+    grades) treated as continuous variables. Uses cross-validated MAE for robust
+    prediction assessment and Laplace likelihood for theoretically sound BIC.
     
-    This separates predictive value from complexity, preventing the double-counting
-    problem where BIC measures prediction quality twice (R² + MSE in BIC).
+    Key improvements over R² system:
+    - Robust to sparse geological data (no zero-inflation bias)
+    - Interpretable errors in geological units (% grade, ppm, fault probability)
+    - Theoretically consistent BIC using same metric for prediction and scoring
+    - Unified framework eliminates mixed-type complexity
     
     Features:
     - Geological interpolation: Extends features within 7x voxel-size radius
-    - Bidirectional masking test: New helps existing OR existing predict new
-    - ESA-BIC: Applied only after masking test passes
-    - Spatial autocorrelation correction: Moran's I to prevent cheat-code layers
+    - Cross-validated MAE: 80/20 split with geological signal constraints
+    - Laplace likelihood BIC: Direct conversion from MAE to BIC
+    - Spatial autocorrelation correction: Moran's I for spatial validity
     
     Args:
         layer_values: List of flattened layer arrays
-        layer_dtypes: List of data types for each layer
+        layer_dtypes: List of data types (treated as continuous)
         grid: GridSpec for spatial coordinate information
         shape: Original (nx, ny, nz) shape
-        enable_masking_test: Whether to run Stage 1 masking test
-        masking_test_threshold: Minimum R² improvement to pass Stage 1 (default 0.0001 for sparse geological data)
+        enable_masking_test: Legacy parameter (simplified in MAE version)
+        masking_test_threshold: Minimum MAE improvement threshold
     
     Returns:
         dict with:
-            - system_coherence: Average R² across layer pairs
+            - system_coherence: MAE-derived coherence score (higher = better)
             - spatial_correction: Moran's I correction factor
-            - coherence_matrix: Full R² matrix between layers
-            - bic: ESA-BIC score (lower = better, inf if Stage 1 fails)
-            - total_cv_mse: Legacy compatibility (set to 1 - coherence)
+            - coherence_matrix: MAE matrix (lower = better prediction)
+            - bic: Laplace likelihood BIC (lower = better)
+            - total_cv_mse: Legacy compatibility (derived from MAE)
             - per_layer_mse: Legacy compatibility (empty dict)
-            - masking_test_passed: Whether Stage 1 passed
-            - masking_test_improvement: R² improvement from Stage 1
-            - masking_test_direction: Which direction passed ("new_helps_existing", etc.)
-            - stage_completed: "stage_1_failed" or "stage_2_completed"
+            - masking_test_passed: Always True (simplified)
+            - masking_test_improvement: System-wide MAE quality
+            - masking_test_direction: "unified_continuous"
+            - stage_completed: "mae_bic_completed"
     """
     n_layers = len(layer_values)
     
-    # Default return values for Stage 1 fields
-    default_stage1_results = {
-        "masking_test_passed": True,
-        "masking_test_improvement": 0.0,
-        "masking_test_direction": "not_applicable",
-        "stage_completed": "stage_2_completed"
-    }
-    
-    if n_layers < 2:
+    # Handle edge cases
+    if n_layers == 0:
         return {
             "system_coherence": 0.0,
             "spatial_correction": 1.0,
@@ -1268,55 +1476,27 @@ def geological_coherence_score(
             "bic": 0.0,
             "total_cv_mse": 0.0,
             "per_layer_mse": {},
-            **default_stage1_results
+            "masking_test_passed": True,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "not_applicable",
+            "stage_completed": "mae_bic_completed"
         }
     
-    # STAGE 1: Predictive Capacity Test (only if enabled and n_layers >= 2)
-    if enable_masking_test and n_layers >= 2:
-        # Assume last layer is the candidate layer being evaluated
-        existing_layers = layer_values[:-1]
-        new_layer = layer_values[-1]
-        existing_dtypes = layer_dtypes[:-1]
-        new_layer_dtype = layer_dtypes[-1]
-        
-        if existing_layers:  # Only run masking test if there are existing layers
-            masking_result = evaluate_bidirectional_prediction(
-                existing_layers=existing_layers,
-                new_layer=new_layer,
-                layer_dtypes=existing_dtypes,
-                new_layer_dtype=new_layer_dtype,
-                grid=grid,
-                shape=shape,
-                min_improvement=masking_test_threshold
-            )
-            
-            if not masking_result["passes_test"]:
-                # Stage 1 failed - return with high BIC penalty
-                return {
-                    "system_coherence": 0.0,
-                    "spatial_correction": 1.0,
-                    "coherence_matrix": np.array([]),
-                    "bic": float('inf'),  # High penalty for failed Stage 1
-                    "total_cv_mse": 1.0,
-                    "per_layer_mse": {},
-                    "masking_test_passed": False,
-                    "masking_test_improvement": masking_result["improvement"],
-                    "masking_test_direction": masking_result["direction"],
-                    "stage_completed": "stage_1_failed"
-                }
-            
-            # Stage 1 passed - update results and proceed to Stage 2
-            default_stage1_results.update({
-                "masking_test_passed": True,
-                "masking_test_improvement": masking_result["improvement"],
-                "masking_test_direction": masking_result["direction"],
-                "stage_completed": "stage_2_completed"
-            })
-        else:
-            # No existing layers - first layer case, skip Stage 1
-            pass
+    if n_layers == 1:
+        # Single layer - perfect coherence, no complexity penalty
+        return {
+            "system_coherence": 1.0,
+            "spatial_correction": 1.0,
+            "coherence_matrix": np.array([[0.0]]),  # Zero MAE for self
+            "bic": 0.0,
+            "total_cv_mse": 0.0,
+            "per_layer_mse": {},
+            "masking_test_passed": True,
+            "masking_test_improvement": 1.0,
+            "masking_test_direction": "single_layer",
+            "stage_completed": "mae_bic_completed"
+        }
     
-    # STAGE 2: Complexity Assessment (ESA-BIC)
     # Apply geological interpolation to reduce sparsity
     interpolated_layers = []
     for layer in layer_values:
@@ -1325,61 +1505,61 @@ def geological_coherence_score(
     
     # Calculate effective samples based on non-zero values in interpolated data
     total_non_zero = sum(np.count_nonzero(layer) for layer in interpolated_layers)
-    effective_samples = max(total_non_zero, n_layers)  # At least n_layers samples
+    effective_samples = max(total_non_zero, n_layers * 10)  # At least 10 samples per layer
     
-    # Handle case where no data exists
+    # Handle case where no geological data exists
     if all(np.count_nonzero(layer) == 0 for layer in interpolated_layers):
         return {
             "system_coherence": 0.0,
             "spatial_correction": 1.0,
-            "coherence_matrix": np.array([]),
+            "coherence_matrix": np.zeros((n_layers, n_layers)),
             "bic": float('inf'),  # Infinite BIC for empty data
             "total_cv_mse": 1.0,
             "per_layer_mse": {},
-            **default_stage1_results
+            "masking_test_passed": False,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "no_data",
+            "stage_completed": "mae_bic_completed"
         }
     
-    # Normalize interpolated layers for fair comparison
-    normalized_values = normalize_layers(interpolated_layers, layer_dtypes)
+    # Compute pairwise MAE matrix using unified continuous approach
+    mae_matrix = compute_pairwise_mae(interpolated_layers, layer_dtypes, grid)
     
-    # Compute pairwise R² matrix on interpolated data
-    r_squared_matrix = compute_pairwise_r_squared(normalized_values, layer_dtypes)
+    # Convert MAE matrix to coherence score for compatibility
+    system_coherence = system_mae_to_coherence(mae_matrix)
     
-    # System coherence = average off-diagonal R²
-    mask = ~np.eye(n_layers, dtype=bool)  # Exclude diagonal (self-correlations)
-    system_coherence = np.mean(r_squared_matrix[mask])
-    
-    # Spatial autocorrelation correction (still use original data for spatial analysis)
+    # Spatial autocorrelation correction using original data
     spatial_correction = compute_moran_correction(layer_values, grid)
     
-    # Effective Sample Size Adjusted BIC score (Stage 2 only)
-    # Now properly used for complexity assessment after predictive value is established
-    total_voxels = grid.n_voxels
-    bic = compute_esa_bic(
-        system_coherence=system_coherence,
-        spatial_correction=spatial_correction,
+    # Compute Laplace likelihood BIC from MAE matrix
+    bic = compute_geological_bic(
+        mae_matrix=mae_matrix,
         n_layers=n_layers,
-        effective_samples=effective_samples,
-        total_voxels=total_voxels
+        n_effective_samples=effective_samples,
+        spatial_correction=spatial_correction
     )
     
-    # For compatibility with existing code, map coherence to MSE-like metric
+    # Legacy compatibility mappings
     total_cv_mse = 1.0 - system_coherence * spatial_correction
+    
+    # Quality assessment for masking test compatibility
+    system_mae = np.mean(mae_matrix[~np.eye(n_layers, dtype=bool)]) if n_layers > 1 else 0.0
+    mae_improvement = max(0.0, 1.0 - system_mae)  # Higher = better
     
     return {
         "system_coherence": system_coherence,
         "spatial_correction": spatial_correction,
-        "coherence_matrix": r_squared_matrix,
+        "coherence_matrix": mae_matrix,  # Now MAE matrix (lower = better)
         "bic": bic,
         "total_cv_mse": total_cv_mse,
         "per_layer_mse": {},  # Legacy compatibility
-        **default_stage1_results
+        "masking_test_passed": True,  # Simplified - MAE handles quality naturally
+        "masking_test_improvement": mae_improvement,
+        "masking_test_direction": "unified_continuous",
+        "stage_completed": "mae_bic_completed"
     }
 
 
-# =============================================================================
-# Joint Prediction Scoring (Ridge Regression + BIC) - LEGACY
-# =============================================================================
 
 def _create_depth_folds(
     shape: tuple[int, int, int],
@@ -1637,25 +1817,34 @@ def evaluate_new_layer(
     n_folds: int = 5,
 ) -> dict:
     """
-    Evaluate adding a new layer to the store.
+    Evaluate adding a new layer to the store using MAE + Laplace likelihood BIC.
     
-    Uses geological coherence scoring:
-    1. Compute geological coherence score WITHOUT the new layer
-    2. Compute geological coherence score WITH the new layer
-    3. Admit if BIC improves (lower is better)
+    NEW: Uses unified continuous approach with MAE prediction and Laplace likelihood
+    BIC for robust geological scoring. All layer types (boolean faults, continuous
+    grades) treated as continuous variables for consistent evaluation.
+    
+    Process:
+    1. Compute geological coherence score WITHOUT the new layer (MAE-based)
+    2. Compute geological coherence score WITH the new layer (MAE-based)
+    3. Admit if Laplace likelihood BIC improves (lower is better)
+    
+    Improvements over R² system:
+    - Robust to sparse geological data (no zero-inflation bias)
+    - Interpretable errors in geological units (%Cu, ppm Au, fault probability)
+    - Theoretically consistent BIC using same metric for prediction and scoring
     
     Args:
         store: VoxelStore to evaluate against
         layer_name: Name for the new layer
         layer_values: 3D array of values
-        layer_dtype: Data type ("float", "categorical", "boolean")
-        ridge_alpha: Ridge regularization strength (legacy compatibility)
-        n_folds: Number of CV folds (legacy compatibility)
+        layer_dtype: Data type ("float", "categorical", "boolean") - all treated as continuous
+        ridge_alpha: Ridge regularization strength (legacy compatibility - ignored)
+        n_folds: Number of CV folds (legacy compatibility - uses 80/20 CV split)
     
     Returns:
-        dict with:
-            - bic_before/after/delta: BIC scores
-            - cv_mse_before/after/delta: Cross-validated MSE (coherence-based)
+        dict with (API compatible):
+            - bic_before/after/delta: Laplace likelihood BIC scores
+            - cv_mse_before/after/delta: MAE-derived MSE (legacy compatibility)
             - mutual_info: MI with existing layers
             - admitted: whether layer improves BIC
             - predicted_value: BIC improvement (higher = better hypothesis)
@@ -1766,7 +1955,7 @@ def evaluate_new_layer(
         "cv_mse_delta": cv_mse_delta,
         "mutual_info": mi_scores,
         "admitted": admitted,
-        # For hypothesis agent training: BIC improvement (higher = better)
+        # For hypothesis agent training: MAE-based BIC improvement (higher = better)
         "predicted_value": -bic_delta,
         # Stage 1 fields from two-stage scoring
         **stage1_fields

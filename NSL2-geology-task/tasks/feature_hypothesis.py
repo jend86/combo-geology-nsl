@@ -409,22 +409,16 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
+        # Generate dynamic survey prompt with recent experiments context
+        survey_prompt = self._generate_survey_prompt_with_context()
+        
         return Workflow(
             steps=(
                 # HYPOTHESIS AGENT: Phase 1
                 WorkflowStep(
                     name="survey",
                     is_entry=True,
-                    prompt=(
-                        "Phase 1: Survey\n\n"
-                        "Explore the dataset to identify feature opportunities.\n\n"
-                        "Use analysis_shell to:\n"
-                        "- Read file headers and schemas\n"
-                        "- Identify interesting patterns\n\n"
-                        "Find 2-3 promising feature layer candidates.\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='survey', candidates=[...])"
-                    ),
+                    prompt=survey_prompt,
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -1725,6 +1719,15 @@ finally:
                     error=f"Unknown execution capability: {capability_name}"
                 )
             
+            # Special handling for execution_submit - pass analysis container
+            if capability_name == "execution_submit":
+                analysis = self._pick_container(containers, "analysis")
+                if analysis is not None:
+                    args = {**args, "container": analysis}
+                else:
+                    # Log warning but continue - will use fallback mode
+                    print(f"Warning: No analysis container available for execution_submit, using fallback mode")
+            
             # Call the tool function directly
             tool_func = tool_functions[capability_name]
             result = tool_func(**args)
@@ -2137,6 +2140,61 @@ finally:
             return len(data.get("layers", {}))
         except Exception:
             return 0
+    
+    def _generate_survey_prompt_with_context(self) -> str:
+        """Generate survey prompt with recent experiments context for deduplication."""
+        base_prompt = (
+            "Phase 1: Survey\n\n"
+            "Explore the dataset to identify feature opportunities.\n\n"
+            "Use analysis_shell to:\n"
+            "- Read file headers and schemas\n"
+            "- Identify interesting patterns\n\n"
+        )
+        
+        # Try to get recent experiments for context
+        try:
+            import sys
+            from pathlib import Path
+            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+            if vfm_path not in sys.path:
+                sys.path.append(vfm_path)
+            
+            from voxel_features.knowledge_graph import KnowledgeGraph
+            from voxel_features.store import COE_FAIRBAIRN_GRID
+            
+            kg = KnowledgeGraph(COE_FAIRBAIRN_GRID)
+            all_experiments = kg.list_all()
+            
+            if all_experiments:
+                # Get 5 most recent experiments
+                recent_experiments = sorted(
+                    all_experiments,
+                    key=lambda exp: exp.timestamp,
+                    reverse=True
+                )[:5]
+                
+                context_prompt = "\n**AVOID REPEATING RECENT EXPERIMENTS:**\n"
+                context_prompt += "Recent hypotheses already tested (don't repeat these patterns):\n"
+                
+                for i, exp in enumerate(recent_experiments, 1):
+                    status = "✅ ADMITTED" if exp.admitted else "❌ REJECTED"
+                    context_prompt += f"{i}. {exp.hypothesis} [{status}]\n"
+                    context_prompt += f"   Result: {exp.result_summary[:100]}...\n"
+                
+                context_prompt += "\nFocus on NEW geological patterns not covered above.\n\n"
+                base_prompt += context_prompt
+            
+        except Exception as e:
+            # If we can't get recent experiments, continue with base prompt
+            print(f"Warning: Could not load recent experiments context: {e}")
+        
+        base_prompt += (
+            "Find 2-3 promising feature layer candidates.\n\n"
+            "Close with:\n"
+            "  record_phase(phase='survey', candidates=[...])"
+        )
+        
+        return base_prompt
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
         """Check if there are crossbreed pairs available."""

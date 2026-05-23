@@ -30,7 +30,8 @@ from voxel_features.mcp.tools.scoring_tools import (
 )
 from voxel_features.mcp.tools.experiment_tools import (
     experiment_record, experiment_get, experiment_list_admitted,
-    experiment_get_crossbreed_pairs, experiment_export_training
+    experiment_get_crossbreed_pairs, experiment_export_training,
+    experiment_list_recent
 )
 from voxel_features.mcp.tools.spatial_tools import (
     spatial_add_point, spatial_add_line, spatial_query_region,
@@ -238,6 +239,20 @@ TOOLS = [
         },
     ),
     Tool(
+        name="experiment.list_recent",
+        description="List recent experiments for hypothesis deduplication",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "max_experiments": {
+                    "type": "integer",
+                    "description": "Maximum number of recent experiments to return",
+                    "default": 10
+                }
+            },
+        },
+    ),
+    Tool(
         name="experiment.export_training",
         description="Export experiments as JSONL training data",
         inputSchema={
@@ -422,6 +437,8 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return experiment_list_admitted(kg)
     elif name == "experiment.get_crossbreed_pairs":
         return experiment_get_crossbreed_pairs(kg, **arguments)
+    elif name == "experiment.list_recent":
+        return experiment_list_recent(kg, **arguments)
     elif name == "experiment.export_training":
         return experiment_export_training(kg, **arguments)
     
