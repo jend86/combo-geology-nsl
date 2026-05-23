@@ -1,0 +1,50 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: docker/feature-hypothesis-kazakhstan-compose/Dockerfile.agent
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [agent-net]
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  vfm:
+    build:
+      context: ../..
+      dockerfile: docker/feature-hypothesis-kazakhstan-compose/Dockerfile.vfm
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    environment:
+      - PYTHONPATH=/opt/vfm
+      - VFM_STORE_PATH=/workspace/store
+      - VFM_KG_PATH=/workspace/knowledge
+    volumes:
+      - ${FEATURE_STORE_DIR:-../../data/kazakhstan/feature-hypothesis/store}:/workspace/store:rw
+      - ${FEATURE_KG_DIR:-../../data/kazakhstan/feature-hypothesis/knowledge}:/workspace/knowledge:rw
+    tmpfs:
+      - /workspace/tmp:rw,size=1g
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  analysis:
+    build:
+      context: ../..
+      dockerfile: docker/feature-hypothesis-kazakhstan-compose/Dockerfile.analysis
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    volumes:
+      - ${KAZKHSTAN_DATA_DIR:-../../../Kazkhstan_data}:/workspace/input:ro
+    tmpfs:
+      - /workspace/out:rw,size=512m
+    working_dir: /workspace
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+networks:
+  agent-net:
+    internal: true
+  task-net:
+    internal: true
