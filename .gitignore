@@ -8,3 +8,8 @@ NSL2-geology-task/config/config-forked-exploit-msagent.toml
 NSL2-geology-task/config/config-forked-exploit.toml
 NSL2-geology-task/tasks/geology_hypothesis.py
 NSL2-geology-task/uv.lock
+
+# python stuff
+__pycache__/
+*.py[cod]
+.venv/

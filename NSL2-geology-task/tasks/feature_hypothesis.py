@@ -13,14 +13,18 @@ Architecture:
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from docker.models.containers import Container
 from loguru import logger
@@ -81,6 +85,15 @@ _ROLE_SERVICE = {
 
 _ANALYSIS_INPUT = "/workspace/input"
 _ANALYSIS_OUT = "/workspace/out"
+
+# Filenames inside `variation.kg_dir`. Centralised so the task code, tests,
+# and any external tooling (e.g. analytics scripts) reference one source.
+_KG_EXPERIMENTS = "experiments.jsonl"
+_KG_CROSSBREED_INDEX = "crossbreed_index.jsonl"
+_KG_ADMITTED_INDEX = "admitted_index.json"
+_KG_BOOTSTRAP_STATE = "bootstrap_state.json"
+_KG_QUEUE = "crossbreed_queue.jsonl"
+_KG_LOCK = "kg.lock"
 
 
 # Coe Fairbairn grid specification - High resolution for spatial features
@@ -150,13 +163,27 @@ _DATASET_OVERVIEW = """## Coe Fairbairn Dataset Overview
 @dataclass
 class FeatureHypothesisVariation(Variation):
     """Variation configuration for feature hypothesis task."""
-    
+
     dataset_dir: str = ""
     store_dir: str = ""
     kg_dir: str = ""
     grid_spec: dict[str, Any] = field(default_factory=lambda: dict(_COE_FAIRBAIRN_GRID))
     min_features: int = 0  # minimum features before crossbreeding
     crossbreed_enabled: bool = True
+    # Crossbreed-pool dedup keeps near-identical experiments from flooding
+    # `experiments.jsonl`. When enabled, an admitted record's fingerprint
+    # (ordered parents + hypothesis) must be unseen; duplicates remain
+    # successes for reward purposes but are silently skipped from the pool.
+    dedup_enabled: bool = True
+    # Upper bound on concurrent bootstrap (= survey) episodes. Set this to
+    # your `GenerationConfig.parallel_episodes` to choke bootstrap to the
+    # full slot count; set it lower to leave headroom for ramp-up. If the
+    # framework has fewer slots than this, the extras simply do nothing.
+    bootstrap_concurrency_cap: int = 4
+    bootstrap_window_size: int = 8  # episodes over which to ramp N/2 -> N
+    bootstrap_min_concurrency_fraction: float = 0.5
+    bootstrap_permit_timeout_s: float = 600.0
+    bootstrap_permit_stale_after_s: float = 1800.0
 
 
 @dataclass
@@ -284,17 +311,17 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     ) -> PopulationOutcome:
         if not isinstance(variation, FeatureHypothesisVariation):
             raise TypeError("FeatureHypothesisTask requires FeatureHypothesisVariation")
-        
+
         episode_id = f"ep_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-        
+
         # Check existing features to decide workflow
         n_features = self._count_features(variation)
         workflow_kind = "crossbreed" if (
-            variation.crossbreed_enabled and 
+            variation.crossbreed_enabled and
             n_features >= variation.min_features and
             self._has_crossbreed_pairs(variation)
         ) else "survey"
-        
+
         episode_context: dict[str, Any] = {
             "episode_id": episode_id,
             "variation_name": variation.name,
@@ -305,11 +332,47 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             "grid_spec": variation.grid_spec,
             "n_features": n_features,
         }
-        
-        # If crossbreeding, add context
+
+        # Crossbreed: serve a distinct ordered (parent_a, parent_b) pair from
+        # the queue so concurrent slots do not collide on the same parents.
         if workflow_kind == "crossbreed":
-            episode_context["crossbreed_context"] = self._get_crossbreed_context(variation)
-        
+            crossbreed_ctx: dict[str, Any] = {}
+            kg_dir_path = Path(variation.kg_dir)
+            if variation.dedup_enabled:
+                pair = self._queue_pop_pair(kg_dir_path)
+                if pair is not None:
+                    crossbreed_ctx = self._build_crossbreed_context_for_pair(
+                        kg_dir_path, pair[0], pair[1]
+                    )
+            if not crossbreed_ctx:
+                # Fall back to the legacy single-best selection (or a no-op
+                # empty context if no experiments). Keeps the task usable when
+                # dedup_enabled is False or the queue couldn't yield a pair.
+                crossbreed_ctx = self._get_crossbreed_context(variation)
+            episode_context["crossbreed_context"] = crossbreed_ctx
+
+        # Survey (= bootstrap): block here until a slot permit is free so
+        # the early generation runs at lower concurrency. The framework
+        # still allocates `parallel_episodes` slots; we choke them at the
+        # task layer to preserve the pytorch-lightning boundary.
+        if (
+            workflow_kind == "survey"
+            and variation.dedup_enabled
+            and variation.bootstrap_window_size > 0
+        ):
+            permit_slot_id = f"slot_{episode_id}_{uuid.uuid4().hex[:6]}"
+            acquired = self._acquire_bootstrap_permit(
+                Path(variation.kg_dir),
+                permit_slot_id,
+                configured_slots=variation.bootstrap_concurrency_cap,
+                window_size=variation.bootstrap_window_size,
+                min_fraction=variation.bootstrap_min_concurrency_fraction,
+                timeout_s=variation.bootstrap_permit_timeout_s,
+                stale_after_s=variation.bootstrap_permit_stale_after_s,
+            )
+            if acquired:
+                episode_context["bootstrap_permit_slot_id"] = permit_slot_id
+
         results = [
             PopulationResult(
                 container_id=getattr(container, "id", ""),
@@ -1481,23 +1544,32 @@ finally:
             stage_completed == 'stage_2_completed'
         )
         
+        # Prefer the kg_dir wired through populate() so dedup ledger and
+        # experiments.jsonl always live next to each other. Fall back to the
+        # legacy `data_base_path / knowledge / coe_fairbairn` derivation so
+        # existing deployments keep working.
+        kg_dir_ctx = ctx.episode_context.get("kg_dir", "")
+        if kg_dir_ctx:
+            knowledge_dir = Path(kg_dir_ctx)
+        else:
+            knowledge_dir = data_base_path / "knowledge" / "coe_fairbairn"
+
+        # Pull queue-served parent IDs from the hypothesise phase record so
+        # the kg node closes the TODO at the previous line numbers.
+        parent_experiments = hypothesise.get("parent_experiments") or []
+        parent_node_1 = parent_experiments[0] if len(parent_experiments) > 0 else None
+        parent_node_2 = parent_experiments[1] if len(parent_experiments) > 1 else None
+
+        duplicate_rejected = False
         if both_stages_passed:
             try:
-                knowledge_dir = data_base_path / "knowledge" / "coe_fairbairn"
                 knowledge_dir.mkdir(parents=True, exist_ok=True)
-                experiments_file = knowledge_dir / "experiments.jsonl"
-                crossbreed_file = knowledge_dir / "crossbreed_index.jsonl"
-                
-                # Generate node ID
                 node_id = f"exp_{episode_id}" if episode_id else f"exp_{int(time.time())}"
-                
-                # Create knowledge graph record (only for experiments that passed both stages)
                 kg_record = {
                     "node_id": node_id,
                     "prompt": training_pair.get('prompt', ''),
                     "response": training_pair.get('response', ''),
                     "bic_delta": bic_delta,
-                    # Two-stage scoring results
                     "masking_test_passed": masking_test_passed,
                     "masking_test_improvement": masking_test_improvement,
                     "masking_test_direction": masking_test_direction,
@@ -1507,21 +1579,31 @@ finally:
                         "layer_file": f"store/coe_fairbairn/layers/{translate.get('feature_layer_name', '')}.npy" if translate.get('feature_layer_name') else None,
                         "spatial_ops": f"store/coe_fairbairn/spatial.db:experiment_{episode_id}" if episode_id else None
                     },
-                    "parent_node_1": None,  # TODO: Add crossbreed parent tracking
-                    "parent_node_2": None,
+                    "parent_node_1": parent_node_1,
+                    "parent_node_2": parent_node_2,
                     "timestamp": datetime.now().isoformat(),
                     "mutual_info": evaluate.get('mutual_info', {}),
                     "layer_name": translate.get('feature_layer_name', ''),
                     "hypothesis": hypothesise.get('hypothesis', '')
                 }
-                
-                # Append to experiments.jsonl
-                with open(experiments_file, 'a') as f:
-                    f.write(json.dumps(kg_record) + '\n')
-                
-                # Calculate mutual information with existing experiments and update crossbreed index
-                self._update_crossbreed_index(knowledge_dir, node_id, evaluate.get('mutual_info', {}))
-                
+
+                # Atomic dedup: appends to experiments.jsonl only if the
+                # fingerprint (ordered parents + hypothesis) is unseen.
+                # Duplicates keep the episode's reward (the capability still
+                # returns success below) but never enter the pool.
+                fingerprint_parents = [p for p in parent_experiments if isinstance(p, str) and p]
+                admitted_to_kg = self._admit_with_dedup(
+                    knowledge_dir,
+                    kg_record,
+                    parents=fingerprint_parents,
+                    hypothesis=hypothesise.get('hypothesis', ''),
+                )
+                duplicate_rejected = not admitted_to_kg
+                if admitted_to_kg:
+                    self._update_crossbreed_index(
+                        knowledge_dir, node_id, evaluate.get('mutual_info', {})
+                    )
+
             except Exception as e:
                 print(f"Warning: Failed to save knowledge graph data: {e}")
 
@@ -1530,19 +1612,24 @@ finally:
             "training_pair": training_pair,
             "timestamp": time.time(),
         }
+        if duplicate_rejected:
+            # finalize_episode reads this to stamp `duplicate_rejected` into
+            # the reward breakdown for telemetry.
+            ctx.episode_context["duplicate_rejected"] = True
 
         return CapabilityResult(
             "submit_rewrite",
             output={
-                "recorded": True, 
-                "training_saved": True, 
-                "knowledge_saved": both_stages_passed,
+                "recorded": True,
+                "training_saved": True,
+                "knowledge_saved": both_stages_passed and not duplicate_rejected,
+                "duplicate_rejected": duplicate_rejected,
                 "two_stage_results": {
                     "stage_1_passed": masking_test_passed,
                     "stage_1_improvement": masking_test_improvement,
                     "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
-                    "final_admitted": both_stages_passed
+                    "final_admitted": both_stages_passed and not duplicate_rejected,
                 }
             },
             success=True,
@@ -1559,9 +1646,9 @@ finally:
         from datetime import datetime
         
         try:
-            experiments_file = knowledge_dir / "experiments.jsonl"
-            crossbreed_file = knowledge_dir / "crossbreed_index.jsonl"
-            
+            experiments_file = knowledge_dir / _KG_EXPERIMENTS
+            crossbreed_file = knowledge_dir / _KG_CROSSBREED_INDEX
+
             # Read existing experiments to calculate MI with each
             existing_experiments = []
             if experiments_file.exists():
@@ -2108,7 +2195,52 @@ finally:
                     "no_predictive_value": True,
                 },
             )
-    
+
+    def finalize_episode(
+        self,
+        containers: list[Container],
+        initial: FeatureHypothesisState,
+        episode_context: dict[str, Any],
+        artifacts: EpisodeArtifacts,
+        *,
+        private_context: dict[str, Any] | None = None,
+        finalization_context: Any | None = None,
+    ) -> TaskReward:
+        try:
+            final = self.measure_final_state(
+                containers, episode_context, artifacts, private_context=private_context
+            )
+            reward = self.compute_reward(initial, final, artifacts)
+            breakdown = dict(reward.breakdown or {})
+            # The framework's max_bootstrap_episodes guard inspects
+            # task_breakdown["bootstrap_active"] (src/execution/generation.py).
+            # For feature_hypothesis, "bootstrap" == the early phase before
+            # the feature pool reaches min_features (workflow_kind="survey").
+            breakdown["bootstrap_active"] = final.workflow_kind == "survey"
+            if episode_context.get("duplicate_rejected"):
+                breakdown["duplicate_rejected"] = True
+            if breakdown != (reward.breakdown or {}):
+                reward = TaskReward(
+                    value=reward.value,
+                    success=reward.success,
+                    breakdown=breakdown,
+                )
+            return reward
+        finally:
+            # Always release the bootstrap permit so a crashed or short-
+            # circuited episode does not hold the in-flight slot until it
+            # ages out via stale_after_s.
+            permit_slot_id = episode_context.get("bootstrap_permit_slot_id")
+            kg_dir_ctx = episode_context.get("kg_dir")
+            if isinstance(permit_slot_id, str) and isinstance(kg_dir_ctx, str) and kg_dir_ctx:
+                try:
+                    self._release_bootstrap_permit(Path(kg_dir_ctx), permit_slot_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"feature_hypothesis: bootstrap permit release failed "
+                        f"({permit_slot_id}): {exc}"
+                    )
+
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
@@ -2140,7 +2272,7 @@ finally:
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
         """Check if there are crossbreed pairs available."""
-        experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
         if not experiments_file.exists():
             return False
         try:
@@ -2168,9 +2300,9 @@ finally:
         import json
         
         try:
-            experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
-            crossbreed_file = Path(variation.kg_dir) / "crossbreed_index.jsonl"
-            
+            experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
+            crossbreed_file = Path(variation.kg_dir) / _KG_CROSSBREED_INDEX
+
             if not experiments_file.exists():
                 return {}
             
@@ -2258,7 +2390,7 @@ finally:
         variation: FeatureHypothesisVariation,
     ) -> dict[str, Any]:
         """Simple fallback crossbreed selection - just first two admitted."""
-        experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
         if not experiments_file.exists():
             return {}
         
@@ -2301,4 +2433,419 @@ finally:
             }
         except Exception:
             return {}
+
+    @staticmethod
+    def _crossbreed_prompt(exp_a: dict[str, Any], exp_b: dict[str, Any]) -> str:
+        """Render the crossbreed prompt for a specific ordered (A, B) pair."""
+        return (
+            f"These experiments both improved the world model:\n\n"
+            f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
+            f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+            f"- Feature: {exp_a.get('layer_name', '')}\n"
+            f"- BIC improvement: {abs(float(exp_a.get('bic_delta', 0.0))):.2f}\n\n"
+            f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
+            f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+            f"- Feature: {exp_b.get('layer_name', '')}\n"
+            f"- BIC improvement: {abs(float(exp_b.get('bic_delta', 0.0))):.2f}\n\n"
+            f"Given that both patterns exist in the data, what new hypothesis "
+            f"would you propose that combines or builds on these findings?"
+        )
+
+    def _build_crossbreed_context_for_pair(
+        self,
+        kg_dir: Path,
+        parent_a_id: str,
+        parent_b_id: str,
+    ) -> dict[str, Any]:
+        """Build crossbreed_context for a specific parent pair, popped from the queue.
+
+        Falls back to an empty dict if either parent cannot be found in
+        experiments.jsonl (e.g. a stale queue entry whose record was pruned).
+        """
+        experiments = self._load_successful_experiments(kg_dir)
+        by_id = {exp.get("node_id"): exp for exp in experiments}
+        exp_a = by_id.get(parent_a_id)
+        exp_b = by_id.get(parent_b_id)
+        if not (isinstance(exp_a, dict) and isinstance(exp_b, dict)):
+            return {}
+        return {
+            "prompt": self._crossbreed_prompt(exp_a, exp_b),
+            "parent_ids": [parent_a_id, parent_b_id],
+        }
+
+    # ------------------------------------------------------------------
+    # Duplicate handling + bootstrap pacing
+    # ------------------------------------------------------------------
+    # All coordination is file-based so it survives across the parallel
+    # worker threads that share a single TaskSpec instance. Mirrors the
+    # `_pool_lock`/`_read_pool_index` pattern from `tasks/geology_graph.py`.
+
+    @contextmanager
+    def _kg_lock(self, kg_dir: Path | str) -> Iterator[None]:
+        kg_path = Path(kg_dir)
+        kg_path.mkdir(parents=True, exist_ok=True)
+        lock_path = kg_path / _KG_LOCK
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, obj: Any) -> None:
+        """Tmp-then-replace JSON writer. Unique tmp per pid+uuid prevents
+        cross-process ENOENT races (see `geology_graph._write_pool_index`)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+
+    @staticmethod
+    def _atomic_write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        tmp.replace(path)
+
+    @staticmethod
+    def _read_json_or(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+        if not path.exists():
+            return dict(default)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return dict(default)
+        if not isinstance(data, dict):
+            return dict(default)
+        return data
+
+    @staticmethod
+    def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+        return out
+
+    @staticmethod
+    def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:
+        """SHA256 over ordered parents + whitespace-normalised hypothesis.
+
+        Order-sensitive: `(A, B)` and `(B, A)` hash differently because the
+        agent sees parents in order — the resulting hypotheses are legitimately
+        distinct experiments. Hypothesis normalisation stops at whitespace;
+        anything stronger (lower-case, stemming) risks false dedups.
+        """
+        parents = list(parent_experiments or [])
+        normalized = re.sub(r"\s+", " ", (hypothesis or "")).strip()
+        payload = "|".join(parents) + "::" + normalized
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _admit_with_dedup(
+        self,
+        kg_dir: Path | str,
+        kg_record: dict,
+        *,
+        parents: list[str],
+        hypothesis: str,
+    ) -> bool:
+        """Append kg_record to experiments.jsonl iff (parents, hypothesis)
+        is unseen. Returns True if newly admitted, False on duplicate.
+
+        Duplicates leave the episode's reward intact — the design intent is
+        "duplicates count as successes but do not flood the pool". Callers
+        pass `parents` and `hypothesis` explicitly so the kg_record schema
+        is decoupled from the fingerprint inputs.
+        """
+        kg_path = Path(kg_dir)
+        fp = self._fingerprint(parents, hypothesis)
+
+        with self._kg_lock(kg_path):
+            ledger = self._read_json_or(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": []})
+            seen: list[str] = list(ledger.get("fingerprints", []))
+            if fp in seen:
+                return False
+            with (kg_path / _KG_EXPERIMENTS).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(kg_record) + "\n")
+            seen.append(fp)
+            self._atomic_write_json(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": seen})
+        return True
+
+    # ----- Bootstrap concurrency ramp ---------------------------------
+
+    @staticmethod
+    def _bootstrap_target_active(
+        bootstrap_episodes_seen: int,
+        configured_slots: int,
+        window_size: int,
+        min_fraction: float,
+    ) -> int:
+        """Active-slot target as the bootstrap window progresses.
+
+        progress = seen / window  ∈ [0, 1]
+        fraction = min_fraction + (1 - min_fraction) * progress  ∈ [min, 1]
+        target   = ceil(configured_slots * fraction)
+
+        window_size <= 0 means "no ramp" — every slot is allowed.
+        """
+        if window_size <= 0 or configured_slots <= 0:
+            return max(0, configured_slots)
+        progress = min(max(bootstrap_episodes_seen / window_size, 0.0), 1.0)
+        fraction = min_fraction + (1.0 - min_fraction) * progress
+        return max(1, math.ceil(configured_slots * fraction))
+
+    def _read_bootstrap_state(self, kg_dir: Path) -> dict[str, Any]:
+        data = self._read_json_or(
+            kg_dir / _KG_BOOTSTRAP_STATE,
+            {"bootstrap_episodes_seen": 0, "in_flight": []},
+        )
+        data.setdefault("bootstrap_episodes_seen", 0)
+        data.setdefault("in_flight", [])
+        return data
+
+    def _acquire_bootstrap_permit(
+        self,
+        kg_dir: Path | str,
+        slot_id: str,
+        configured_slots: int,
+        window_size: int,
+        min_fraction: float,
+        timeout_s: float = 600.0,
+        stale_after_s: float = 1800.0,
+        poll_interval_s: float = 0.5,
+    ) -> bool:
+        """Block until in-flight slots < target, then claim a permit.
+
+        Returns False on timeout. The caller MUST call
+        `_release_bootstrap_permit(slot_id)` once the episode finishes,
+        or the in-flight entry will linger until it ages out via
+        ``stale_after_s``. The 0.5 s poll interval is deliberate: the ramp
+        unit is "episodes", not subseconds, so faster polling just burns
+        lock contention with no scheduling benefit.
+        """
+        kg_path = Path(kg_dir)
+        state_path = kg_path / _KG_BOOTSTRAP_STATE
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+
+        while True:
+            with self._kg_lock(kg_path):
+                state = self._read_bootstrap_state(kg_path)
+                now = time.time()
+                raw_in_flight = list(state.get("in_flight", []))
+                # Reap stale entries: a crashed slot leaves its permit
+                # behind; without this the run deadlocks.
+                in_flight = [
+                    entry
+                    for entry in raw_in_flight
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("acquired_at"), (int, float))
+                    and (now - float(entry["acquired_at"])) < stale_after_s
+                ]
+                target = self._bootstrap_target_active(
+                    bootstrap_episodes_seen=int(state.get("bootstrap_episodes_seen", 0)),
+                    configured_slots=configured_slots,
+                    window_size=window_size,
+                    min_fraction=min_fraction,
+                )
+                if len(in_flight) < target:
+                    in_flight.append({"slot_id": slot_id, "acquired_at": now})
+                    state["in_flight"] = in_flight
+                    # `bootstrap_episodes_seen` increments on RELEASE, not
+                    # acquire — otherwise the ramp accelerates with raw
+                    # parallelism and lets configured concurrency in before
+                    # any episode has actually completed.
+                    self._atomic_write_json(state_path, state)
+                    return True
+                # Persist the reap so other slots benefit when they next
+                # acquire — but only if we actually changed anything.
+                if in_flight != raw_in_flight:
+                    state["in_flight"] = in_flight
+                    self._atomic_write_json(state_path, state)
+
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_interval_s)
+
+    def _release_bootstrap_permit(self, kg_dir: Path | str, slot_id: str) -> None:
+        kg_path = Path(kg_dir)
+        state_path = kg_path / _KG_BOOTSTRAP_STATE
+        if not state_path.exists():
+            return
+        with self._kg_lock(kg_path):
+            state = self._read_bootstrap_state(kg_path)
+            before = state.get("in_flight", [])
+            after = [
+                entry
+                for entry in before
+                if not (isinstance(entry, dict) and entry.get("slot_id") == slot_id)
+            ]
+            state["in_flight"] = after
+            # Each *completed* episode (release) advances the ramp. Acquires
+            # that never complete (stale, reaped) do not bump the counter.
+            if len(after) != len(before):
+                state["bootstrap_episodes_seen"] = (
+                    int(state.get("bootstrap_episodes_seen", 0)) + 1
+                )
+            self._atomic_write_json(state_path, state)
+
+    # ----- Crossbreed queue -------------------------------------------
+
+    @classmethod
+    def _load_successful_experiments(cls, kg_dir: Path) -> list[dict[str, Any]]:
+        return [
+            rec
+            for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS)
+            if rec.get("bic_delta", 0) < 0
+        ]
+
+    @classmethod
+    def _load_mi_index(cls, kg_dir: Path) -> dict[str, float]:
+        mi: dict[str, float] = {}
+        for rec in cls._read_jsonl_records(kg_dir / _KG_CROSSBREED_INDEX):
+            pair_id = rec.get("pair_id")
+            if not isinstance(pair_id, str):
+                continue
+            try:
+                mi[pair_id] = float(rec.get("mutual_information", 0.0))
+            except (TypeError, ValueError):
+                continue
+        return mi
+
+    @staticmethod
+    def _ordered_pair_id(a: str, b: str) -> str:
+        # Pair ID is ORDERED — keeps (A,B) and (B,A) distinct in the queue.
+        return f"{a}->{b}"
+
+    def _enumerate_pairs(self, kg_dir: Path) -> list[dict[str, Any]]:
+        experiments = self._load_successful_experiments(kg_dir)
+        mi_index = self._load_mi_index(kg_dir)
+        out: list[dict[str, Any]] = []
+        for exp_a in experiments:
+            for exp_b in experiments:
+                if exp_a["node_id"] == exp_b["node_id"]:
+                    continue
+                bic_a = abs(float(exp_a.get("bic_delta", 0.0)))
+                bic_b = abs(float(exp_b.get("bic_delta", 0.0)))
+                # MI is symmetric and uses the alphabetically-sorted pair
+                # id (matches `_update_crossbreed_index`).
+                mi_pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
+                mi = mi_index.get(mi_pair_id, 0.0)
+                out.append({
+                    "pair_id": self._ordered_pair_id(exp_a["node_id"], exp_b["node_id"]),
+                    "parents": [exp_a["node_id"], exp_b["node_id"]],
+                    "score": (bic_a + bic_b) - mi,
+                    "popped_at": None,
+                })
+        out.sort(key=lambda entry: entry["score"], reverse=True)
+        return out
+
+    @classmethod
+    def _read_queue(cls, kg_dir: Path) -> list[dict[str, Any]]:
+        return cls._read_jsonl_records(kg_dir / _KG_QUEUE)
+
+    @classmethod
+    def _write_queue(cls, kg_dir: Path, entries: list[dict[str, Any]]) -> None:
+        cls._atomic_write_jsonl(kg_dir / _KG_QUEUE, entries)
+
+    @staticmethod
+    def _experiments_changed_since_queue(kg_dir: Path) -> bool:
+        """True if experiments.jsonl has been modified after the queue was last
+        written (or the queue does not yet exist). Lets us skip the O(N²)
+        re-enumeration when the experiment set is unchanged."""
+        queue_path = kg_dir / _KG_QUEUE
+        exp_path = kg_dir / _KG_EXPERIMENTS
+        if not queue_path.exists():
+            return True
+        if not exp_path.exists():
+            return False
+        return exp_path.stat().st_mtime > queue_path.stat().st_mtime
+
+    def _merge_new_pairs(
+        self,
+        kg_dir: Path,
+        existing: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Union existing queue entries with freshly-enumerated pairs.
+
+        Existing entries (including their popped_at state) are preserved;
+        new pairs from newly-admitted experiments are inserted. Re-sorted
+        by score desc.
+        """
+        merged = {entry.get("pair_id"): entry for entry in existing}
+        for entry in self._enumerate_pairs(kg_dir):
+            pid = entry["pair_id"]
+            if pid in merged:
+                # Refresh score in case MI/BIC moved; preserve popped state.
+                merged[pid]["score"] = entry["score"]
+            else:
+                merged[pid] = entry
+        return sorted(merged.values(), key=lambda e: e["score"], reverse=True)
+
+    def _queue_refill(self, kg_dir: Path | str) -> None:
+        """Re-enumerate ordered pairs and insert any missing ones into the queue.
+
+        Existing entries (popped or not) are preserved so partial progress
+        across episodes isn't lost. New experiments added between calls
+        introduce new pairs that take their place in score order.
+        """
+        kg_path = Path(kg_dir)
+        with self._kg_lock(kg_path):
+            self._write_queue(kg_path, self._merge_new_pairs(kg_path, self._read_queue(kg_path)))
+
+    def _queue_pop_pair(self, kg_dir: Path | str) -> tuple[str, str] | None:
+        """Pop the highest-scoring unpopped ordered pair under the kg lock.
+
+        Returns ``(parent_a, parent_b)`` or None if no valid pairs exist
+        (need ≥2 successful experiments). If every pair has been popped this
+        round, the queue is reset (round-robin) and the top pair is served
+        again.
+        """
+        kg_path = Path(kg_dir)
+        # Cheap pre-check outside the lock — if there are <2 experiments,
+        # there is no way to pop. Inside the lock we may still re-check after
+        # acquiring the queue, but this avoids the lock overhead in the
+        # common steady-state survey-only case.
+        if len(self._load_successful_experiments(kg_path)) < 2:
+            return None
+
+        with self._kg_lock(kg_path):
+            entries = self._read_queue(kg_path)
+            # Only re-enumerate (the O(N²) hot path) when experiments.jsonl
+            # has grown since the last queue write. In the steady state this
+            # skips the enumeration entirely.
+            if not entries or self._experiments_changed_since_queue(kg_path):
+                entries = self._merge_new_pairs(kg_path, entries)
+
+            chosen = next((e for e in entries if not e.get("popped_at")), None)
+            if chosen is None:
+                # Round-robin: clear popped_at on every entry and pick the
+                # top of the refreshed ordering.
+                for entry in entries:
+                    entry["popped_at"] = None
+                chosen = entries[0] if entries else None
+
+            if chosen is None:
+                self._write_queue(kg_path, entries)
+                return None
+
+            chosen["popped_at"] = time.time()
+            self._write_queue(kg_path, entries)
+
+            parents = chosen.get("parents") or []
+            if len(parents) != 2:
+                return None
+            return str(parents[0]), str(parents[1])
 
