@@ -37,6 +37,10 @@ services:
     stdin_open: true
     networks: [task-net]
     volumes:
+      # Resolved relative to this compose file
+      # (docker/feature-hypothesis-kazakhstan-compose/): three `..`s walk up
+      # to the repo root, where Kazkhstan_data lives as a sibling of
+      # NSL2-geology-task.
       - ${KAZKHSTAN_DATA_DIR:-../../../Kazkhstan_data}:/workspace/input:ro
     tmpfs:
       - /workspace/out:rw,size=512m

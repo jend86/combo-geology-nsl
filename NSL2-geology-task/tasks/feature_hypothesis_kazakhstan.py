@@ -1010,9 +1010,6 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         enhanced = data_spec.copy()
         files = enhanced.get("files", [])
         
-        # Add Kazakhstan-specific file guidance with correct paths
-        file_specs = []
-        
         # Add the known Kazakhstan GeoJSON files with correct paths
         kazakhstan_geojson_files = [
             {
@@ -1082,15 +1079,18 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             }
         ]
         
-        # Combine all file specifications
-        all_files = kazakhstan_geojson_files + russian_survey_files + usgs_files
-        
-        # Add any additional files from the original data_spec
+        # Combine all known file specifications, then append any agent-supplied
+        # extras the enhancer doesn't already cover. Previously enhanced[
+        # "file_specs"] was overwritten with `all_files` after the extras were
+        # appended to a separate `file_specs` list, silently dropping the
+        # agent's own file list.
+        file_specs = list(kazakhstan_geojson_files + russian_survey_files + usgs_files)
+        known_file_keys = {spec["file"] for spec in file_specs}
         for file_path in files:
-            if not any(spec["file"] in file_path for spec in all_files):
+            if not any(known in file_path for known in known_file_keys):
                 file_specs.append({"file": file_path, "type": "unknown", "note": "Additional file - check format"})
-        
-        enhanced["file_specs"] = all_files
+
+        enhanced["file_specs"] = file_specs
         enhanced["kazakhstan_data_structure"] = {
             "geojson_files": 4,
             "copper_prospects": 113,
@@ -1305,7 +1305,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if store_dir:
             data_base_path = Path(store_dir).parent.parent  # from store/teniz_basin to data/kazakhstan/feature-hypothesis
         else:
-            data_base_path = Path("/home/jen/Desktop/GeoNSL_monorepo-pre-kazakh-complete/NSL2-geology-task/data/kazakhstan/feature-hypothesis")
+            # Fallback to a path relative to this file. The previous hardcoded
+            # absolute `/home/jen/Desktop/...` path crashed with PermissionError
+            # on any host whose user isn't `jen`.
+            data_base_path = (
+                Path(__file__).resolve().parent.parent
+                / "data" / "kazakhstan" / "feature-hypothesis"
+            )
         
         # Extract scoring results (Kazakhstan doesn't have two-stage scoring yet, so simplified)
         masking_test_passed = evaluate.get('masking_test_passed', True)

@@ -4,9 +4,22 @@
 echo "🚀 Testing Kazakhstan Teniz Basin Workflow with Regional Analysis"
 echo "================================================================="
 
-# Check if .env has been updated
+# Check .env: must exist, no placeholder, and OPENROUTER_API_KEY must be non-empty.
+# Previously this was a single `grep -q "your-..." .env` — that returns non-zero
+# both when the placeholder is absent AND when the file is missing entirely,
+# so a missing .env silently passed the check.
+if [ ! -f .env ]; then
+    echo "❌ ERROR: .env not found. Copy .env.example to .env and fill in OPENROUTER_API_KEY."
+    exit 1
+fi
 if grep -q "your-openrouter-api-key-here" .env; then
     echo "❌ ERROR: Please update .env with your actual OpenRouter API key"
+    exit 1
+fi
+# shellcheck disable=SC1091
+set -a; . ./.env; set +a
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "❌ ERROR: OPENROUTER_API_KEY is empty in .env"
     exit 1
 fi
 
@@ -19,8 +32,17 @@ echo "✅ Caches cleared"
 echo ""
 echo "🐳 Step 2: Docker cleanup (optional but recommended)"
 echo "----------------------------------------------------"
-read -p "Stop and remove Kazakhstan Docker containers? (y/n): " -n 1 -r
-echo
+# Prompt only when stdin is a TTY; otherwise skip so CI/log-piped runs don't hang.
+# Set DOCKER_CLEANUP=1 to force the cleanup non-interactively, DOCKER_CLEANUP=0 to skip.
+if [ -n "${DOCKER_CLEANUP:-}" ]; then
+    REPLY=$([ "$DOCKER_CLEANUP" = "1" ] && echo y || echo n)
+elif [ -t 0 ]; then
+    read -p "Stop and remove Kazakhstan Docker containers? (y/n): " -n 1 -r
+    echo
+else
+    REPLY=n
+    echo "⏭️  Non-interactive; skipping Docker cleanup (export DOCKER_CLEANUP=1 to force)"
+fi
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     docker compose -f docker/feature-hypothesis-kazakhstan-compose/docker-compose.yml down 2>/dev/null || true
     echo "✅ Kazakhstan Docker containers stopped"
@@ -57,20 +79,12 @@ echo ""
 echo "🚀 Step 5: Run Kazakhstan episode with debugging"
 echo "------------------------------------------------"
 
-# Create Kazakhstan-specific config if it doesn't exist
 if [ ! -f "config/config-feature-hypothesis-kazakhstan.toml" ]; then
-    echo "📝 Creating Kazakhstan config from template..."
-    if [ -f "config/config-feature-hypothesis-aiq.toml" ]; then
-        cp "config/config-feature-hypothesis-aiq.toml" "config/config-feature-hypothesis-kazakhstan.toml"
-        # Update the config for Kazakhstan
-        sed -i 's/feature-hypothesis-compose/feature-hypothesis-kazakhstan-compose/g' config/config-feature-hypothesis-kazakhstan.toml
-        sed -i 's/feature_hypothesis\.py/feature_hypothesis_kazakhstan.py/g' config/config-feature-hypothesis-kazakhstan.toml
-        sed -i 's/coe_fairbairn/teniz_basin/g' config/config-feature-hypothesis-kazakhstan.toml
-        echo "✅ Kazakhstan config created"
-    else
-        echo "❌ Base config file not found"
-        exit 1
-    fi
+    echo "❌ ERROR: config/config-feature-hypothesis-kazakhstan.toml is missing."
+    echo "   Check out this file from the repo — the previous auto-generation"
+    echo "   step (sed on the AIQ config) produced a config pointing at the"
+    echo "   wrong task class and is no longer trusted."
+    exit 1
 fi
 
 # Run the Kazakhstan episode with focused output

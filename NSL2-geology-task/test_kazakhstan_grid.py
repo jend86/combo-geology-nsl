@@ -14,28 +14,31 @@ KAZAKHSTAN_TENIZ_GRID = {
 }
 
 def coord_to_voxel(longitude, latitude, depth_m, grid_spec):
-    """Convert geographic coordinates to voxel indices."""
+    """Convert geographic coordinates to voxel indices.
+
+    Mirrors production behaviour in voxel_features/spatial.py: the geographic
+    coordinate must lie within the closed grid bounds, and the resulting index
+    is clamped to shape-1 so that a coordinate exactly equal to the grid
+    maximum lands on the last voxel instead of one past it.
+    """
     origin = grid_spec["origin"]
     maximum = grid_spec["maximum"]
     shape = grid_spec["shape"]
-    
-    # Calculate fractional position within grid bounds
-    lon_frac = (longitude - origin[0]) / (maximum[0] - origin[0])
-    lat_frac = (latitude - origin[1]) / (maximum[1] - origin[1])
-    depth_frac = (depth_m - origin[2]) / (maximum[2] - origin[2])
-    
-    # Convert to voxel indices
-    lon_idx = int(lon_frac * shape[0])
-    lat_idx = int(lat_frac * shape[1])
-    depth_idx = int(depth_frac * shape[2])
-    
-    # Check bounds
+
     in_bounds = (
-        0 <= lon_idx < shape[0] and
-        0 <= lat_idx < shape[1] and
-        0 <= depth_idx < shape[2]
+        origin[0] <= longitude <= maximum[0] and
+        origin[1] <= latitude  <= maximum[1] and
+        origin[2] <= depth_m   <= maximum[2]
     )
-    
+
+    lon_frac = (longitude - origin[0]) / (maximum[0] - origin[0])
+    lat_frac = (latitude  - origin[1]) / (maximum[1] - origin[1])
+    depth_frac = (depth_m - origin[2]) / (maximum[2] - origin[2])
+
+    lon_idx = min(max(int(lon_frac * shape[0]), 0), shape[0] - 1)
+    lat_idx = min(max(int(lat_frac * shape[1]), 0), shape[1] - 1)
+    depth_idx = min(max(int(depth_frac * shape[2]), 0), shape[2] - 1)
+
     return (lon_idx, lat_idx, depth_idx), in_bounds
 
 def test_kazakhstan_grid():
