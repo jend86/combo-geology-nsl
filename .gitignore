@@ -1,0 +1,10 @@
+# Upstream NSL2 files we do not adopt into combo.
+# These are added by `git subtree pull` from nsl2/geology-task but provide no
+# value to combo and should be removed via `git rm` after each pull.
+# Listing them here keeps `git status` quiet if they reappear in the worktree.
+NSL2-geology-task/config/config-crypto-exploit.toml
+NSL2-geology-task/config/config-feature-hypothesis-aiq-gemma4.toml
+NSL2-geology-task/config/config-forked-exploit-msagent.toml
+NSL2-geology-task/config/config-forked-exploit.toml
+NSL2-geology-task/tasks/geology_hypothesis.py
+NSL2-geology-task/uv.lock
