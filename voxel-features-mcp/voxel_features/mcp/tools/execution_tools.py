@@ -166,7 +166,7 @@ host_artifact_dir = "{artifact_dir}"
 
 # Container paths - use real data paths
 data_dir = "/workspace/input/amalgamated_csvs"
-output_dir = "/workspace/output"
+output_dir = "/workspace/out"
 os.makedirs(output_dir, exist_ok=True)
 
 # Store original locals to compare later
@@ -200,7 +200,7 @@ finally:
             var_name not in ['host_artifact_dir', 'data_dir', 'output_dir', 'os', 'glob', 'pickle', 'pd', 'np', 'Path', 'traceback']):
             
             try:
-                # Save to /workspace/output (mounted to host)
+                # Save to /workspace/out (container tmpfs)
                 if isinstance(obj, pd.DataFrame) and not obj.empty:
                     filepath = f"{{output_dir}}/{{var_name}}_dataframe.csv"
                     obj.to_csv(filepath, index=False)
@@ -289,21 +289,24 @@ finally:
         record.stdout = stdout.strip()
         record.stderr = stderr.strip()
         
-        # Copy artifacts from container output to host artifact directory 
+        # Pull artifacts from container using Docker SDK get_archive
         try:
-            copy_result = exec_run_with_timeout(
-                record.container,
-                ["sh", "-c", f"cp -r /workspace/output/* {artifact_dir}/ 2>/dev/null || true"],
-                timeout_s=30
-            )
-            # List artifacts
+            import tarfile
+            import io as _io
+            bits, _ = record.container.get_archive('/workspace/out')
+            tar_data = _io.BytesIO()
+            for chunk in bits:
+                tar_data.write(chunk)
+            tar_data.seek(0)
+            with tarfile.open(fileobj=tar_data) as tar:
+                tar.extractall(artifact_dir)
             artifact_files = []
-            if os.path.exists(artifact_dir):
-                for item in os.listdir(artifact_dir):
-                    artifact_files.append(f"{artifact_dir}/{item}")
+            for root, _, files in os.walk(artifact_dir):
+                for f in files:
+                    artifact_files.append(os.path.join(root, f))
             record.artifact_files = artifact_files
         except Exception as copy_err:
-            record.add_progress(f"Warning: Could not copy artifacts: {copy_err}")
+            record.add_progress(f"Warning: Could not extract artifacts from container: {copy_err}")
             record.artifact_files = []
         
     except Exception as container_err:
