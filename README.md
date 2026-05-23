@@ -43,7 +43,7 @@ This system **automatically discovers geological patterns** from 3D mineral expl
 - **Bidirectional Masking**: Tests 20% held-out data to verify geological understanding
 - **Direction A**: Can new layer improve prediction of existing layers?
 - **Direction B**: Can existing layers predict the new layer well?
-- **Pass Criteria**: Either direction shows R² improvement ≥ 0.01
+- **Pass Criteria**: Either direction shows R² improvement ≥ 0.0001 (optimized for sparse geological data)
 
 **Stage 2 - Complexity Assessment:**
 - **ESA-BIC (Effective Sample Size Adjusted BIC)**: Applied only after Stage 1 passes
