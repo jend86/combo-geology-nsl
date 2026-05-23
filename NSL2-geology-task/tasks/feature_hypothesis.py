@@ -185,6 +185,12 @@ class FeatureHypothesisState:
     mutual_info: dict[str, float] = field(default_factory=dict)
     admitted: bool = False
     
+    # Two-stage scoring results
+    masking_test_passed: bool = True
+    masking_test_improvement: float = 0.0
+    masking_test_direction: str = "not_applicable"
+    stage_completed: str = "stage_2_completed"
+    
     # Crossbreeding context
     parent_experiments: list[str] = field(default_factory=list)
     
@@ -455,8 +461,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                     name="code",
                     prompt=(
                         "Phase 3: Code (Async Execution with Budget Control)\n\n"
-                        "🚨 CRITICAL: analysis_shell is DISABLED in this phase! 🚨\n"
-                        "You MUST use the new async execution tools only.\n\n"
+                        "Use async execution tools only.\n\n"
                         "Analyze data to test the hypothesis. Focus on producing data artifacts.\n\n"
                         "**EXECUTION BUDGET**: You have 3 execution attempts. Use them strategically!\n\n"
                         "**WORKFLOW**:\n"
@@ -467,7 +472,6 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                         "   - Creates filtered DataFrames, computed arrays, summary statistics\n"
                         "   - Tests geological relationships and patterns\n"
                         "   - Stores results in variables (these become artifacts automatically)\n"
-                        "   - Prints clear analysis summary and conclusions\n\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -507,53 +511,32 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                     name="translate",
                     prompt=(
                         "Phase 4: Translate (Spatial Data Processor)\n\n"
-                        "🚨 CRITICAL: You are NOT an analyst! You are a spatial command generator.\n"
-                        "The analysis is already done - your job is to convert findings to spatial operations.\n\n"
-                        "Your role: Convert existing analysis artifacts into spatial feature commands.\n"
-                        "The system automatically maps these to the 200×200×8 voxel grid.\n\n"
+                        "🚨 CRITICAL: You are NOT in analysis mode. Your role is now to convert existing analysis artifacts into spatial feature commands as best you can.\n"
+                        "The system automatically maps these to a voxel grid.\n\n"
                         "1. Call get_experiment_summary() to get hypothesis, data_spec, and analysis results\n"
-                        "2. Review the analysis artifacts already produced by previous phases:\n"
-                        "   - *.csv: Filtered/processed DataFrames\n"
-                        "   - *.npy: Computed arrays or matrices\n"
-                        "   - *.pkl: Complex objects or analysis results\n"
-                        "   - *.txt: Scalar values and summaries\n"
-                        "   DO NOT re-run analysis - use the existing results!\n\n"
-                        "3. Data preprocessing (convert strings, handle missing data, etc.):\n"
-                        "   - Convert lithology strings to boolean: 'clay' → has_clay=True\n"
-                        "   - Handle missing values: interpolate or flag as unknown\n"
-                        "   - Standardize units and coordinate systems\n"
-                        "   - Clean and validate data before spatial mapping\n\n"
-                        "4. Generate spatial commands based on analysis findings:\n"
+                        "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 117.832°-117.973°, lat -27.441°--27.300°, depth 0-80m\n"
                         "   Resolution: ~70m × 79m × 10m per voxel (200×200×8 total)\n\n"
                         "   **For drill hole data with coordinates:**\n"
-                        "   spatial_add_point(name='copper_grade_dh001', longitude=117.918, latitude=-27.407, depth_m=45, value=0.85, radius_m=100)\n\n"
+                        "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
                         "   **For geological structures (faults, veins):**\n"
-                        "   spatial_add_line(name='fault_main', start_longitude=117.911, start_latitude=-27.407, start_depth_m=0, end_longitude=117.913, end_latitude=-27.406, end_depth_m=60, value=1.0, width_m=75)\n\n"
+                        "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
                         "   **For statistical results without coordinates:**\n"
                         "   - Use geological knowledge: 'near Emily Well' → find well coordinates\n"
                         "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
-                        "   - Apply geological expertise about ore distribution\n\n"
-                        "5. **CRITICAL**: Create exactly ONE coherent feature layer:\n"
-                        "   - Instead of separate Cu, Au, As → create 'mineralization_potential'\n"
-                        "   - Use geological expertise: weighted combination, intersection zones\n"
+                        "3. -Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
+                        " - Values must be floats or booleans: 'clay' → has_clay=True\n", 
                         "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
                         "            spatial_add_line(name='mineralization_potential', ...) \n"
-                        "   - Focus on the single most predictive geological feature\n\n"
-                        "6. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
-                        "7. **MANDATORY TO COMPLETE THIS PHASE**:\n"
-                        "   🚨 YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
-                        "   \n"
-                        "   AFTER all spatial operations, call:\n"
-                        "   scoring_create_feature_layer(name='the_same_layer_name_you_used')\n"
-                        "   \n"
+                        "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
+                        "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
+                        "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
                         "   Example workflow:\n"
-                        "   1. spatial_add_point(name='copper_potential', ...)\n"
-                        "   2. spatial_add_line(name='copper_potential', ...)\n"
-                        "   3. scoring_create_feature_layer(name='copper_potential')  ← REQUIRED!\n"
+                        "   1. spatial_add_point(name='name', ...)\n"
+                        "   2. spatial_add_line(name='name', ...)\n"
+                        "   3. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
-                        "   This call triggers BIC evaluation. WITHOUT IT, THE PHASE FAILS!\n\n"
                         "Focus on geological intelligence, not array mathematics!"
                     ),
                     context_mode="isolated",
@@ -1429,6 +1412,12 @@ finally:
         else:
             data_base_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/data/feature-hypothesis")
         
+        # Extract two-stage scoring results
+        masking_test_passed = evaluate.get('masking_test_passed', True)
+        masking_test_improvement = evaluate.get('masking_test_improvement', 0.0)
+        masking_test_direction = evaluate.get('masking_test_direction', 'not_applicable')
+        stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
+        
         training_record = {
             'prompt': training_pair.get('prompt', ''),
             'response': training_pair.get('response', ''),
@@ -1437,11 +1426,25 @@ finally:
             'timestamp': time.time(),
             'admitted': admitted,
             'layer_name': translate.get('feature_layer_name', ''),
+            # Two-stage scoring results
+            'masking_test_passed': masking_test_passed,
+            'masking_test_improvement': masking_test_improvement,
+            'masking_test_direction': masking_test_direction,
+            'stage_completed': stage_completed,
             'metadata': {
                 'hypothesis': hypothesise.get('hypothesis', ''),
                 'grid_bounds': ctx.episode_context.get('grid_spec', {}),
                 'mutual_info': evaluate.get('mutual_info', {}),
-                'experiment_summary': code.get('result_summary', '')
+                'experiment_summary': code.get('result_summary', ''),
+                # Additional two-stage context
+                'two_stage_scoring': {
+                    'stage_1_passed': masking_test_passed,
+                    'stage_1_improvement': masking_test_improvement,
+                    'stage_1_direction': masking_test_direction,
+                    'stage_completed': stage_completed,
+                    'stage_1_threshold': 0.01,  # Current threshold
+                    'scoring_version': 'two_stage_v1'
+                }
             }
         }
         
@@ -1467,8 +1470,18 @@ finally:
         except Exception as e:
             print(f"Warning: Failed to save training data: {e}")
         
-        # Save to knowledge graph (ONLY successful experiments)
-        if admitted and bic_delta is not None and bic_delta < 0:
+        # Save to knowledge graph (ONLY experiments that passed BOTH stages)
+        # Stage 1: Must pass predictive capacity test
+        # Stage 2: Must improve BIC (complexity assessment)
+        both_stages_passed = (
+            masking_test_passed and 
+            admitted and 
+            bic_delta is not None and 
+            bic_delta < 0 and
+            stage_completed == 'stage_2_completed'
+        )
+        
+        if both_stages_passed:
             try:
                 knowledge_dir = data_base_path / "knowledge" / "coe_fairbairn"
                 knowledge_dir.mkdir(parents=True, exist_ok=True)
@@ -1478,12 +1491,18 @@ finally:
                 # Generate node ID
                 node_id = f"exp_{episode_id}" if episode_id else f"exp_{int(time.time())}"
                 
-                # Create knowledge graph record
+                # Create knowledge graph record (only for experiments that passed both stages)
                 kg_record = {
                     "node_id": node_id,
                     "prompt": training_pair.get('prompt', ''),
                     "response": training_pair.get('response', ''),
                     "bic_delta": bic_delta,
+                    # Two-stage scoring results
+                    "masking_test_passed": masking_test_passed,
+                    "masking_test_improvement": masking_test_improvement,
+                    "masking_test_direction": masking_test_direction,
+                    "stage_completed": stage_completed,
+                    "scoring_version": "two_stage_v1",
                     "artifact_links": {
                         "layer_file": f"store/coe_fairbairn/layers/{translate.get('feature_layer_name', '')}.npy" if translate.get('feature_layer_name') else None,
                         "spatial_ops": f"store/coe_fairbairn/spatial.db:experiment_{episode_id}" if episode_id else None
@@ -1514,7 +1533,18 @@ finally:
 
         return CapabilityResult(
             "submit_rewrite",
-            output={"recorded": True, "training_saved": True, "knowledge_saved": admitted},
+            output={
+                "recorded": True, 
+                "training_saved": True, 
+                "knowledge_saved": both_stages_passed,
+                "two_stage_results": {
+                    "stage_1_passed": masking_test_passed,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": admitted,
+                    "bic_delta": bic_delta,
+                    "final_admitted": both_stages_passed
+                }
+            },
             success=True,
         )
     
@@ -1989,6 +2019,11 @@ finally:
             cv_mse_delta=evaluate.get("cv_mse_delta"),
             mutual_info=evaluate.get("mutual_info", {}),
             admitted=evaluate.get("admitted", False),
+            # Two-stage scoring results
+            masking_test_passed=evaluate.get("masking_test_passed", True),
+            masking_test_improvement=evaluate.get("masking_test_improvement", 0.0),
+            masking_test_direction=evaluate.get("masking_test_direction", "not_applicable"),
+            stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
             prompt_response_pair=terminal_record.get("training_pair", {}),
         )
     
@@ -1998,35 +2033,79 @@ finally:
         final: FeatureHypothesisState,
         artifacts: EpisodeArtifacts,
     ) -> TaskReward:
-        """Compute reward based on BIC improvement."""
+        """Compute reward based on two-stage scoring results."""
         
-        # Reward is based on BIC delta (negative is better)
+        # Extract two-stage scoring results
         bic_delta = final.bic_delta
+        masking_test_passed = final.masking_test_passed
+        masking_test_improvement = final.masking_test_improvement
+        admitted = final.admitted
+        stage_completed = final.stage_completed
         
         if bic_delta is None:
             # No feature layer created
-            return TaskReward(value=0.0, success=False, breakdown={"no_feature": True})
+            return TaskReward(
+                value=0.0, 
+                success=False, 
+                breakdown={
+                    "no_feature": True,
+                    "stage_completed": stage_completed
+                }
+            )
         
-        if final.admitted:
-            # Layer was admitted - BIC improved
-            # Normalize to 0-1 range (typical BIC improvements are 0-1000)
-            value = min(1.0, max(0.0, -bic_delta / 1000.0))
+        # Two-stage reward calculation
+        if masking_test_passed and admitted:
+            # Both stages passed - full success
+            # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
+            stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))  # Stage 2 contribution
+            
+            # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
+            value = 0.4 * stage1_reward + 0.6 * stage2_reward
+            
             return TaskReward(
                 value=value,
                 success=True,
                 breakdown={
+                    "stage_1_passed": True,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": True,
                     "bic_delta": bic_delta,
-                    "admitted": True,
+                    "stage1_reward": stage1_reward,
+                    "stage2_reward": stage2_reward,
+                    "final_reward": value,
+                    "both_stages_passed": True,
+                },
+            )
+        elif masking_test_passed and not admitted:
+            # Stage 1 passed but Stage 2 failed - partial success
+            # Reward for predictive capacity even if complexity penalty too high
+            stage1_reward = min(1.0, masking_test_improvement)
+            value = 0.3 * stage1_reward  # Reduced reward for Stage 1 only
+            
+            return TaskReward(
+                value=value,
+                success=False,
+                breakdown={
+                    "stage_1_passed": True,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": False,
+                    "bic_delta": bic_delta,
+                    "stage1_reward": stage1_reward,
+                    "partial_success": True,
                 },
             )
         else:
-            # Layer was rejected
+            # Stage 1 failed - no geological understanding
             return TaskReward(
-                value=0.1,  # Small reward for attempting
+                value=0.05,  # Very small reward for attempting
                 success=False,
                 breakdown={
+                    "stage_1_passed": False,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
-                    "admitted": False,
+                    "no_predictive_value": True,
                 },
             )
     
