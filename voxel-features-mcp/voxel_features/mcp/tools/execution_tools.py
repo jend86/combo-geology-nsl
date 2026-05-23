@@ -18,6 +18,28 @@ from enum import Enum
 import pandas as pd
 import numpy as np
 
+# Import Docker execution functions for container support
+try:
+    from docker.models.containers import Container
+    import sys
+    from pathlib import Path
+    
+    # Add NSL2-geology-task to Python path  
+    nsl_path = Path(__file__).parent.parent.parent.parent.parent / "NSL2-geology-task"
+    if nsl_path.exists():
+        sys.path.insert(0, str(nsl_path))
+    
+    from tasks.common.foundry_exec import (
+        exec_run_with_timeout,
+        coerce_exec_result
+    )
+    DOCKER_AVAILABLE = True
+except ImportError:
+    Container = None
+    exec_run_with_timeout = None
+    coerce_exec_result = None
+    DOCKER_AVAILABLE = False
+
 
 class ExecutionStatus(Enum):
     """Execution status values."""
@@ -52,6 +74,7 @@ class ExecutionRecord:
     session_id: str
     code: str
     timeout_s: int
+    container: Any | None = None  # Docker container for execution
     status: ExecutionStatus = ExecutionStatus.PENDING
     start_time: float | None = None
     end_time: float | None = None
@@ -87,7 +110,7 @@ def _get_or_create_session(session_id: str | None = None, max_attempts: int = 3)
 
 
 def _execute_code_in_thread(record: ExecutionRecord) -> None:
-    """Execute code in background thread."""
+    """Execute code in background thread, using container if available."""
     try:
         record.status = ExecutionStatus.RUNNING
         record.start_time = time.time()
@@ -100,36 +123,69 @@ def _execute_code_in_thread(record: ExecutionRecord) -> None:
         record.artifact_directory = artifact_dir
         record.add_progress(f"Created artifact directory: {artifact_dir}")
         
-        # Wrap user code with artifact capture (same as feature_hypothesis.py)
-        indented_code = '\n'.join("    " + line for line in record.code.split('\n'))
+        # Choose execution method based on container availability
+        if record.container is not None and DOCKER_AVAILABLE:
+            record.add_progress("Executing code in analysis container")
+            _execute_in_container(record, artifact_dir)
+        else:
+            record.add_progress("Executing code on host (fallback mode)")
+            _execute_on_host(record, artifact_dir)
         
-        wrapped_code = f'''
+        # Set completion status
+        if record.exit_code == 0:
+            record.status = ExecutionStatus.COMPLETED
+            record.add_progress(f"Execution completed successfully with {len(record.artifact_files)} artifacts")
+        else:
+            record.status = ExecutionStatus.FAILED
+            record.add_progress(f"Execution failed with exit code {record.exit_code}")
+            
+    except Exception as e:
+        record.status = ExecutionStatus.FAILED
+        record.stderr = str(e)
+        record.add_progress(f"Execution failed with exception: {e}")
+    
+    finally:
+        record.end_time = time.time()
+
+
+def _execute_in_container(record: ExecutionRecord, artifact_dir: str) -> None:
+    """Execute code inside Docker container (like analysis_shell)."""
+    
+    # Create wrapped code with artifact capture
+    wrapped_code = f'''
 import os
 import glob
 import pickle
 import pandas as pd
 import numpy as np
 from pathlib import Path
+import traceback
 
-# Create artifact directory and common output directories
-artifact_dir = "{artifact_dir}"
-os.makedirs(artifact_dir, exist_ok=True)
-os.makedirs("/workspace/output", exist_ok=True)
+# Host artifact directory (visible to both container and host)
+host_artifact_dir = "{artifact_dir}"
+
+# Container paths - use real data paths
+data_dir = "/workspace/input/amalgamated_csvs"
+output_dir = "/workspace/output"
+os.makedirs(output_dir, exist_ok=True)
 
 # Store original locals to compare later
 _original_locals = set(locals().keys())
 
+print("Starting geological analysis execution...")
+print(f"Data directory: {{data_dir}}")
+print(f"Output directory: {{output_dir}}")
+print("="*50)
+
 try:
     # Execute user's analysis code
-{indented_code}
+{chr(10).join("    " + line for line in record.code.split(chr(10)))}
 
 except Exception as user_code_error:
     print(f"ERROR in user code: {{user_code_error}}")
-    import traceback
     traceback.print_exc()
 
 finally:
-    # Always attempt artifact capture, even if user code failed
     print("\\n" + "="*50)
     print("ANALYSIS COMPLETE - CAPTURING ARTIFACTS")
     print("="*50)
@@ -141,25 +197,26 @@ finally:
     for var_name, obj in _final_locals.items():
         if (not var_name.startswith('_') and 
             var_name not in _original_locals and 
-            var_name not in ['artifact_dir', 'os', 'glob', 'pickle', 'pd', 'np', 'Path']):
+            var_name not in ['host_artifact_dir', 'data_dir', 'output_dir', 'os', 'glob', 'pickle', 'pd', 'np', 'Path', 'traceback']):
             
             try:
+                # Save to /workspace/output (mounted to host)
                 if isinstance(obj, pd.DataFrame) and not obj.empty:
-                    filepath = f"{{artifact_dir}}/{{var_name}}_dataframe.csv"
+                    filepath = f"{{output_dir}}/{{var_name}}_dataframe.csv"
                     obj.to_csv(filepath, index=False)
                     _artifacts_saved.append(filepath)
                     print(f"Saved DataFrame '{{var_name}}' -> {{filepath}}")
                     print(f"  Shape: {{obj.shape}}, Columns: {{list(obj.columns)}}")
                 
-                elif isinstance(obj, np.ndarray):
-                    filepath = f"{{artifact_dir}}/{{var_name}}_array.npy" 
+                elif isinstance(obj, np.ndarray) and obj.size > 0:
+                    filepath = f"{{output_dir}}/{{var_name}}_array.npy" 
                     np.save(filepath, obj)
                     _artifacts_saved.append(filepath)
                     print(f"Saved numpy array '{{var_name}}' -> {{filepath}}")
                     print(f"  Shape: {{obj.shape}}, dtype: {{obj.dtype}}")
                 
                 elif isinstance(obj, (dict, list, tuple)) and len(str(obj)) < 10000:
-                    filepath = f"{{artifact_dir}}/{{var_name}}_object.pkl"
+                    filepath = f"{{output_dir}}/{{var_name}}_object.pkl"
                     with open(filepath, 'wb') as f:
                         pickle.dump(obj, f)
                     _artifacts_saved.append(filepath)
@@ -167,10 +224,9 @@ finally:
                     print(f"  Type: {{type(obj)}}, Size: {{len(str(obj))}} chars")
                 
                 elif isinstance(obj, (int, float, str, bool)):
-                    # Save simple scalars as JSON-like format
-                    filepath = f"{{artifact_dir}}/{{var_name}}_scalar.txt"
+                    filepath = f"{{output_dir}}/{{var_name}}_scalar.txt"
                     with open(filepath, 'w') as f:
-                        f.write(var_name + ": " + str(obj) + "\\ntype: " + type(obj).__name__)
+                        f.write(f"{{var_name}}: {{obj}}\\ntype: {{type(obj).__name__}}")
                     _artifacts_saved.append(filepath)
                     print(f"Saved scalar '{{var_name}}' -> {{filepath}}")
                     print(f"  Value: {{obj}}")
@@ -178,32 +234,96 @@ finally:
             except Exception as save_err:
                 print(f"Failed to save '{{var_name}}': {{save_err}}")
     
-    # List all artifacts in directory
-    all_artifacts = glob.glob(f"{{artifact_dir}}/*")
-    print(f"\\nARTIFACTS_DIRECTORY: {{artifact_dir}}")
-    print(f"ARTIFACTS_SAVED: {{all_artifacts}}")
+    print(f"\\nARTIFACTS_SAVED: {{_artifacts_saved}}")
     print("="*50)
 '''
+    
+    try:
+        # Write code to temporary file in container and execute it
+        write_cmd = (
+            "cat > /tmp/_execution_script.py <<'__EXEC_PY_EOF__'\n"
+            f"{wrapped_code}\n"
+            "__EXEC_PY_EOF__"
+        )
         
-        record.add_progress("Executing wrapped code")
+        # Write the script
+        write_result = exec_run_with_timeout(
+            record.container, ["sh", "-c", write_cmd], timeout_s=30
+        )
+        write_code, write_out = coerce_exec_result(write_result)
+        if write_code != 0:
+            record.exit_code = write_code
+            record.stderr = f"Failed to stage script: {write_out.decode(errors='replace')}"
+            record.artifact_files = []
+            return
         
-        # Note: For now, we'll simulate execution for testing
-        # In a real implementation, this would coordinate with the task framework
-        # to execute code in the analysis container
+        # Execute the script
+        run_result = exec_run_with_timeout(
+            record.container,
+            ["python3", "-u", "/tmp/_execution_script.py"],
+            timeout_s=record.timeout_s,
+            demux=True,
+        )
         
-        record.add_progress("Executing submitted code...")
+        # Parse results
+        exit_code = getattr(run_result, "exit_code", None)
+        if exit_code is None and isinstance(run_result, tuple):
+            exit_code = run_result[0]
+        raw_output = getattr(run_result, "output", None)
+        if raw_output is None and isinstance(run_result, tuple):
+            raw_output = run_result[1]
         
-        # REAL CODE EXECUTION: Execute the actual submitted code
+        if isinstance(raw_output, tuple) and len(raw_output) == 2:
+            stdout_bytes, stderr_bytes = raw_output
+            stdout = stdout_bytes.decode(errors="replace") if stdout_bytes else ""
+            stderr = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+        else:
+            stdout = (
+                raw_output.decode(errors="replace")
+                if isinstance(raw_output, (bytes, bytearray))
+                else str(raw_output) if raw_output else ""
+            )
+            stderr = ""
+        
+        record.exit_code = int(exit_code) if exit_code is not None else 0
+        record.stdout = stdout.strip()
+        record.stderr = stderr.strip()
+        
+        # Copy artifacts from container output to host artifact directory 
         try:
-            import subprocess
-            import sys
-            import textwrap
-            
-            # Create a temporary Python script with the submitted code
-            script_path = f"{artifact_dir}/execution_script.py"
-            
-            # Create the wrapper code as separate parts
-            setup_code = f"""
+            copy_result = exec_run_with_timeout(
+                record.container,
+                ["sh", "-c", f"cp -r /workspace/output/* {artifact_dir}/ 2>/dev/null || true"],
+                timeout_s=30
+            )
+            # List artifacts
+            artifact_files = []
+            if os.path.exists(artifact_dir):
+                for item in os.listdir(artifact_dir):
+                    artifact_files.append(f"{artifact_dir}/{item}")
+            record.artifact_files = artifact_files
+        except Exception as copy_err:
+            record.add_progress(f"Warning: Could not copy artifacts: {copy_err}")
+            record.artifact_files = []
+        
+    except Exception as container_err:
+        record.exit_code = 1
+        record.stderr = f"Container execution failed: {container_err}"
+        record.artifact_files = []
+
+
+def _execute_on_host(record: ExecutionRecord, artifact_dir: str) -> None:
+    """Execute code on host machine (fallback mode)."""
+    try:
+        import subprocess
+        import sys
+        import textwrap
+        
+        # Create a temporary Python script with the submitted code
+        script_path = f"{artifact_dir}/execution_script.py"
+        
+        # Create the wrapper code as separate parts
+        setup_code = f"""
 import sys
 import os
 import pandas as pd
@@ -227,8 +347,8 @@ if not os.path.exists(data_dir):
 try:
     # Execute the submitted code
 """
-            
-            cleanup_code = f"""
+        
+        cleanup_code = f"""
 except Exception as code_err:
     print(f"Code execution error: {{code_err}}")
     import traceback
@@ -267,65 +387,50 @@ for name, obj in locals().items():
 print(f"\\nARTIFACTS_SAVED: {{artifacts_saved}}")
 print("Analysis completed successfully.")
 """
-            
-            # Indent the user's code properly
-            user_code_indented = textwrap.indent(record.code, "    ")
-            
-            # Combine all parts
-            wrapped_code = setup_code + user_code_indented + "\n" + cleanup_code
-            
-            # Write the wrapped script
-            with open(script_path, 'w') as f:
-                f.write(wrapped_code)
-            
-            # Execute the script
-            result = subprocess.run([
-                sys.executable, script_path
-            ], capture_output=True, text=True, timeout=record.timeout_s, cwd=artifact_dir)
-            
-            record.exit_code = result.returncode
-            record.stdout = result.stdout
-            record.stderr = result.stderr
-            
-            # Find created artifacts (exclude the script itself)
-            artifact_files = []
-            if os.path.exists(artifact_dir):
-                for item in os.listdir(artifact_dir):
-                    if item != "execution_script.py":
-                        artifact_files.append(f"{artifact_dir}/{item}")
-            record.artifact_files = artifact_files
-            
-        except subprocess.TimeoutExpired:
-            record.exit_code = 124
-            record.stderr = f"Execution timed out after {record.timeout_s} seconds"
-            record.artifact_files = []
-        except Exception as exec_err:
-            record.exit_code = 1
-            record.stderr = f"Execution failed: {exec_err}"
-            record.artifact_files = []
         
-        # Set completion status
-        if record.exit_code == 0:
-            record.status = ExecutionStatus.COMPLETED
-            record.add_progress(f"Execution completed successfully with {len(record.artifact_files)} artifacts")
-        else:
-            record.status = ExecutionStatus.FAILED
-            record.add_progress(f"Execution failed with exit code {record.exit_code}")
-            
-    except Exception as e:
-        record.status = ExecutionStatus.FAILED
-        record.stderr = str(e)
-        record.add_progress(f"Execution failed with exception: {e}")
-    
-    finally:
-        record.end_time = time.time()
+        # Indent the user's code properly
+        user_code_indented = textwrap.indent(record.code, "    ")
+        
+        # Combine all parts
+        wrapped_code = setup_code + user_code_indented + "\n" + cleanup_code
+        
+        # Write the wrapped script
+        with open(script_path, 'w') as f:
+            f.write(wrapped_code)
+        
+        # Execute the script
+        result = subprocess.run([
+            sys.executable, script_path
+        ], capture_output=True, text=True, timeout=record.timeout_s, cwd=artifact_dir)
+        
+        record.exit_code = result.returncode
+        record.stdout = result.stdout
+        record.stderr = result.stderr
+        
+        # Find created artifacts (exclude the script itself)
+        artifact_files = []
+        if os.path.exists(artifact_dir):
+            for item in os.listdir(artifact_dir):
+                if item != "execution_script.py":
+                    artifact_files.append(f"{artifact_dir}/{item}")
+        record.artifact_files = artifact_files
+        
+    except subprocess.TimeoutExpired:
+        record.exit_code = 124
+        record.stderr = f"Execution timed out after {record.timeout_s} seconds"
+        record.artifact_files = []
+    except Exception as exec_err:
+        record.exit_code = 1
+        record.stderr = f"Host execution failed: {exec_err}"
+        record.artifact_files = []
 
 
 def execution_submit(
     code: str,
     timeout_s: int = 300,
     session_id: str | None = None,
-    max_attempts: int = 3
+    max_attempts: int = 3,
+    container: Any | None = None
 ) -> dict[str, Any]:
     """
     Submit code for async execution.
@@ -335,6 +440,7 @@ def execution_submit(
         timeout_s: Execution timeout in seconds
         session_id: Session ID for budget tracking
         max_attempts: Maximum execution attempts for this session
+        container: Optional Docker container for execution (recommended)
     
     Returns:
         Dict with execution_id and attempt info, or error if budget exhausted
@@ -355,7 +461,8 @@ def execution_submit(
         execution_id=execution_id,
         session_id=session.session_id,
         code=code,
-        timeout_s=timeout_s
+        timeout_s=timeout_s,
+        container=container
     )
     
     # Use attempt

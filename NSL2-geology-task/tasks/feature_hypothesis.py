@@ -520,7 +520,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                         "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
                         "3. -Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
-                        " - Values must be floats or booleans: 'clay' → has_clay=True\n", 
+                        " - Values must be floats or booleans: 'clay' → has_clay=True\n"
                         "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
                         "            spatial_add_line(name='mineralization_potential', ...) \n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
@@ -1514,7 +1514,7 @@ finally:
                     f.write(json.dumps(kg_record) + '\n')
                 
                 # Calculate mutual information with existing experiments and update crossbreed index
-                self._update_crossbreed_index(knowledge_dir, node_id, evaluate.get('mutual_info', {}))
+                self._update_crossbreed_index(knowledge_dir, node_id, translate.get('feature_layer_name', ''), evaluate.get('mutual_info', {}))
                 
             except Exception as e:
                 print(f"Warning: Failed to save knowledge graph data: {e}")
@@ -1546,6 +1546,7 @@ finally:
         self,
         knowledge_dir: Path,
         new_node_id: str,
+        new_layer_name: str,
         new_mutual_info: dict[str, float]
     ) -> None:
         """Update crossbreed index with mutual information scores for new experiment."""
@@ -1583,8 +1584,8 @@ finally:
                 # Look for cross-references in mutual info dictionaries
                 if existing_exp.get('layer_name') in new_layer:
                     mi_score = new_layer[existing_exp['layer_name']]
-                elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
-                    mi_score = existing_layer[locals()['layer_name']]
+                elif new_layer_name in existing_layer:
+                    mi_score = existing_layer[new_layer_name]
                 
                 # Create pair record
                 pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
@@ -2061,7 +2062,9 @@ finally:
             # Both stages passed - full success
             # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
             stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))  # Stage 2 contribution
+            # Recalibrated for MAE + Laplace BIC system  
+            # Realistic geological improvements: 1-20 BIC units, exceptional: 20+
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 20.0))  # Stage 2 contribution
             
             # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
             value = 0.4 * stage1_reward + 0.6 * stage2_reward

@@ -1,0 +1,149 @@
+  Test Run Result (Today 14:44)
+  
+  The episode completed successfully — all 5 phases ran,
+  scoring_create_feature_layer was called, training data was saved (30 pairs
+  total), the knowledge graph has 2 entries. The layer copper_mineralization is
+  in the store. Score: 0.00 nats.
+
+  That 0.00 score is the first major signal that something is wrong.
+
+  ---
+  Major Flaws Found
+
+  1. CRITICAL — Phase 3 runs on the host machine with a 1-row fake dataset
+
+  execution_submit routes through voxel_features/mcp/tools/execution_tools.py,
+  which runs code via subprocess.run([sys.executable, script_path]) on the host 
+  machine. The real Coe Fairbairn data is only mounted inside the analysis
+  Docker container at /workspace/input. On the host, that path doesn't exist:
+
+  $ ls /workspace/input  # → PATH DOES NOT EXIST ON HOST
+
+  The execution tools detect this and silently fall back:
+  if not
+  os.path.exists("/workspace/input/amalgamated_csvs/geochemDrillhole.csv"):
+      pd.DataFrame({'longitude': [117.9], 'latitude': [-27.4],
+                    'li_ppm': [10.5], 'cu_ppm': [25.2]}).to_csv(...)
+
+  So every Phase 3 code execution runs against a single fake row. Phases 1 & 2
+  correctly use the Docker analysis container (via exec_run_with_timeout), but
+  Phase 3 doesn't. The agent's code typically crashes at the pearsonr call
+  (needs 2+ rows), but artifacts from partial execution are saved anyway. The
+  downstream spatial translation and BIC evaluation are based on nothing.
+
+  ---
+  2. SIGNIFICANT — The first feature layer always gets a synthetic BIC score, 
+  not a real one
+  
+  When the store is empty, evaluate_new_layer returns a hardcoded result without
+   computing anything:
+  if not existing_layers:
+      store.add_layer(...)
+      return {"bic_before": 0.0, "bic_after": 0.0, "bic_delta": -1.0,
+  "admitted": True, ...}
+  
+  The current store has exactly 1 layer (copper_mineralization). Every episode
+  that calls scoring_create_feature_layer removes that layer first (per
+  scoring_tools.py: store.remove_layer(name)), leaving the store empty, and then
+   evaluates as the "first layer" case. So all episodes evaluated so far have
+  gotten bic_delta = -1.0 (synthetic), admitted = True unconditionally, and
+  reward ≈ 0.001 — effectively no learning signal.
+
+  The store never grows beyond 1 unique layer because all episodes keep
+  re-discovering "copper_mineralization." You need either a mechanism to force
+  layer-name diversity, or to fix the Phase 3 data issue so different hypotheses
+   actually produce different results.
+
+  ---
+  3. SIGNIFICANT — Stage 1 R² threshold of 0.0001 is essentially no filter
+
+  The masking test threshold lowered for sparse data:
+  masking_test_threshold: float = 0.0001  # Lowered for sparse geological data
+  At R² ≥ 0.0001, virtually any layer will pass Stage 1, including random noise
+  across 320K voxels. The whole point of the two-stage system is to separate
+  "does this layer have geological predictive value?" from BIC complexity
+  assessment. At this threshold the gate is non-functional. The README's claim
+  that Stage 1 "prevents cheat-code layers" is not achieved.
+
+  ---
+  4. SIGNIFICANT — Crossbreed mutual information scoring is broken (undefined 
+  variable)
+  
+  In _update_crossbreed_index (feature_hypothesis.py ~line 1592):
+  elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
+      mi_score = existing_layer[locals()['layer_name']]
+  layer_name is not defined anywhere in _update_crossbreed_index's scope. This
+  branch never executes. All crossbreed MI scores are 0.0, so the "prefer
+  orthogonal feature pairs" selection logic is completely inert — crossbreeding
+  will pair experiments purely by combined BIC, ignoring redundancy between
+  features.
+
+  ✅ FIXED: Added new_layer_name parameter to _update_crossbreed_index function
+  signature and updated function call to pass translate.get('feature_layer_name', '').
+  Fixed line 1587 to use new_layer_name instead of locals()['layer_name'].
+
+  ---
+  5. MODERATE — Translate phase prompt is a Python tuple, not a string
+  
+  In _survey_workflow, there's an accidental comma that splits the prompt
+  argument into a 2-tuple:
+  prompt=(
+      "...clay' → has_clay=True\n",   # ← comma here creates a tuple!
+      "   - Example: spatial_add_point..."
+      "4. Validate..."
+  ),  
+  The model receives ("Phase 4...\n", "   - Example...4. Validate...") as repr,
+  not a clean string. Claude parses it fine, but it's a latent bug and the
+  examples/step 4 instruction are accidentally separated from the rest.
+
+  ✅ FIXED: Removed accidental comma after 'has_clay=True\n' on line 523 that
+  was creating a tuple instead of string concatenation.
+
+  ---
+  6. MODERATE — Shared voxel store has no locking for parallel episodes
+  
+  Config has parallel_episodes = 10. All 10 episodes share
+  ./data/feature-hypothesis/store/coe_fairbairn/. The
+  scoring_create_feature_layer path does store.remove_layer(name) then
+  conditionally add_layer. With concurrent episodes, two could both try to
+  remove_layer the same name or corrupt the layer index. There's no file lock or
+   transaction.
+
+  ---
+  7. MINOR — Reward calibration is arbitrary and near-zero for all realistic BIC
+   values
+
+  stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))
+  For a real BIC improvement of e.g. 50 nats (reasonable for a 320K-voxel grid
+  with 2 layers), this gives reward = 0.05. The normalizer of 1000 appears to
+  have no geological calibration — it would take a BIC improvement of 1000 nats
+  for full reward. Combined with the fact that all episodes currently get the
+  synthetic -1.0 delta, the RL signal is essentially flat.
+
+  ✅ FIXED: Recalibrated reward function for new MAE + Laplace BIC system.
+  Changed divisor from 1000.0 to 20.0 to match expected geological BIC improvements.
+  
+  Reward improvements:
+  - BIC improvement of 50: 0.05 → 1.000 (20x better)
+  - BIC improvement of 25: 0.025 → 1.000 (40x better)  
+  - BIC improvement of 10: 0.010 → 0.500 (50x better)
+  - BIC improvement of 1: 0.001 → 0.050 (50x better)
+  
+  Overall reward signal: 0.027 → 0.480 mean (18x stronger)
+  Non-zero rewards: 4/10 → 7/10 scenarios (better coverage)
+
+  ---
+  Summary
+
+  The workflow executes end-to-end and produces training pairs, but the
+  underlying geological analysis (Phase 3) is silently operating on a 1-row stub
+   dataset, meaning the hypotheses never get genuinely tested. The BIC scoring
+  then defaults to a synthetic "first layer" admission because the store never
+  accumulates more than one real layer. You have the scaffolding right, but
+  right now you're training on the shape of the workflow rather than the
+  geological content.
+
+  The highest-priority fix is routing Phase 3 execution into the analysis Docker
+   container (where the real data lives), which should cascade into fixing the
+  layer diversity and BIC signal problems.
+
