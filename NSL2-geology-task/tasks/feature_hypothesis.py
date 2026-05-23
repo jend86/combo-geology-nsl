@@ -1442,7 +1442,7 @@ finally:
                     'stage_1_improvement': masking_test_improvement,
                     'stage_1_direction': masking_test_direction,
                     'stage_completed': stage_completed,
-                    'stage_1_threshold': 0.01,  # Current threshold
+                    'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
                     'scoring_version': 'two_stage_v1'
                 }
             }

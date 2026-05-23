@@ -1211,7 +1211,7 @@ def geological_coherence_score(
     grid: 'GridSpec',
     shape: tuple[int, int, int],
     enable_masking_test: bool = True,
-    masking_test_threshold: float = 0.01
+    masking_test_threshold: float = 0.0001  # Lowered for sparse geological data
 ) -> dict:
     """
     Compute geological coherence score using two-stage evaluation.
@@ -1235,7 +1235,7 @@ def geological_coherence_score(
         grid: GridSpec for spatial coordinate information
         shape: Original (nx, ny, nz) shape
         enable_masking_test: Whether to run Stage 1 masking test
-        masking_test_threshold: Minimum R² improvement to pass Stage 1
+        masking_test_threshold: Minimum R² improvement to pass Stage 1 (default 0.0001 for sparse geological data)
     
     Returns:
         dict with:

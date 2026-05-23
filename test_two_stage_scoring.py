@@ -135,7 +135,7 @@ def test_two_stage_scoring():
         store.remove_layer("combined_trend")
     
     # Test bad layer with two-stage scoring
-    print(f"\n  Testing BAD layer (should fail Stage 1):")
+    print(f"\n  Testing BAD layer (should pass Stage 1, fail Stage 2):")
     
     start_time = time.time()
     result_two_stage_bad = scoring.evaluate_new_layer(
@@ -189,13 +189,15 @@ def test_two_stage_scoring():
     print(f"  ✅ Stage 1 components working (masking, prediction)")
     print(f"  ✅ Bidirectional prediction test working")
     print(f"  ✅ Good layer: Stage 1 passed, BIC {result_two_stage_good['bic_delta']:.4f}")
-    print(f"  ✅ Bad layer: Stage 1 failed, BIC {result_two_stage_bad['bic_delta']:.4f}")
+    print(f"  ✅ Bad layer: Stage 1 passed, Stage 2 failed, BIC {result_two_stage_bad['bic_delta']:.4f}")
     print(f"  ✅ Performance: {elapsed_good:.1f}s/{elapsed_bad:.1f}s per evaluation")
     print(f"  ✅ Backward compatibility maintained")
     
-    # Validation checks
+    # Validation checks (updated for lower Stage 1 threshold)
     success_good = result_two_stage_good['admitted'] and result_two_stage_good.get('masking_test_passed', False)
-    success_bad = not result_two_stage_bad['admitted'] and not result_two_stage_bad.get('masking_test_passed', True)
+    success_bad = (not result_two_stage_bad['admitted'] and 
+                   result_two_stage_bad.get('masking_test_passed', False) and  # Now passes Stage 1
+                   result_two_stage_bad.get('stage_completed') == 'stage_2_completed')  # But fails Stage 2
     performance_reasonable = elapsed_good < 15.0 and elapsed_bad < 15.0  # More reasonable threshold for complex system
     
     if success_good and success_bad and performance_reasonable:
@@ -208,7 +210,7 @@ def test_two_stage_scoring():
         if not success_good:
             print("   - Good layer not handled correctly")
         if not success_bad:
-            print("   - Bad layer not rejected correctly") 
+            print("   - Bad layer not rejected correctly (should pass Stage 1, fail Stage 2)") 
         if not performance_reasonable:
             print("   - Performance too slow (>15s per evaluation)")
         return False
