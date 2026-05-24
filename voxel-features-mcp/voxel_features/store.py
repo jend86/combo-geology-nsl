@@ -166,17 +166,25 @@ class VoxelStore:
     def _save_index(self) -> None:
         """Save store index to disk atomically.
 
-        Writes to a sibling ``.tmp`` file then ``os.replace()``s into place so
-        concurrent readers (e.g. parallel episodes in the feature-hypothesis
-        task) never observe a truncated/empty ``index.json``. The previous
-        ``open(path, "w")`` left a window between truncation and content where
-        a peer reader would JSONDecodeError on ``line 1 column 1 (char 0)``.
+        Writes to a per-writer-unique ``.<pid>.<tid>.tmp`` sibling then
+        ``os.replace()``s into place so concurrent readers (e.g. parallel
+        episodes in the feature-hypothesis task) never observe a truncated/
+        empty ``index.json``. The previous ``open(path, "w")`` left a window
+        between truncation and content where a peer reader would
+        JSONDecodeError on ``line 1 column 1 (char 0)``.
+
+        The tmp filename is per-writer (pid + thread id) — a shared sibling
+        ``.tmp`` raced when two writers both renamed it, and the loser saw
+        FileNotFoundError on the replace.
         """
+        import threading
+
         data = {
             "grid": self._grid.to_dict(),
             "layers": {name: layer.to_dict() for name, layer in self._layers.items()},
         }
-        tmp_path = self._index_path.with_suffix(self._index_path.suffix + ".tmp")
+        tmp_suffix = f"{self._index_path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp_path = self._index_path.with_suffix(tmp_suffix)
         with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
             f.flush()

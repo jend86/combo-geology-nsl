@@ -1,0 +1,31 @@
+# Build context for the vfm service (kazakhstan compose) is this directory.
+# The Dockerfile only COPYs voxel-features-mcp/voxel_features/, but docker
+# sends the entire context to the daemon for hashing — without these
+# excludes, that's 8 GB of .venv/data/etc. per slot rebuild and the daemon
+# silently stalls.
+NSL2-geology-task/.venv/
+NSL2-geology-task/data/
+NSL2-geology-task/logs/
+NSL2-geology-task/models/
+NSL2-geology-task/.model-cache/
+NSL2-geology-task/wandb/
+NSL2-geology-task/unsloth_compiled_cache/
+NSL2-geology-task/.git/
+NSL2-geology-task/.pytest_cache/
+NSL2-geology-task/.llama/
+NSL2-geology-task/code/
+NSL2-geology-task/scripts/lib/__pycache__/
+Kazkhstan_data/
+Kazkhstan_data.zip
+graph-to-voxel-mcp-main/
+.git/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.venv/
+**/node_modules/
+voxel-features-mcp/.pytest_cache/
+voxel-features-mcp/dist/
+voxel-features-mcp/build/
+voxel-features-mcp/*.egg-info/

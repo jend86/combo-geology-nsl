@@ -100,6 +100,16 @@ _KG_BOOTSTRAP_STATE = "bootstrap_state.json"
 _KG_QUEUE = "crossbreed_queue.jsonl"
 _KG_LOCK = "kg.lock"
 
+# Queue selection knobs. The effective score of an entry is
+#   score / (1 + α · attempt_count),   with an extra · β multiplier when the
+# pair is "consummated" (already has ≥1 admitted crossbreed child). α decays
+# repeatedly-tried pairs out of the fast lane; β puts consummated pairs in a
+# slow lane without banning them — LLM hypothesis generation is high-variance
+# and the surrounding feature pool keeps growing, so a second attempt at the
+# same pair is a genuinely different experiment.
+_PAIR_ATTEMPT_DECAY = 0.5
+_CONSUMMATED_DISCOUNT = 0.25
+
 
 # Kazakhstan Teniz Basin grid specification - Regional scale for basin analysis
 _KAZAKHSTAN_TENIZ_GRID = {
@@ -2793,6 +2803,7 @@ finally:
                     "parents": [exp_a["node_id"], exp_b["node_id"]],
                     "score": (bic_a + bic_b) - mi,
                     "popped_at": None,
+                    "attempt_count": 0,
                 })
         out.sort(key=lambda entry: entry["score"], reverse=True)
         return out
@@ -2851,12 +2862,22 @@ finally:
             self._write_queue(kg_path, self._merge_new_pairs(kg_path, self._read_queue(kg_path)))
 
     def _queue_pop_pair(self, kg_dir: Path | str) -> tuple[str, str] | None:
-        """Pop the highest-scoring unpopped ordered pair under the kg lock.
+        """Pop the next pair under the kg lock.
 
-        Returns ``(parent_a, parent_b)`` or None if no valid pairs exist
-        (need ≥2 successful experiments). If every pair has been popped this
-        round, the queue is reset (round-robin) and the top pair is served
-        again.
+        Selection scores each entry as
+            score / (1 + α · attempt_count)              (unconsummated), or
+            score · β / (1 + α · attempt_count)          (consummated).
+        A pair is *consummated* when any admitted experiment in
+        experiments.jsonl already lists its two parents (in either order)
+        as parent_node_1, parent_node_2 — i.e. the joint info has been
+        captured by at least one descendant.
+
+        The chosen entry's ``attempt_count`` is bumped and ``popped_at``
+        stamped (popped_at is retained for telemetry only; the score-decay
+        replaces the earlier round-robin reset).
+
+        Returns ``(parent_a, parent_b)`` or None when fewer than two admitted
+        experiments exist.
         """
         kg_path = Path(kg_dir)
         # Cheap pre-check outside the lock — if there are <2 experiments,
@@ -2874,18 +2895,16 @@ finally:
             if not entries or self._experiments_changed_since_queue(kg_path):
                 entries = self._merge_new_pairs(kg_path, entries)
 
-            chosen = next((e for e in entries if not e.get("popped_at")), None)
-            if chosen is None:
-                # Round-robin: clear popped_at on every entry and pick the
-                # top of the refreshed ordering.
-                for entry in entries:
-                    entry["popped_at"] = None
-                chosen = entries[0] if entries else None
-
-            if chosen is None:
-                self._write_queue(kg_path, entries)
+            if not entries:
                 return None
 
+            consummated = self._consummated_pairs(kg_path)
+            chosen = max(
+                entries,
+                key=lambda entry: self._effective_pair_score(entry, consummated),
+            )
+
+            chosen["attempt_count"] = int(chosen.get("attempt_count", 0)) + 1
             chosen["popped_at"] = time.time()
             self._write_queue(kg_path, entries)
 
@@ -2893,4 +2912,39 @@ finally:
             if len(parents) != 2:
                 return None
             return str(parents[0]), str(parents[1])
+
+    @classmethod
+    def _consummated_pairs(cls, kg_dir: Path) -> set[frozenset[str]]:
+        """Unordered parent pairs that already have an admitted child.
+
+        Treats (A,B) and (B,A) as the same consummation — the joint
+        information has been captured regardless of which ordering produced
+        the child.
+        """
+        out: set[frozenset[str]] = set()
+        for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS):
+            if rec.get("bic_delta", 0) >= 0:
+                continue
+            p1 = rec.get("parent_node_1")
+            p2 = rec.get("parent_node_2")
+            if (
+                isinstance(p1, str) and p1
+                and isinstance(p2, str) and p2
+                and p1 != p2
+            ):
+                out.add(frozenset({p1, p2}))
+        return out
+
+    @staticmethod
+    def _effective_pair_score(
+        entry: dict[str, Any],
+        consummated: set[frozenset[str]],
+    ) -> float:
+        score = float(entry.get("score", 0.0))
+        attempts = int(entry.get("attempt_count", 0))
+        decayed = score / (1.0 + _PAIR_ATTEMPT_DECAY * attempts)
+        parents = entry.get("parents") or []
+        if len(parents) == 2 and frozenset(parents) in consummated:
+            decayed *= _CONSUMMATED_DISCOUNT
+        return decayed
 
