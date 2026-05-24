@@ -1,7 +1,12 @@
 """Feature hypothesis task for Kazakhstan geological dataset.
 
-Agents explore Kazakhstan geological datasets, hypothesize about informative feature layers,
-write code to test hypotheses, and have features evaluated via BIC on ridge CV.
+Agents explore the Kazakhstan Teniz Basin geological dataset, hypothesise about
+informative feature layers, write code to test hypotheses, and have features
+evaluated via BIC on ridge CV.
+
+Sibling of tasks.feature_hypothesis — same workflow + dedup gate + bootstrap
+permit machinery, only the grid spec, system prompt, dataset overview, and
+default paths differ.
 
 Architecture:
 - Hypothesis Agent: Survey → Hypothesise → (wait) → Translate
@@ -13,14 +18,18 @@ Architecture:
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from docker.models.containers import Container
 from loguru import logger
@@ -82,11 +91,30 @@ _ROLE_SERVICE = {
 _ANALYSIS_INPUT = "/workspace/input"
 _ANALYSIS_OUT = "/workspace/out"
 
+# Filenames inside `variation.kg_dir`. Centralised so the task code, tests,
+# and any external tooling (e.g. analytics scripts) reference one source.
+_KG_EXPERIMENTS = "experiments.jsonl"
+_KG_CROSSBREED_INDEX = "crossbreed_index.jsonl"
+_KG_ADMITTED_INDEX = "admitted_index.json"
+_KG_BOOTSTRAP_STATE = "bootstrap_state.json"
+_KG_QUEUE = "crossbreed_queue.jsonl"
+_KG_LOCK = "kg.lock"
+
+# Queue selection knobs. The effective score of an entry is
+#   score / (1 + α · attempt_count),   with an extra · β multiplier when the
+# pair is "consummated" (already has ≥1 admitted crossbreed child). α decays
+# repeatedly-tried pairs out of the fast lane; β puts consummated pairs in a
+# slow lane without banning them — LLM hypothesis generation is high-variance
+# and the surrounding feature pool keeps growing, so a second attempt at the
+# same pair is a genuinely different experiment.
+_PAIR_ATTEMPT_DECAY = 0.5
+_CONSUMMATED_DISCOUNT = 0.25
+
 
 # Kazakhstan Teniz Basin grid specification - Regional scale for basin analysis
 _KAZAKHSTAN_TENIZ_GRID = {
     "origin": [66.5, 49.5, 0.0],      # 66°30'E, 49°30'N, 0m depth
-    "maximum": [71.5, 52.5, 80.0],    # 71°30'E, 52°30'N, 80m depth  
+    "maximum": [71.5, 52.5, 80.0],    # 71°30'E, 52°30'N, 80m depth
     "shape": [200, 200, 8],            # ~1.75km x 1.75km x 10m resolution, 320k total voxels
     "crs": "EPSG:4326",
 }
@@ -94,7 +122,7 @@ _KAZAKHSTAN_TENIZ_GRID = {
 
 _SYSTEM_PROMPT = """You are in mineral exploration mode for Kazakhstan geological analysis.
 
-Your goal is to identify informative feature layers that would improve compression 
+Your goal is to identify informative feature layers that would improve compression
 of a voxel-based world model. You are rewarded when adding a feature layer improves BIC on a ridge regression of the overall world model.
 
 ## Grid
@@ -145,7 +173,7 @@ This dataset contains comprehensive geological data for the Teniz Basin region o
 - Scientific assessment report chunks and figure descriptions
 - Technical reports on sediment-hosted copper systems
 
-**Russian Survey Data (Smolianova 1984):**  
+**Russian Survey Data (Smolianova 1984):**
 - 300+ detailed geological text chunks covering stratigraphy, tectonics, magmatism
 - 60+ drill hole logs with lithology and depth data
 - Comprehensive geophysical interpretations and mineral evaluations
@@ -162,19 +190,33 @@ This dataset contains comprehensive geological data for the Teniz Basin region o
 
 @dataclass
 class FeatureHypothesisKazakhstanVariation(Variation):
-    """Variation configuration for Kazakhstan feature hypothesis task."""
-    
+    """Variation configuration for feature hypothesis task."""
+
     dataset_dir: str = ""
     store_dir: str = ""
     kg_dir: str = ""
     grid_spec: dict[str, Any] = field(default_factory=lambda: dict(_KAZAKHSTAN_TENIZ_GRID))
     min_features: int = 0  # minimum features before crossbreeding
     crossbreed_enabled: bool = True
+    # Crossbreed-pool dedup keeps near-identical experiments from flooding
+    # `experiments.jsonl`. When enabled, an admitted record's fingerprint
+    # (ordered parents + hypothesis) must be unseen; duplicates remain
+    # successes for reward purposes but are silently skipped from the pool.
+    dedup_enabled: bool = True
+    # Upper bound on concurrent bootstrap (= survey) episodes. Set this to
+    # your `GenerationConfig.parallel_episodes` to choke bootstrap to the
+    # full slot count; set it lower to leave headroom for ramp-up. If the
+    # framework has fewer slots than this, the extras simply do nothing.
+    bootstrap_concurrency_cap: int = 4
+    bootstrap_window_size: int = 8  # episodes over which to ramp N/2 -> N
+    bootstrap_min_concurrency_fraction: float = 0.5
+    bootstrap_permit_timeout_s: float = 600.0
+    bootstrap_permit_stale_after_s: float = 1800.0
 
 
 @dataclass
 class FeatureHypothesisKazakhstanState:
-    """Episode state for Kazakhstan feature hypothesis task."""
+    """Episode state for feature hypothesis task."""
     
     episode_id: str = ""
     workflow_kind: str = "survey"  # survey, crossbreed
@@ -206,16 +248,80 @@ class FeatureHypothesisKazakhstanState:
     
     # Crossbreeding context
     parent_experiments: list[str] = field(default_factory=list)
-    
+
     # Training data
     prompt_response_pair: dict[str, str] = field(default_factory=dict)
 
 
+class FeatureHypothesisKazakhstanProposerRows:
+    """SFT transform: keep proposer-persona turns, drop pure executor turns.
+
+    Twin of :class:`tasks.feature_hypothesis.FeatureHypothesisProposerRows`
+    for the Kazakhstan variation. Kept as a sibling class (rather than
+    re-using the Australian one) so the recipe hash recorded in
+    ``export_recipe.json`` makes the source task unambiguous when SFT data
+    from both variants ends up in the same downstream sweep.
+    """
+
+    DEFAULT_INCLUDED_WORKFLOW_STEPS: tuple[str, ...] = (
+        "survey",
+        "hypothesise",
+        "translate",
+        "rewrite",
+    )
+
+    def __init__(self, included_workflow_steps: tuple[str, ...] | None = None) -> None:
+        self._included: tuple[str, ...] = tuple(
+            included_workflow_steps
+            if included_workflow_steps is not None
+            else self.DEFAULT_INCLUDED_WORKFLOW_STEPS
+        )
+
+    @property
+    def name(self) -> str:
+        return "FeatureHypothesisKazakhstanProposerRows[v1]"
+
+    def config(self) -> dict[str, Any]:
+        return {"included_workflow_steps": list(self._included)}
+
+    def transform_export_rows(
+        self,
+        context: Any,
+        episodes: list[Any],
+    ) -> list[Any]:
+        del context
+        from src.training_data.transforms import EpisodeTrainingRows
+
+        allowed = set(self._included)
+        out: list[EpisodeTrainingRows] = []
+        for episode in episodes:
+            kept: list[dict[str, Any]] = []
+            for row in episode.rows:
+                step = row.get("workflow_step")
+                if step is None:
+                    raise ValueError(
+                        "feature_hypothesis_kazakhstan export row is missing "
+                        f"workflow_step (row_id={row.get('row_id')!r})"
+                    )
+                if step in allowed:
+                    kept.append(row)
+            out.append(
+                EpisodeTrainingRows(
+                    episode_id=episode.episode_id,
+                    episode_index=episode.episode_index,
+                    generation_id=episode.generation_id,
+                    episode_score=episode.episode_score,
+                    rows=kept,
+                )
+            )
+        return out
+
+
 class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]):
-    """Feature hypothesis discovery task for Kazakhstan geological data."""
+    """Feature hypothesis discovery task."""
     
     name = "feature-hypothesis-kazakhstan"
-    description = "Discover informative feature layers from Kazakhstan geological data through hypothesis-driven exploration."
+    description = "Discover informative feature layers from Kazakhstan Teniz Basin geological data through hypothesis-driven exploration."
     metric_name = "bic_improvement"
     metric_unit = "nats"
     higher_is_better = False  # Lower BIC is better
@@ -227,17 +333,29 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # Dataset paths - Kazakhstan data
         default_dataset = repo_root.parent / "Kazkhstan_data"
         self._dataset_dir = Path(task_config.get("dataset_dir", default_dataset)).resolve()
-        
+
         # Store paths - Kazakhstan regional structure
         default_store = repo_root / "data" / "kazakhstan" / "feature-hypothesis" / "store"
         self._store_dir = Path(task_config.get("store_dir", default_store)).resolve()
-        
+
         default_kg = repo_root / "data" / "kazakhstan" / "feature-hypothesis" / "knowledge"
         self._kg_dir = Path(task_config.get("kg_dir", default_kg)).resolve()
-        
+
         self._docker_compose_dir = task_config.get(
             "docker_compose_dir", "docker/feature-hypothesis-kazakhstan-compose"
         )
+
+        # Pre-create the per-variation store + kg dirs as the calling user.
+        # Otherwise docker compose up's bind-mount auto-creates the missing
+        # path as root (daemon UID), then the host-side Python in
+        # _kg_lock().mkdir() / _save_index() etc. fails with PermissionError
+        # on subsequent runs. Idempotent (exist_ok=True).
+        for sub in ("teniz_basin",):
+            (self._store_dir / sub / "admitted" / "layers").mkdir(
+                parents=True, exist_ok=True
+            )
+            (self._store_dir / sub / "scratch").mkdir(parents=True, exist_ok=True)
+            (self._kg_dir / sub).mkdir(parents=True, exist_ok=True)
 
         # Pre-warm voxel-features imports. _exec_spatial_capability /
         # _exec_scoring_capability import voxel_features.spatial (which pulls
@@ -297,17 +415,17 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> PopulationOutcome:
         if not isinstance(variation, FeatureHypothesisKazakhstanVariation):
             raise TypeError("FeatureHypothesisKazakhstanTask requires FeatureHypothesisKazakhstanVariation")
-        
+
         episode_id = f"ep_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-        
+
         # Check existing features to decide workflow
         n_features = self._count_features(variation)
         workflow_kind = "crossbreed" if (
-            variation.crossbreed_enabled and 
+            variation.crossbreed_enabled and
             n_features >= variation.min_features and
             self._has_crossbreed_pairs(variation)
         ) else "survey"
-        
+
         episode_context: dict[str, Any] = {
             "episode_id": episode_id,
             "variation_name": variation.name,
@@ -318,11 +436,47 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             "grid_spec": variation.grid_spec,
             "n_features": n_features,
         }
-        
-        # If crossbreeding, add context
+
+        # Crossbreed: serve a distinct ordered (parent_a, parent_b) pair from
+        # the queue so concurrent slots do not collide on the same parents.
         if workflow_kind == "crossbreed":
-            episode_context["crossbreed_context"] = self._get_crossbreed_context(variation)
-        
+            crossbreed_ctx: dict[str, Any] = {}
+            kg_dir_path = Path(variation.kg_dir)
+            if variation.dedup_enabled:
+                pair = self._queue_pop_pair(kg_dir_path)
+                if pair is not None:
+                    crossbreed_ctx = self._build_crossbreed_context_for_pair(
+                        kg_dir_path, pair[0], pair[1]
+                    )
+            if not crossbreed_ctx:
+                # Fall back to the legacy single-best selection (or a no-op
+                # empty context if no experiments). Keeps the task usable when
+                # dedup_enabled is False or the queue couldn't yield a pair.
+                crossbreed_ctx = self._get_crossbreed_context(variation)
+            episode_context["crossbreed_context"] = crossbreed_ctx
+
+        # Survey (= bootstrap): block here until a slot permit is free so
+        # the early generation runs at lower concurrency. The framework
+        # still allocates `parallel_episodes` slots; we choke them at the
+        # task layer to preserve the pytorch-lightning boundary.
+        if (
+            workflow_kind == "survey"
+            and variation.dedup_enabled
+            and variation.bootstrap_window_size > 0
+        ):
+            permit_slot_id = f"slot_{episode_id}_{uuid.uuid4().hex[:6]}"
+            acquired = self._acquire_bootstrap_permit(
+                Path(variation.kg_dir),
+                permit_slot_id,
+                configured_slots=variation.bootstrap_concurrency_cap,
+                window_size=variation.bootstrap_window_size,
+                min_fraction=variation.bootstrap_min_concurrency_fraction,
+                timeout_s=variation.bootstrap_permit_timeout_s,
+                stale_after_s=variation.bootstrap_permit_stale_after_s,
+            )
+            if acquired:
+                episode_context["bootstrap_permit_slot_id"] = permit_slot_id
+
         results = [
             PopulationResult(
                 container_id=getattr(container, "id", ""),
@@ -410,7 +564,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             budgets=BudgetConstraints(max_task_tool_calls=100, max_llm_turns=120),
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
-    
+
+    def training_data_transforms(self) -> tuple[FeatureHypothesisKazakhstanProposerRows, ...]:
+        return (FeatureHypothesisKazakhstanProposerRows(),)
+
     # ------------------------------------------------------------------
     # Workflows
     # ------------------------------------------------------------------
@@ -422,16 +579,22 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
-        # Generate dynamic survey prompt with recent experiments context
-        survey_prompt = self._generate_survey_prompt_with_context()
-        
         return Workflow(
             steps=(
                 # HYPOTHESIS AGENT: Phase 1
                 WorkflowStep(
                     name="survey",
                     is_entry=True,
-                    prompt=survey_prompt,
+                    prompt=(
+                        "Phase 1: Survey\n\n"
+                        "Explore the dataset to identify feature opportunities.\n\n"
+                        "Use analysis_shell to:\n"
+                        "- Read file headers and schemas\n"
+                        "- Identify interesting patterns\n\n"
+                        "Find 2-3 promising feature layer candidates.\n\n"
+                        "Close with:\n"
+                        "  record_phase(phase='survey', candidates=[...])"
+                    ),
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -524,18 +687,18 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
-                        "   **For prospect/drill data with coordinates:**\n"
+                        "   **For drill hole data with coordinates:**\n"
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
-                        "   **For geological structures (faults, anticlines, basins):**\n"
+                        "   **For geological structures (faults, veins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
                         "   **For statistical results without coordinates:**\n"
-                        "   - Use geological knowledge: regional trends, basin centers, prospect clusters\n"
-                        "   - Create spatial patterns: geological formations, mineral belts\n"
-                        "3. Create exactly ONE coherent feature layer:\n"
+                        "   - Use geological knowledge: 'near Emily Well' → find well coordinates\n"
+                        "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
+                        "3. -Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
-                        "   - Values must be floats or booleans: 'copper_potential' → 0.75\n"
-                        "   - Example: spatial_add_point(name='sediment_copper_potential', ...) \n"
-                        "            spatial_add_line(name='sediment_copper_potential', ...) \n"
+                        " - Values must be floats or booleans: 'clay' → has_clay=True\n", 
+                        "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
+                        "            spatial_add_line(name='mineralization_potential', ...) \n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
                         "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
                         "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
@@ -544,7 +707,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   2. spatial_add_line(name='name', ...)\n"
                         "   3. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
-                        "Focus on regional geological intelligence for Kazakhstan basin analysis!"
+                        "Focus on geological intelligence, not array mathematics!"
                     ),
                     context_mode="isolated",
                     inherit_all_capabilities=False,
@@ -571,9 +734,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "2. Call submit_rewrite(prompt=..., response=...) to close the phase.\n\n"
                         "Pass two string arguments:\n"
                         "  prompt:   A description of the dataset context and the hypothesis "
-                        "being tested. What patterns in the Kazakhstan data suggested this hypothesis?\n"
+                        "being tested. What patterns in the data suggested this hypothesis?\n"
                         "  response: What analysis was performed, what was found, and why "
-                        "the result is or isn't informative for Kazakhstan mineral exploration.\n\n"
+                        "the result is or isn't informative for mineral exploration.\n\n"
                         "Do NOT include the BIC score in your response — "
                         "it will be appended automatically."
                     ),
@@ -758,6 +921,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "Submit the training pair for this experiment. "
                     "The knowledge graph node is generated automatically."
                 ),
+                # `prompt` and `response` are passed as flat top-level string
+                # arguments. A nested object parameter (training_pair={...})
+                # trips a NAT MCP-client bug: it generates the nested model
+                # type twice and its own validation rejects its own parsed
+                # value (SubmitRewriteInputSchema.training_pair). Flat scalar
+                # params — like every other capability here — avoid it.
                 schema={
                     "type": "object",
                     "properties": {
@@ -917,10 +1086,6 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         else:
             return CapabilityResult(name, success=False, error=f"Unknown capability: {name}")
     
-    # ------------------------------------------------------------------
-    # Execution methods
-    # ------------------------------------------------------------------
-    
     def _exec_analysis_shell(
         self,
         containers: list[Container],
@@ -936,7 +1101,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if analysis is None:
             return CapabilityResult("analysis_shell", success=False, error="No analysis container")
         
-        # Normal execution for Kazakhstan analysis
+        # Check if this is translate phase - if so, auto-detect voxel arrays
+        current_step = ctx.episode_context.get("current_step", "")
+        if "translate" in current_step:
+            return self._exec_analysis_shell_with_voxel_detection(analysis, code, ctx)
+        
+        # Normal execution for other phases
         cmd = ["python", "-c", code]
         try:
             result = exec_run_with_timeout(analysis, cmd, timeout_s=60)
@@ -948,6 +1118,109 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 success=exit_code == 0,
                 error=stdout if exit_code != 0 else None,
             )
+        except Exception as e:
+            return CapabilityResult("analysis_shell", success=False, error=str(e))
+    
+    def _exec_analysis_shell_with_voxel_detection(
+        self,
+        analysis: Container,
+        code: str,
+        ctx: CapabilityExecutionContext,
+    ) -> CapabilityResult:
+        """Execute analysis_shell code with automatic voxel array detection and feature layer creation."""
+        
+        # Wrap user code to automatically detect and save (200, 200, 8) voxel arrays
+        wrapped_code = '''
+import numpy as np
+import pickle
+import os
+
+# Store original locals to compare later
+_original_locals = set(locals().keys())
+
+try:
+    # Execute user's analysis code
+''' + code + '''
+    
+    print("\\n" + "="*50)
+    print("VOXEL DETECTION - CHECKING FOR (200,200,8) ARRAYS")
+    print("="*50)
+    
+    # Check for voxel arrays in final namespace
+    _final_locals = locals().copy()
+    _voxel_arrays_found = []
+    
+    for var_name, obj in _final_locals.items():
+        if (not var_name.startswith('_') and 
+            var_name not in _original_locals and 
+            var_name not in ['np', 'pickle', 'os']):
+            
+            try:
+                if isinstance(obj, np.ndarray) and obj.shape == (200, 200, 8):
+                    print(f"Found voxel array '{var_name}': shape {obj.shape}, dtype {obj.dtype}")
+                    _voxel_arrays_found.append({
+                        'name': var_name,
+                        'array': obj,
+                        'dtype': str(obj.dtype)
+                    })
+                elif isinstance(obj, np.ndarray) and len(obj.shape) > 3:
+                    print(f"WARNING: Multidimensional array '{var_name}' with shape {obj.shape} detected")
+                    print(f"  Only (200,200,8) arrays are accepted. Please reduce to single feature.")
+                    
+            except Exception as check_err:
+                print(f"Error checking '{var_name}': {check_err}")
+    
+    print(f"\\nTotal voxel arrays detected: {len(_voxel_arrays_found)}")
+    
+    # Auto-save voxel arrays as feature layers
+    _feature_layers_created = []
+    for voxel_info in _voxel_arrays_found:
+        try:
+            # Convert 3D voxel array to feature layer
+            voxel_array = voxel_info['array']
+            layer_name = voxel_info['name']
+            dtype = 'float' if 'float' in voxel_info['dtype'] else 'int'
+                
+            # Convert to Python list and save
+            voxel_list = voxel_array.tolist()
+            
+            # Here we would call create_feature_layer, but we'll mark it for the wrapper
+            print(f"AUTO-SAVE: {layer_name} -> feature layer (dtype: {dtype})")
+            _feature_layers_created.append({
+                'name': layer_name,
+                'values': voxel_list,
+                'dtype': dtype
+            })
+            
+        except Exception as save_err:
+            print(f"Failed to auto-save '{voxel_info['name']}': {save_err}")
+    
+    print(f"\\nFEATURE_LAYERS_TO_CREATE: {len(_feature_layers_created)}")
+    for layer in _feature_layers_created:
+        print(f"  - {layer['name']} ({layer['dtype']})")
+    print("="*50)
+    
+except Exception as user_code_error:
+    print(f"ERROR in user analysis code: {user_code_error}")
+    import traceback
+    traceback.print_exc()
+'''
+        
+        # Execute wrapped code
+        cmd = ["python", "-c", wrapped_code]
+        try:
+            result = exec_run_with_timeout(analysis, cmd, timeout_s=60)
+            exit_code, raw = coerce_exec_result(result)
+            stdout = raw.decode(errors="replace")
+            
+            
+            return CapabilityResult(
+                "analysis_shell",
+                output={"stdout": stdout, "stderr": ""},
+                success=exit_code == 0,
+                error=stdout if exit_code != 0 else None,
+            )
+            
         except Exception as e:
             return CapabilityResult("analysis_shell", success=False, error=str(e))
     
@@ -994,9 +1267,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         
         output = phase_records[phase].copy()
         
-        # Auto-enhance data_spec for coding phase with Kazakhstan data
+        # Auto-enhance data_spec for coding phase
         if phase == "hypothesise" and "data_spec" in output:
-            output["data_spec"] = self._enhance_data_spec_kazakhstan(output["data_spec"])
+            output["data_spec"] = self._enhance_data_spec(output["data_spec"])
         
         return CapabilityResult(
             "phase_get",
@@ -1004,12 +1277,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             success=True,
         )
     
-    def _enhance_data_spec_kazakhstan(self, data_spec: dict[str, Any]) -> dict[str, Any]:
+    def _enhance_data_spec(self, data_spec: dict[str, Any]) -> dict[str, Any]:
         """Enhance data_spec with Kazakhstan-specific file guidance and correct paths."""
-        import os
         enhanced = data_spec.copy()
         files = enhanced.get("files", [])
-        
+
         # Add the known Kazakhstan GeoJSON files with correct paths
         kazakhstan_geojson_files = [
             {
@@ -1020,40 +1292,39 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 "properties": ["name", "tonnage", "grade", "coordinates", "deposit_type"],
                 "note": "113 copper prospects with economic data - use geopandas.read_file(full_path)",
                 "count": 113,
-                "description": "Sediment-hosted copper prospects in Teniz Basin"
+                "description": "Sediment-hosted copper prospects in Teniz Basin",
             },
             {
-                "file": "converted_spatial_data/anticlines_synclines.geojson", 
+                "file": "converted_spatial_data/anticlines_synclines.geojson",
                 "full_path": "/workspace/input/converted_spatial_data/anticlines_synclines.geojson",
                 "type": "geojson",
                 "geometry": "linestrings/polygons",
                 "properties": ["structure_type", "geological_age", "fold_axis"],
                 "note": "33 geological fold structures - use geopandas.read_file(full_path)",
                 "count": 33,
-                "description": "Regional anticline and syncline structures"
+                "description": "Regional anticline and syncline structures",
             },
             {
                 "file": "converted_spatial_data/assessment_tract.geojson",
-                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson", 
+                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson",
                 "type": "geojson",
                 "geometry": "polygon",
                 "properties": ["area_km2", "tract_name", "assessment_type"],
                 "note": "Teniz Basin boundary (49,714 km²) - use geopandas.read_file(full_path)",
                 "area_km2": 49714,
-                "description": "USGS assessment tract boundary"
+                "description": "USGS assessment tract boundary",
             },
             {
                 "file": "converted_spatial_data/copper_prospects_aoi.geojson",
                 "full_path": "/workspace/input/converted_spatial_data/copper_prospects_aoi.geojson",
-                "type": "geojson", 
+                "type": "geojson",
                 "geometry": "polygons",
                 "properties": ["area_of_interest", "prospect_density"],
                 "note": "Copper prospect areas of interest - use geopandas.read_file(full_path)",
-                "description": "AOI polygons for copper exploration"
-            }
+                "description": "AOI polygons for copper exploration",
+            },
         ]
-        
-        # Add Russian geological survey data
+
         russian_survey_files = [
             {
                 "file": "36572_Smolianova_1984",
@@ -1061,29 +1332,24 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 "type": "directory",
                 "language": "Russian/English",
                 "content": "geological survey texts and drill hole data",
-                "note": "579 Russian geological survey files - use os.listdir() to explore",
-                "file_count": 579,
-                "description": "Comprehensive geological survey (Smolianova 1984)"
-            }
+                "note": "Russian geological survey files - use os.listdir() to explore",
+                "description": "Comprehensive geological survey (Smolianova 1984)",
+            },
         ]
-        
-        # Add USGS data
+
         usgs_files = [
             {
-                "file": "USGS", 
+                "file": "USGS",
                 "full_path": "/workspace/input/USGS",
                 "type": "directory",
                 "content": "USGS assessment data and reports",
                 "note": "USGS English-language data - use os.listdir() to explore",
-                "description": "USGS Teniz Basin assessment data"
-            }
+                "description": "USGS Teniz Basin assessment data",
+            },
         ]
-        
-        # Combine all known file specifications, then append any agent-supplied
-        # extras the enhancer doesn't already cover. Previously enhanced[
-        # "file_specs"] was overwritten with `all_files` after the extras were
-        # appended to a separate `file_specs` list, silently dropping the
-        # agent's own file list.
+
+        # Combine known specs, then append any agent-supplied extras the
+        # enhancer doesn't already cover.
         file_specs = list(kazakhstan_geojson_files + russian_survey_files + usgs_files)
         known_file_keys = {spec["file"] for spec in file_specs}
         for file_path in files:
@@ -1096,12 +1362,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             "copper_prospects": 113,
             "geological_structures": 33,
             "assessment_area_km2": 49714,
-            "russian_survey_files": 579,
             "data_languages": ["English", "Russian"],
-            "coordinate_system": "EPSG:4326 (WGS84)",
-            "grid_bounds": "66.5°-71.5°E × 49.5°-52.5°N"
         }
-        
         return enhanced
     
     def _exec_get_experiment_summary(
@@ -1109,7 +1371,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         containers: list[Container],
         ctx: CapabilityExecutionContext,
     ) -> CapabilityResult:
-        """Return all phase data for Kazakhstan experiment."""
+        """Return all phase data in one call for translate and rewrite agents."""
         phase_records = ctx.episode_context.get("phase_records", {})
         hypothesise = phase_records.get("hypothesise", {})
         code = phase_records.get("code", {})
@@ -1130,18 +1392,511 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 "bic_delta": evaluate.get("bic_delta"),
                 "admitted": evaluate.get("admitted", False),
                 "mutual_info": evaluate.get("mutual_info", {}),
-                "region": "kazakhstan",
-                "grid_coverage": "116160_km2",
             },
             success=True,
         )
+
+    def _exec_submit_code(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+    ) -> CapabilityResult:
+        """Submit and execute code (coding agent)."""
+        code = args.get("code", "")
+        if not code:
+            return CapabilityResult("submit_code", success=False, error="No code provided")
+        
+        # Execute in analysis container
+        analysis = self._pick_container(containers, "analysis")
+        if analysis is None:
+            return CapabilityResult("submit_code", success=False, error="No analysis container")
+        
+        # Create artifact directory
+        episode_id = ctx.episode_context.get("episode_id", "unknown")
+        artifact_dir = f"/tmp/artifacts/{episode_id}"
+        
+        # Wrap user code with automatic artifact capture
+        indented_code = '\n'.join("    " + line for line in code.split('\n'))
+        
+        # Use string concatenation to avoid f-string variable scope issues
+        wrapped_code = '''
+import os
+import glob
+import pickle
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+# Create artifact directory and common output directories
+artifact_dir = "''' + artifact_dir + '''"
+os.makedirs(artifact_dir, exist_ok=True)
+os.makedirs("/workspace/output", exist_ok=True)  # Fix common user code issue
+
+# Store original locals to compare later
+_original_locals = set(locals().keys())
+
+try:
+    # Execute user's analysis code
+''' + indented_code + '''
+
+except Exception as user_code_error:
+    print(f"ERROR in user code: {user_code_error}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    # Always attempt artifact capture, even if user code failed
+    print("\\n" + "="*50)
+    print("ANALYSIS COMPLETE - CAPTURING ARTIFACTS")
+    print("="*50)
+    
+    # Capture artifacts from final namespace
+    _final_locals = locals().copy()
+    _artifacts_saved = []
+    
+    for var_name, obj in _final_locals.items():
+        if (not var_name.startswith('_') and 
+            var_name not in _original_locals and 
+            var_name not in ['artifact_dir', 'os', 'glob', 'pickle', 'pd', 'np', 'Path']):
+            
+            try:
+                if isinstance(obj, pd.DataFrame) and not obj.empty:
+                    filepath = f"{artifact_dir}/{var_name}_dataframe.csv"
+                    obj.to_csv(filepath, index=False)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved DataFrame '{var_name}' -> {filepath}")
+                    print(f"  Shape: {obj.shape}, Columns: {list(obj.columns)}")
+                
+                elif isinstance(obj, np.ndarray):
+                    filepath = f"{artifact_dir}/{var_name}_array.npy" 
+                    np.save(filepath, obj)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved numpy array '{var_name}' -> {filepath}")
+                    print(f"  Shape: {obj.shape}, dtype: {obj.dtype}")
+                
+                elif isinstance(obj, (dict, list, tuple)) and len(str(obj)) < 10000:
+                    filepath = f"{artifact_dir}/{var_name}_object.pkl"
+                    with open(filepath, 'wb') as f:
+                        pickle.dump(obj, f)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved object '{var_name}' -> {filepath}")
+                    print(f"  Type: {type(obj)}, Size: {len(str(obj))} chars")
+                
+                elif isinstance(obj, (int, float, str, bool)):
+                    # Save simple scalars as JSON-like format
+                    filepath = f"{artifact_dir}/{var_name}_scalar.txt"
+                    with open(filepath, 'w') as f:
+                        f.write(var_name + ": " + str(obj) + "\\ntype: " + type(obj).__name__)
+                    _artifacts_saved.append(filepath)
+                    print(f"Saved scalar '{var_name}' -> {filepath}")
+                    print(f"  Value: {obj}")
+                
+            except Exception as save_err:
+                print(f"Failed to save '{var_name}': {save_err}")
+    
+    # List all artifacts in directory
+    all_artifacts = glob.glob(f"{artifact_dir}/*")
+    print(f"\\nARTIFACTS_DIRECTORY: {artifact_dir}")
+    print(f"ARTIFACTS_SAVED: {all_artifacts}")
+    print("="*50)
+'''
+        
+        cmd = ["python", "-c", wrapped_code]
+        try:
+            result = exec_run_with_timeout(analysis, cmd, timeout_s=120)
+            exit_code, raw = coerce_exec_result(result)
+            stdout = raw.decode(errors="replace")
+            
+            # Extract artifact information from stdout
+            artifact_files = []
+            if "ARTIFACTS_SAVED:" in stdout:
+                import re
+                artifacts_match = re.search(r"ARTIFACTS_SAVED: \[(.*?)\]", stdout)
+                if artifacts_match:
+                    artifacts_str = artifacts_match.group(1)
+                    # Parse the list of file paths
+                    artifact_files = [f.strip().strip("'\"") for f in artifacts_str.split(",") if f.strip()]
+            
+            # Store code and result with artifact information
+            phase_records = ctx.episode_context.setdefault("phase_records", {})
+            phase_records["code"] = {
+                "code_executed": code,
+                "result_summary": stdout,
+                "artifact_directory": artifact_dir,
+                "artifact_files": artifact_files,
+                "success": exit_code == 0,
+                "timestamp": time.time(),
+            }
+            
+            return CapabilityResult(
+                "submit_code",
+                output={
+                    "stdout": stdout,
+                    "stderr": "",
+                    "success": exit_code == 0,
+                    "artifact_directory": artifact_dir,
+                    "artifact_files": artifact_files,
+                },
+                success=True,
+            )
+        except Exception as e:
+            return CapabilityResult("submit_code", success=False, error=str(e))
+    
+    def _exec_submit_rewrite(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+    ) -> CapabilityResult:
+        """Submit rewritten experiment record. Auto-generates graph node and appends BIC."""
+        import pickle
+        import json
+        from pathlib import Path
+        from datetime import datetime
+        
+        # `prompt`/`response` arrive as flat top-level args (see the
+        # submit_rewrite capability schema for why it is not nested).
+        training_pair = {
+            "prompt": args.get("prompt", ""),
+            "response": args.get("response", ""),
+        }
+
+        phase_records = ctx.episode_context.get("phase_records", {})
+        hypothesise = phase_records.get("hypothesise", {})
+        code = phase_records.get("code", {})
+        translate = phase_records.get("translate", {})
+        evaluate = phase_records.get("evaluate", {})
+
+        # Auto-generate graph node from phase records
+        graph_node = {
+            "hypothesis": hypothesise.get("hypothesis", ""),
+            "data_spec": hypothesise.get("data_spec", {}),
+            "experiment_summary": code.get("result_summary", ""),
+            "feature_layer_name": translate.get("feature_layer_name", ""),
+            "outcome": {
+                "bic_delta": evaluate.get("bic_delta"),
+                "admitted": evaluate.get("admitted", False),
+                "mutual_info": evaluate.get("mutual_info", {}),
+            },
+        }
+
+        # Auto-append BIC result to training pair response
+        bic_delta = evaluate.get("bic_delta")
+        admitted = evaluate.get("admitted", False)
+        if isinstance(training_pair.get("response"), str) and bic_delta is not None:
+            verdict = "Admitted" if admitted else "Not admitted"
+            training_pair["response"] += (
+                f"\n\nResult: {bic_delta:.4f} BIC delta. {verdict}."
+            )
+
+        # Prepare training record for persistence
+        episode_id = ctx.episode_context.get("episode_id", "")
+        store_dir = ctx.episode_context.get("store_dir", "")
+        
+        # Extract data paths - need to get base data directory
+        if store_dir:
+            data_base_path = Path(store_dir).parent.parent  # from store/teniz_basin to data/kazakhstan/feature-hypothesis
+        else:
+            data_base_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/data/feature-hypothesis")
+        
+        # Extract two-stage scoring results
+        masking_test_passed = evaluate.get('masking_test_passed', True)
+        masking_test_improvement = evaluate.get('masking_test_improvement', 0.0)
+        masking_test_direction = evaluate.get('masking_test_direction', 'not_applicable')
+        stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
+        
+        training_record = {
+            'prompt': training_pair.get('prompt', ''),
+            'response': training_pair.get('response', ''),
+            'bic_delta': bic_delta,
+            'episode_id': episode_id,
+            'timestamp': time.time(),
+            'admitted': admitted,
+            'layer_name': translate.get('feature_layer_name', ''),
+            # Two-stage scoring results
+            'masking_test_passed': masking_test_passed,
+            'masking_test_improvement': masking_test_improvement,
+            'masking_test_direction': masking_test_direction,
+            'stage_completed': stage_completed,
+            'metadata': {
+                'hypothesis': hypothesise.get('hypothesis', ''),
+                'grid_bounds': ctx.episode_context.get('grid_spec', {}),
+                'mutual_info': evaluate.get('mutual_info', {}),
+                'experiment_summary': code.get('result_summary', ''),
+                # Additional two-stage context
+                'two_stage_scoring': {
+                    'stage_1_passed': masking_test_passed,
+                    'stage_1_improvement': masking_test_improvement,
+                    'stage_1_direction': masking_test_direction,
+                    'stage_completed': stage_completed,
+                    'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
+                    'scoring_version': 'two_stage_v1'
+                }
+            }
+        }
+        
+        # Save training data (ALL experiments)
+        try:
+            training_dir = data_base_path / "training"
+            training_dir.mkdir(parents=True, exist_ok=True)
+            training_file = training_dir / "training_pairs.pkl"
+
+            # Load existing records or create new list
+            existing_records = []
+            if training_file.exists():
+                with open(training_file, 'rb') as f:
+                    existing_records = pickle.load(f)
+            
+            # Append new record
+            existing_records.append(training_record)
+            
+            # Save back to file
+            with open(training_file, 'wb') as f:
+                pickle.dump(existing_records, f)
+                
+        except Exception as e:
+            print(f"Warning: Failed to save training data: {e}")
+        
+        # Save to knowledge graph (ONLY experiments that passed BOTH stages)
+        # Stage 1: Must pass predictive capacity test
+        # Stage 2: Must improve BIC (complexity assessment)
+        both_stages_passed = (
+            masking_test_passed and 
+            admitted and 
+            bic_delta is not None and 
+            bic_delta < 0 and
+            stage_completed == 'stage_2_completed'
+        )
+        
+        # Prefer the kg_dir wired through populate() so dedup ledger and
+        # experiments.jsonl always live next to each other. Fall back to the
+        # legacy `data_base_path / knowledge / teniz_basin` derivation so
+        # existing deployments keep working.
+        kg_dir_ctx = ctx.episode_context.get("kg_dir", "")
+        if kg_dir_ctx:
+            knowledge_dir = Path(kg_dir_ctx)
+        else:
+            knowledge_dir = data_base_path / "knowledge" / "teniz_basin"
+
+        # Pull queue-served parent IDs from the hypothesise phase record so
+        # the kg node closes the TODO at the previous line numbers.
+        parent_experiments = hypothesise.get("parent_experiments") or []
+        parent_node_1 = parent_experiments[0] if len(parent_experiments) > 0 else None
+        parent_node_2 = parent_experiments[1] if len(parent_experiments) > 1 else None
+
+        duplicate_rejected = False
+        if both_stages_passed:
+            try:
+                knowledge_dir.mkdir(parents=True, exist_ok=True)
+                node_id = f"exp_{episode_id}" if episode_id else f"exp_{int(time.time())}"
+                feature_layer_name = translate.get('feature_layer_name', '') or ''
+                kg_record = {
+                    "node_id": node_id,
+                    "prompt": training_pair.get('prompt', ''),
+                    "response": training_pair.get('response', ''),
+                    "bic_delta": bic_delta,
+                    "masking_test_passed": masking_test_passed,
+                    "masking_test_improvement": masking_test_improvement,
+                    "masking_test_direction": masking_test_direction,
+                    "stage_completed": stage_completed,
+                    "scoring_version": "two_stage_v1",
+                    "artifact_links": {
+                        "layer_file": f"store/teniz_basin/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
+                        "spatial_ops": f"store/teniz_basin/scratch/{episode_id}/spatial.db:experiment_{episode_id}" if episode_id else None
+                    },
+                    "parent_node_1": parent_node_1,
+                    "parent_node_2": parent_node_2,
+                    "timestamp": datetime.now().isoformat(),
+                    "mutual_info": evaluate.get('mutual_info', {}),
+                    "layer_name": feature_layer_name,
+                    "hypothesis": hypothesise.get('hypothesis', '')
+                }
+
+                # Atomic dedup + scratch→admitted promotion (both inside the
+                # kg lock). Duplicates keep the episode's reward but never
+                # enter the pool, and leave the scratch file in place for
+                # the cleanup hook to reclaim.
+                fingerprint_parents = [p for p in parent_experiments if isinstance(p, str) and p]
+                scratch_dir = (
+                    Path(store_dir) / "scratch" / episode_id
+                    if store_dir and episode_id
+                    else None
+                )
+                admitted_dir = (
+                    Path(store_dir) / "admitted" if store_dir else None
+                )
+                admitted_to_kg = self._admit_with_dedup(
+                    knowledge_dir,
+                    kg_record,
+                    parents=fingerprint_parents,
+                    hypothesis=hypothesise.get('hypothesis', ''),
+                    scratch_dir=scratch_dir,
+                    admitted_dir=admitted_dir,
+                    layer_name=feature_layer_name or None,
+                )
+                duplicate_rejected = not admitted_to_kg
+                if admitted_to_kg:
+                    self._update_crossbreed_index(
+                        knowledge_dir, node_id, evaluate.get('mutual_info', {})
+                    )
+
+            except Exception as e:
+                print(f"Warning: Failed to save knowledge graph data: {e}")
+
+        ctx.episode_context["terminal_record"] = {
+            "graph_node": graph_node,
+            "training_pair": training_pair,
+            "timestamp": time.time(),
+        }
+        if duplicate_rejected:
+            # finalize_episode reads this to stamp `duplicate_rejected` into
+            # the reward breakdown for telemetry.
+            ctx.episode_context["duplicate_rejected"] = True
+
+        # Emit a synthetic inference row carrying the rewriter's polished
+        # (prompt, response). See FeatureHypothesisTask._record_rewrite_output_row
+        # for the rationale.
+        self._record_rewrite_output_row(ctx, training_pair)
+
+        return CapabilityResult(
+            "submit_rewrite",
+            output={
+                "recorded": True,
+                "training_saved": True,
+                "knowledge_saved": both_stages_passed and not duplicate_rejected,
+                "duplicate_rejected": duplicate_rejected,
+                "two_stage_results": {
+                    "stage_1_passed": masking_test_passed,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": admitted,
+                    "bic_delta": bic_delta,
+                    "final_admitted": both_stages_passed and not duplicate_rejected,
+                }
+            },
+            success=True,
+        )
+
+    @staticmethod
+    def _record_rewrite_output_row(
+        ctx: CapabilityExecutionContext,
+        training_pair: dict[str, str],
+    ) -> None:
+        """Synthesize one TrajectoryRecord for the rewriter's polished output.
+
+        The rewrite phase's real inference rows are tool-call-only — their
+        ``raw_response`` is empty — so the SFT export would otherwise have no
+        visibility of the ``(prompt, response)`` the agent crafted. No-op
+        when no recorder is wired (unit-test path).
+        """
+        recorder = ctx.recorder
+        if recorder is None:
+            return
+        prompt = training_pair.get("prompt", "")
+        response = training_pair.get("response", "")
+        if not isinstance(prompt, str) or not isinstance(response, str):
+            return
+        if not prompt and not response:
+            return
+
+        from datetime import datetime as _dt
+        from src.harness.recorder import TrajectoryRecord
+
+        record = TrajectoryRecord(
+            episode_id=ctx.episode_id,
+            phase="rewrite_output",
+            messages=[{"role": "user", "content": prompt}],
+            response=response,
+            usage=None,
+            timestamp=_dt.now().isoformat(),
+            success=True,
+            error_message=None,
+            meta={
+                "workflow_step": "rewrite",
+                "actor_role": "rewriter_output",
+                "synthesized": True,
+                "client": "task_synth",
+                "model": "task_synth",
+                "episode_id": ctx.episode_id,
+            },
+        )
+        try:
+            recorder.record_inference(record)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"feature_hypothesis_kazakhstan: failed to record rewrite_output row: {exc}"
+            )
+
+    def _update_crossbreed_index(
+        self,
+        knowledge_dir: Path,
+        new_node_id: str,
+        new_mutual_info: dict[str, float]
+    ) -> None:
+        """Update crossbreed index with mutual information scores for new experiment."""
+        import json
+        from datetime import datetime
+        
+        try:
+            experiments_file = knowledge_dir / _KG_EXPERIMENTS
+            crossbreed_file = knowledge_dir / _KG_CROSSBREED_INDEX
+
+            # Read existing experiments to calculate MI with each
+            existing_experiments = []
+            if experiments_file.exists():
+                with open(experiments_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                exp = json.loads(line)
+                                existing_experiments.append(exp)
+                            except json.JSONDecodeError:
+                                continue
+            
+            # Calculate mutual information between new experiment and all existing ones
+            new_mi_records = []
+            for existing_exp in existing_experiments:
+                if existing_exp['node_id'] == new_node_id:
+                    continue  # Skip self
+                
+                # Get mutual information score between layer names
+                mi_score = 0.0
+                new_layer = new_mutual_info
+                existing_layer = existing_exp.get('mutual_info', {})
+                
+                # Look for cross-references in mutual info dictionaries
+                if existing_exp.get('layer_name') in new_layer:
+                    mi_score = new_layer[existing_exp['layer_name']]
+                elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
+                    mi_score = existing_layer[locals()['layer_name']]
+                
+                # Create pair record
+                pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
+                mi_record = {
+                    "pair_id": pair_id,
+                    "node_1": new_node_id,
+                    "node_2": existing_exp['node_id'],
+                    "mutual_information": mi_score,
+                    "calculated_at": datetime.now().isoformat()
+                }
+                new_mi_records.append(mi_record)
+            
+            # Append new MI records to crossbreed index
+            if new_mi_records:
+                with open(crossbreed_file, 'a') as f:
+                    for record in new_mi_records:
+                        f.write(json.dumps(record) + '\n')
+                        
+        except Exception as e:
+            print(f"Warning: Failed to update crossbreed index: {e}")
     
     def _exec_execution_finalize(
         self,
         args: dict[str, Any],
         ctx: CapabilityExecutionContext,
     ) -> CapabilityResult:
-        """Finalize execution results for Kazakhstan analysis."""
+        """Finalize execution results and store in phase records."""
         execution_id = args.get("execution_id", "")
         success = args.get("success", False)
         summary = args.get("summary", "")
@@ -1149,25 +1904,66 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if not execution_id:
             return CapabilityResult("execution_finalize", success=False, error="execution_id required")
         
-        # For now, simple implementation - can be enhanced with actual execution system
-        phase_records = ctx.episode_context.setdefault("phase_records", {})
-        phase_records["code"] = {
-            "code_executed": "Kazakhstan analysis executed",
-            "result_summary": summary,
-            "success": success,
-            "timestamp": time.time(),
-            "execution_id": execution_id,
-        }
-        
-        return CapabilityResult(
-            "execution_finalize",
-            output={
+        try:
+            # Import and call execution_results directly
+            import sys
+            from pathlib import Path
+            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+            if vfm_path not in sys.path:
+                sys.path.append(vfm_path)
+                
+            from voxel_features.mcp.tools.execution_tools import execution_results
+            
+            result = execution_results(execution_id=execution_id)
+            
+            if not result.get("success", False):
+                return CapabilityResult(
+                    "execution_finalize",
+                    success=False,
+                    error=f"Failed to get execution results: {result.get('error', 'Unknown error')}"
+                )
+            
+            result_data = result
+            
+            # Validate that artifacts were created if execution succeeded
+            if success and result_data.get("artifacts_count", 0) == 0:
+                return CapabilityResult(
+                    "execution_finalize",
+                    success=False,
+                    error="Execution reported success but no artifacts were created"
+                )
+            
+            # Store in phase records in the same format as old submit_code
+            phase_records = ctx.episode_context.setdefault("phase_records", {})
+            
+            # Get any existing code data to preserve original code
+            existing_code = phase_records.get("code", {})
+            
+            phase_records["code"] = {
+                "code_executed": existing_code.get("code_executed", ""),  # Keep original if available
+                "result_summary": result_data.get("stdout", ""),
+                "artifact_directory": result_data.get("artifact_directory", ""),
+                "artifact_files": result_data.get("artifact_files", []),
+                "success": success and result_data.get("execution_success", False),
+                "timestamp": time.time(),
                 "execution_id": execution_id,
-                "success": success,
                 "summary": summary,
-            },
-            success=True,
-        )
+            }
+            
+            return CapabilityResult(
+                "execution_finalize",
+                output={
+                    "execution_id": execution_id,
+                    "success": success,
+                    "summary": summary,
+                    "artifacts_count": result_data.get("artifacts_count", 0),
+                    "artifact_files": result_data.get("artifact_files", []),
+                },
+                success=True,
+            )
+            
+        except Exception as e:
+            return CapabilityResult("execution_finalize", success=False, error=str(e))
     
     def _exec_execution_capability(
         self,
@@ -1176,7 +1972,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         ctx: CapabilityExecutionContext,
         capability_name: str,
     ) -> CapabilityResult:
-        """Execute execution tool capability via direct import for Kazakhstan."""
+        """Execute execution tool capability via direct import."""
         
         try:
             # Add voxel-features-mcp to path
@@ -1205,17 +2001,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error=f"Unknown Kazakhstan execution capability: {capability_name}"
+                    error=f"Unknown execution capability: {capability_name}"
                 )
-            
-            # Special handling for execution_submit - pass analysis container
-            if capability_name == "execution_submit":
-                analysis = self._pick_container(containers, "analysis")
-                if analysis is not None:
-                    args = {**args, "container": analysis}
-                else:
-                    # Log warning but continue - will use fallback mode
-                    print(f"Warning: No analysis container available for Kazakhstan execution_submit, using fallback mode")
             
             # Call the tool function directly
             tool_func = tool_functions[capability_name]
@@ -1233,7 +2020,6 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "code_executed": code,
                         "execution_submitted": True,
                         "submission_timestamp": time.time(),
-                        "region": "kazakhstan",
                     }
             
             return CapabilityResult(
@@ -1246,196 +2032,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             return CapabilityResult(
                 capability_name,
                 success=False,
-                error=f"Kazakhstan execution capability failed: {str(e)}",
+                error=f"Execution capability failed: {str(e)}",
             )
-    
-    def _exec_submit_rewrite(
-        self,
-        containers: list[Container],
-        args: dict[str, Any],
-        ctx: CapabilityExecutionContext,
-    ) -> CapabilityResult:
-        """Submit Kazakhstan rewritten experiment record. Auto-generates graph node and appends BIC."""
-        import pickle
-        import json
-        from pathlib import Path
-        from datetime import datetime
-        
-        # `prompt`/`response` arrive as flat top-level args (see the
-        # submit_rewrite capability schema for why it is not nested).
-        training_pair = {
-            "prompt": args.get("prompt", ""),
-            "response": args.get("response", ""),
-        }
-
-        phase_records = ctx.episode_context.get("phase_records", {})
-        hypothesise = phase_records.get("hypothesise", {})
-        code = phase_records.get("code", {})
-        translate = phase_records.get("translate", {})
-        evaluate = phase_records.get("evaluate", {})
-
-        # Auto-generate graph node from phase records
-        graph_node = {
-            "hypothesis": hypothesise.get("hypothesis", ""),
-            "data_spec": hypothesise.get("data_spec", {}),
-            "experiment_summary": code.get("result_summary", ""),
-            "feature_layer_name": translate.get("feature_layer_name", ""),
-            "region": "kazakhstan",
-            "outcome": {
-                "bic_delta": evaluate.get("bic_delta"),
-                "admitted": evaluate.get("admitted", False),
-                "mutual_info": evaluate.get("mutual_info", {}),
-            },
-        }
-
-        # Auto-append BIC result to training pair response
-        bic_delta = evaluate.get("bic_delta")
-        admitted = evaluate.get("admitted", False)
-        if isinstance(training_pair.get("response"), str) and bic_delta is not None:
-            verdict = "Admitted" if admitted else "Not admitted"
-            training_pair["response"] += (
-                f"\n\nKazakhstan Result: {bic_delta:.4f} BIC delta. {verdict}."
-            )
-
-        # Prepare training record for persistence
-        episode_id = ctx.episode_context.get("episode_id", "")
-        store_dir = ctx.episode_context.get("store_dir", "")
-        
-        # Extract Kazakhstan data paths - need to get base data directory
-        if store_dir:
-            data_base_path = Path(store_dir).parent.parent  # from store/teniz_basin to data/kazakhstan/feature-hypothesis
-        else:
-            # Fallback to a path relative to this file. The previous hardcoded
-            # absolute `/home/jen/Desktop/...` path crashed with PermissionError
-            # on any host whose user isn't `jen`.
-            data_base_path = (
-                Path(__file__).resolve().parent.parent
-                / "data" / "kazakhstan" / "feature-hypothesis"
-            )
-        
-        # Extract scoring results (Kazakhstan doesn't have two-stage scoring yet, so simplified)
-        masking_test_passed = evaluate.get('masking_test_passed', True)
-        masking_test_improvement = evaluate.get('masking_test_improvement', 0.0)
-        masking_test_direction = evaluate.get('masking_test_direction', 'not_applicable')
-        stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
-        
-        training_record = {
-            'prompt': training_pair.get('prompt', ''),
-            'response': training_pair.get('response', ''),
-            'bic_delta': bic_delta,
-            'episode_id': episode_id,
-            'timestamp': time.time(),
-            'admitted': admitted,
-            'layer_name': translate.get('feature_layer_name', ''),
-            'region': 'kazakhstan',
-            # Simplified scoring results for Kazakhstan
-            'masking_test_passed': masking_test_passed,
-            'masking_test_improvement': masking_test_improvement,
-            'masking_test_direction': masking_test_direction,
-            'stage_completed': stage_completed,
-            'metadata': {
-                'hypothesis': hypothesise.get('hypothesis', ''),
-                'grid_bounds': ctx.episode_context.get('grid_spec', _KAZAKHSTAN_TENIZ_GRID),
-                'mutual_info': evaluate.get('mutual_info', {}),
-                'experiment_summary': code.get('result_summary', ''),
-                'grid_coverage': '116160_km2',
-                'voxel_resolution': '1.75km_x_1.66km_x_10m',
-                'dataset': 'kazakhstan_teniz_basin',
-                'scoring_version': 'bic_only_v1'  # Kazakhstan uses simplified scoring for now
-            }
-        }
-        
-        # Save training data (ALL Kazakhstan experiments)
-        try:
-            training_dir = data_base_path / "training"
-            training_dir.mkdir(parents=True, exist_ok=True)
-            training_file = training_dir / "training_pairs.pkl"
-
-            # Load existing records or create new list
-            existing_records = []
-            if training_file.exists():
-                with open(training_file, 'rb') as f:
-                    existing_records = pickle.load(f)
-            
-            # Append new Kazakhstan record
-            existing_records.append(training_record)
-            
-            # Save back to file
-            with open(training_file, 'wb') as f:
-                pickle.dump(existing_records, f)
-                
-        except Exception as e:
-            print(f"Warning: Failed to save Kazakhstan training data: {e}")
-        
-        # Save to knowledge graph (successful Kazakhstan experiments)
-        # For now, use simple admission criterion - can be enhanced later
-        if admitted and bic_delta is not None and bic_delta < 0:
-            try:
-                knowledge_dir = data_base_path / "knowledge" / "teniz_basin"
-                knowledge_dir.mkdir(parents=True, exist_ok=True)
-                experiments_file = knowledge_dir / "experiments.jsonl"
-                
-                # Generate node ID
-                node_id = f"kz_exp_{episode_id}" if episode_id else f"kz_exp_{int(time.time())}"
-                
-                # Get parent experiment IDs if this is a crossbreed episode
-                parent_experiments = hypothesise.get("parent_experiments", [])
-                parent_node_1 = parent_experiments[0] if len(parent_experiments) > 0 else None
-                parent_node_2 = parent_experiments[1] if len(parent_experiments) > 1 else None
-                
-                # Create Kazakhstan knowledge graph record
-                kg_record = {
-                    "node_id": node_id,
-                    "prompt": training_pair.get('prompt', ''),
-                    "response": training_pair.get('response', ''),
-                    "bic_delta": bic_delta,
-                    "region": "kazakhstan",
-                    "grid_coverage": "116160_km2",
-                    "voxel_resolution": "1.75km_x_1.66km_x_10m",
-                    "scoring_version": "bic_only_v1",
-                    "artifact_links": {
-                        "layer_file": f"store/teniz_basin/layers/{translate.get('feature_layer_name', '')}.npy" if translate.get('feature_layer_name') else None,
-                        "spatial_ops": f"store/teniz_basin/spatial.db:experiment_{episode_id}" if episode_id else None
-                    },
-                    "parent_node_1": parent_node_1,
-                    "parent_node_2": parent_node_2,
-                    "timestamp": datetime.now().isoformat(),
-                    "mutual_info": evaluate.get('mutual_info', {}),
-                    "layer_name": translate.get('feature_layer_name', ''),
-                    "hypothesis": hypothesise.get('hypothesis', ''),
-                    "dataset": "kazakhstan_teniz_basin"
-                }
-                
-                # Append to experiments.jsonl
-                with open(experiments_file, 'a') as f:
-                    f.write(json.dumps(kg_record) + '\n')
-                
-                # TODO: Implement Kazakhstan crossbreed index calculation
-                # self._update_crossbreed_index_kazakhstan(knowledge_dir, node_id, translate.get('feature_layer_name', ''), evaluate.get('mutual_info', {}))
-                
-            except Exception as e:
-                print(f"Warning: Failed to save Kazakhstan knowledge graph data: {e}")
-
-        ctx.episode_context["terminal_record"] = {
-            "graph_node": graph_node,
-            "training_pair": training_pair,
-            "timestamp": time.time(),
-            "region": "kazakhstan",
-        }
-
-        return CapabilityResult(
-            "submit_rewrite",
-            output={
-                "recorded": True, 
-                "training_saved": True, 
-                "knowledge_saved": (admitted and bic_delta is not None and bic_delta < 0),
-                "region": "kazakhstan",
-                "grid_coverage": "116160_km2",
-                "bic_delta": bic_delta,
-                "admitted": admitted,
-            },
-            success=True,
-        )
     
     def _exec_spatial_capability(
         self,
@@ -1444,9 +2042,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         ctx: CapabilityExecutionContext,
         capability_name: str,
     ) -> CapabilityResult:
-        """Execute spatial tool capability via voxel-features-mcp with Kazakhstan grid."""
+        """Execute spatial tool capability via voxel-features-mcp."""
         
-        print(f"🔧 DEBUG: Starting Kazakhstan spatial capability: {capability_name}")
+        print(f"🔧 DEBUG: Starting spatial capability: {capability_name}")
         print(f"🔧 DEBUG: Args: {args}")
         
         # Set up environment for spatial operations
@@ -1468,29 +2066,38 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 spatial_coord_to_voxel, spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
-            
+
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
+            episode_id = ctx.episode_context.get("episode_id", "")
             print(f"🔧 DEBUG: Episode context keys: {list(ctx.episode_context.keys())}")
             print(f"🔧 DEBUG: Store dir: {store_dir}")
-            if not store_dir:
+            if not store_dir or not episode_id:
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error="No store directory available in episode context",
+                    error="No store directory or episode_id available in episode context",
                 )
-            
-            # Create or get spatial store with Kazakhstan grid
-            print("🔧 DEBUG: Creating SpatialVoxelStore with Kazakhstan grid...")
-            # Create GridSpec object from Kazakhstan grid dictionary
-            kazakhstan_grid_spec = GridSpec(
-                origin=tuple(_KAZAKHSTAN_TENIZ_GRID["origin"]),
-                maximum=tuple(_KAZAKHSTAN_TENIZ_GRID["maximum"]), 
-                shape=tuple(_KAZAKHSTAN_TENIZ_GRID["shape"]),
-                crs=_KAZAKHSTAN_TENIZ_GRID["crs"]
+
+            # Resolve the variation's grid from episode context. Falls back to
+            # the Kazakhstan default if (somehow) absent — but never to Coe
+            # Fairbairn, which was the bug in upstream feature_hypothesis.py.
+            grid_dict = ctx.episode_context.get("grid_spec") or _KAZAKHSTAN_TENIZ_GRID
+            grid = GridSpec.from_dict(grid_dict)
+
+            # Per-episode scratch with the admitted pool as read-only
+            # overlay — isolates this slot's in-flight mutations from
+            # every other slot's. See
+            # docs/design/feature_hypothesis_voxel_store_isolation.md.
+            scratch_dir = Path(store_dir) / "scratch" / episode_id
+            admitted_dir = Path(store_dir) / "admitted"
+            admitted_dir.mkdir(parents=True, exist_ok=True)
+
+            print("🔧 DEBUG: Creating SpatialVoxelStore...")
+            store = SpatialVoxelStore(
+                scratch_dir, grid, read_only_overlay=admitted_dir
             )
-            store = SpatialVoxelStore(store_dir, kazakhstan_grid_spec)
-            print(f"🔧 DEBUG: ✅ Kazakhstan store created, grid shape: {store.grid.shape}")
+            print(f"🔧 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
             
             # Validate coordinates if this is a spatial operation with coordinates
@@ -1499,17 +2106,17 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     lon, lat = args["longitude"], args["latitude"]
                     in_bounds = (store.grid.origin[0] <= lon <= store.grid.maximum[0] and 
                                 store.grid.origin[1] <= lat <= store.grid.maximum[1])
-                    print(f"🔧 DEBUG: Kazakhstan coordinate validation - lon={lon:.6f}, lat={lat:.6f}, in_bounds={in_bounds}")
+                    print(f"🔧 DEBUG: Coordinate validation - lon={lon:.6f}, lat={lat:.6f}, in_bounds={in_bounds}")
                     
                     if not in_bounds:
                         return CapabilityResult(
                             capability_name,
                             success=False,
-                            error=f"Coordinates ({lon:.6f}, {lat:.6f}) outside Kazakhstan grid bounds",
+                            error=f"Coordinates ({lon:.6f}, {lat:.6f}) outside grid bounds",
                         )
             
             # Route to appropriate spatial tool function
-            print(f"🔧 DEBUG: Routing to Kazakhstan tool: {capability_name}")
+            print(f"🔧 DEBUG: Routing to tool: {capability_name}")
             if capability_name == "spatial_add_point":
                 print("🔧 DEBUG: Calling spatial_add_point...")
                 result = spatial_add_point(store, **args)
@@ -1530,10 +2137,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error=f"Unknown Kazakhstan spatial capability: {capability_name}",
+                    error=f"Unknown spatial capability: {capability_name}",
                 )
             
-            print(f"🔧 DEBUG: ✅ Kazakhstan tool result: {result}")
+            print(f"🔧 DEBUG: ✅ Tool result: {result}")
             
             # Update translate phase with layer name for later evaluation
             if result.get("success") and result.get("layer_name"):
@@ -1542,7 +2149,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 if not translate_record.get("feature_layer_name"):
                     translate_record["feature_layer_name"] = result["layer_name"]
                     translate_record["timestamp"] = __import__('time').time()
-                    print(f"🔧 DEBUG: Stored Kazakhstan layer name '{result['layer_name']}' for later evaluation")
+                    print(f"🔧 DEBUG: Stored layer name '{result['layer_name']}' for later evaluation")
             
             # Return result
             return CapabilityResult(
@@ -1552,13 +2159,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             )
             
         except Exception as e:
-            print(f"🔧 DEBUG: ❌ Exception in Kazakhstan spatial capability: {e}")
+            print(f"🔧 DEBUG: ❌ Exception in spatial capability: {e}")
             import traceback
             traceback.print_exc()
             return CapabilityResult(
                 capability_name,
                 success=False,
-                error=f"Kazakhstan spatial capability execution failed: {str(e)}",
+                error=f"Spatial capability execution failed: {str(e)}",
             )
     
     def _exec_scoring_capability(
@@ -1568,9 +2175,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         ctx: CapabilityExecutionContext,
         capability_name: str,
     ) -> CapabilityResult:
-        """Execute scoring tool capability via voxel-features-mcp with Kazakhstan grid."""
+        """Execute scoring tool capability via voxel-features-mcp."""
         
-        print(f"🎯 DEBUG: Starting Kazakhstan scoring capability: {capability_name}")
+        print(f"🎯 DEBUG: Starting scoring capability: {capability_name}")
         print(f"🎯 DEBUG: Args: {args}")
         
         # Set up environment for scoring operations
@@ -1591,33 +2198,35 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 scoring_create_feature_layer
             )
             print("🎯 DEBUG: ✅ Imports successful")
-            
+
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
-            print(f"🎯 DEBUG: Kazakhstan store dir: {store_dir}")
-            if not store_dir:
+            episode_id = ctx.episode_context.get("episode_id", "")
+            print(f"🎯 DEBUG: Store dir: {store_dir}")
+            if not store_dir or not episode_id:
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error="No store directory available in episode context",
+                    error="No store directory or episode_id available in episode context",
                 )
-            
-            # Create or get spatial store with Kazakhstan grid
-            print("🎯 DEBUG: Creating SpatialVoxelStore with Kazakhstan grid...")
-            # Create GridSpec object from Kazakhstan grid dictionary
-            kazakhstan_grid_spec = GridSpec(
-                origin=tuple(_KAZAKHSTAN_TENIZ_GRID["origin"]),
-                maximum=tuple(_KAZAKHSTAN_TENIZ_GRID["maximum"]), 
-                shape=tuple(_KAZAKHSTAN_TENIZ_GRID["shape"]),
-                crs=_KAZAKHSTAN_TENIZ_GRID["crs"]
+
+            grid_dict = ctx.episode_context.get("grid_spec") or _KAZAKHSTAN_TENIZ_GRID
+            grid = GridSpec.from_dict(grid_dict)
+
+            scratch_dir = Path(store_dir) / "scratch" / episode_id
+            admitted_dir = Path(store_dir) / "admitted"
+            admitted_dir.mkdir(parents=True, exist_ok=True)
+
+            print("🎯 DEBUG: Creating SpatialVoxelStore...")
+            store = SpatialVoxelStore(
+                scratch_dir, grid, read_only_overlay=admitted_dir
             )
-            store = SpatialVoxelStore(store_dir, kazakhstan_grid_spec)
-            print(f"🎯 DEBUG: ✅ Kazakhstan store created, grid shape: {store.grid.shape}")
+            print(f"🎯 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             
             # Route to scoring.create_feature_layer MCP tool
-            print(f"🎯 DEBUG: Routing to Kazakhstan tool: {capability_name}")
+            print(f"🎯 DEBUG: Routing to tool: {capability_name}")
             if capability_name == "scoring_create_feature_layer":
-                print("🎯 DEBUG: Calling scoring_create_feature_layer MCP function with Kazakhstan grid...")
+                print("🎯 DEBUG: Calling scoring_create_feature_layer MCP function...")
                 result = scoring_create_feature_layer(store, **args)
                 # BIC scoring returns numpy scalars (np.bool_/np.float64); coerce
                 # to native types so the result — and the evaluate phase record
@@ -1628,10 +2237,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error=f"Unknown Kazakhstan scoring capability: {capability_name}",
+                    error=f"Unknown scoring capability: {capability_name}",
                 )
             
-            print(f"🎯 DEBUG: ✅ Kazakhstan tool result: {result}")
+            print(f"🎯 DEBUG: ✅ Tool result: {result}")
             
             # Store evaluation results in episode context for rewrite phase
             if result.get("success"):
@@ -1646,7 +2255,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 
                 # Store evaluation results
                 phase_records["evaluate"] = result
-                print(f"🎯 DEBUG: Stored Kazakhstan evaluation data in phase records")
+                print(f"🎯 DEBUG: Stored evaluation data in phase records")
             
             # Return result
             return CapabilityResult(
@@ -1656,13 +2265,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             )
             
         except Exception as e:
-            print(f"🎯 DEBUG: ❌ Exception in Kazakhstan scoring capability: {e}")
+            print(f"🎯 DEBUG: ❌ Exception in scoring capability: {e}")
             import traceback
             traceback.print_exc()
             return CapabilityResult(
                 capability_name,
                 success=False,
-                error=f"Kazakhstan scoring capability execution failed: {str(e)}",
+                error=f"Scoring capability execution failed: {str(e)}",
             )
     
     # ------------------------------------------------------------------
@@ -1714,6 +2323,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             cv_mse_delta=evaluate.get("cv_mse_delta"),
             mutual_info=evaluate.get("mutual_info", {}),
             admitted=evaluate.get("admitted", False),
+            # Two-stage scoring results
+            masking_test_passed=evaluate.get("masking_test_passed", True),
+            masking_test_improvement=evaluate.get("masking_test_improvement", 0.0),
+            masking_test_direction=evaluate.get("masking_test_direction", "not_applicable"),
+            stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
+            prompt_response_pair=terminal_record.get("training_pair", {}),
         )
     
     def compute_reward(
@@ -1722,54 +2337,160 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         final: FeatureHypothesisKazakhstanState,
         artifacts: EpisodeArtifacts,
     ) -> TaskReward:
-        """Compute reward based on BIC results for Kazakhstan regional analysis."""
+        """Compute reward based on two-stage scoring results."""
         
+        # Extract two-stage scoring results
         bic_delta = final.bic_delta
+        masking_test_passed = final.masking_test_passed
+        masking_test_improvement = final.masking_test_improvement
         admitted = final.admitted
+        stage_completed = final.stage_completed
         
         if bic_delta is None:
             # No feature layer created
             return TaskReward(
                 value=0.0, 
                 success=False, 
-                breakdown={"no_feature": True, "region": "kazakhstan"}
+                breakdown={
+                    "no_feature": True,
+                    "stage_completed": stage_completed
+                }
             )
         
-        # Regional-scale reward calculation
-        if admitted:
-            # Feature was admitted (improved regional compression)
-            # Scale reward based on BIC improvement for regional features
-            # Regional features may have different BIC scales than deposit-scale
-            reward_value = min(1.0, max(0.0, -bic_delta / 20.0))
+        # Two-stage reward calculation
+        if masking_test_passed and admitted:
+            # Both stages passed - full success
+            # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
+            stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))  # Stage 2 contribution
+            
+            # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
+            value = 0.4 * stage1_reward + 0.6 * stage2_reward
             
             return TaskReward(
-                value=reward_value,
+                value=value,
                 success=True,
                 breakdown={
+                    "stage_1_passed": True,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": True,
                     "bic_delta": bic_delta,
-                    "admitted": True,
-                    "region": "kazakhstan",
-                    "scale": "basin_regional",
-                    "reward": reward_value,
+                    "stage1_reward": stage1_reward,
+                    "stage2_reward": stage2_reward,
+                    "final_reward": value,
+                    "both_stages_passed": True,
+                },
+            )
+        elif masking_test_passed and not admitted:
+            # Stage 1 passed but Stage 2 failed - partial success
+            # Reward for predictive capacity even if complexity penalty too high
+            stage1_reward = min(1.0, masking_test_improvement)
+            value = 0.3 * stage1_reward  # Reduced reward for Stage 1 only
+            
+            return TaskReward(
+                value=value,
+                success=False,
+                breakdown={
+                    "stage_1_passed": True,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": False,
+                    "bic_delta": bic_delta,
+                    "stage1_reward": stage1_reward,
+                    "partial_success": True,
                 },
             )
         else:
-            # Feature was rejected (worse compression)
+            # Stage 1 failed - no geological understanding
             return TaskReward(
-                value=0.05,  # Small reward for attempting
+                value=0.05,  # Very small reward for attempting
                 success=False,
                 breakdown={
+                    "stage_1_passed": False,
+                    "stage_1_improvement": masking_test_improvement,
+                    "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
-                    "admitted": False,
-                    "region": "kazakhstan",
-                    "scale": "basin_regional",
+                    "no_predictive_value": True,
                 },
             )
-    
+
+    def finalize_episode(
+        self,
+        containers: list[Container],
+        initial: FeatureHypothesisKazakhstanState,
+        episode_context: dict[str, Any],
+        artifacts: EpisodeArtifacts,
+        *,
+        private_context: dict[str, Any] | None = None,
+        finalization_context: Any | None = None,
+    ) -> TaskReward:
+        try:
+            final = self.measure_final_state(
+                containers, episode_context, artifacts, private_context=private_context
+            )
+            reward = self.compute_reward(initial, final, artifacts)
+            breakdown = dict(reward.breakdown or {})
+            # The framework's max_bootstrap_episodes guard inspects
+            # task_breakdown["bootstrap_active"] (src/execution/generation.py).
+            # For feature_hypothesis, "bootstrap" == the early phase before
+            # the feature pool reaches min_features (workflow_kind="survey").
+            breakdown["bootstrap_active"] = final.workflow_kind == "survey"
+            if episode_context.get("duplicate_rejected"):
+                breakdown["duplicate_rejected"] = True
+            if breakdown != (reward.breakdown or {}):
+                reward = TaskReward(
+                    value=reward.value,
+                    success=reward.success,
+                    breakdown=breakdown,
+                )
+            return reward
+        finally:
+            # Always release the bootstrap permit so a crashed or short-
+            # circuited episode does not hold the in-flight slot until it
+            # ages out via stale_after_s.
+            permit_slot_id = episode_context.get("bootstrap_permit_slot_id")
+            kg_dir_ctx = episode_context.get("kg_dir")
+            if isinstance(permit_slot_id, str) and isinstance(kg_dir_ctx, str) and kg_dir_ctx:
+                try:
+                    self._release_bootstrap_permit(Path(kg_dir_ctx), permit_slot_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"feature_hypothesis: bootstrap permit release failed "
+                        f"({permit_slot_id}): {exc}"
+                    )
+            # Reclaim the per-episode scratch dir. Runs unconditionally so
+            # a crashed mid-episode leaves no orphans.
+            try:
+                self.cleanup_episode_resources(episode_context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"feature_hypothesis: scratch cleanup failed: {exc}"
+                )
+
+    def cleanup_episode_resources(
+        self, episode_context: dict[str, Any]
+    ) -> None:
+        """Remove the per-episode scratch dir.
+
+        Idempotent. Designed to run from ``finalize_episode``'s ``finally``
+        block — success or failure of the episode is irrelevant. The
+        admitted pool is *never* touched here; promotion is the only path
+        from scratch to admitted.
+        """
+        import shutil
+
+        store_dir = episode_context.get("store_dir")
+        episode_id = episode_context.get("episode_id")
+        if not isinstance(store_dir, str) or not isinstance(episode_id, str):
+            return
+        # ``episode_id`` already carries an ``ep_<ts>_<hex>`` prefix from
+        # ``populate``, so the scratch dir is simply ``scratch/<episode_id>``.
+        scratch_dir = Path(store_dir) / "scratch" / episode_id
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
-    
+
     def _pick_container(
         self,
         containers: list[Container],
@@ -1782,48 +2503,30 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             if container_to_service(container) == service:
                 return container
         return None
-    
+
     def _count_features(self, variation: FeatureHypothesisKazakhstanVariation) -> int:
-        """Count existing features in the Kazakhstan store."""
-        store_index = Path(variation.store_dir) / "index.json"
-        if not store_index.exists():
-            return 0
-        try:
-            with open(store_index) as f:
-                data = json.load(f)
-            return len(data.get("layers", {}))
-        except Exception:
-            return 0
-    
-    def _generate_survey_prompt_with_context(self) -> str:
-        """Generate survey prompt with recent Kazakhstan experiments context."""
-        base_prompt = (
-            "Phase 1: Survey\n\n"
-            "Explore the Kazakhstan Teniz Basin dataset to identify regional feature opportunities.\n\n"
-            "Use analysis_shell to:\n"
-            "- Read file headers and schemas\n"
-            "- Identify interesting regional patterns\n"
-            "- Focus on basin-scale geological features\n\n"
-        )
-        
-        # For Kazakhstan, we'll start simple without experiment history
-        # This can be enhanced later with Kazakhstan-specific experiment tracking
-        
-        base_prompt += (
-            "Find 2-3 promising regional feature layer candidates.\n\n"
-            "Focus on:\n"
-            "- Sediment-hosted copper systems\n"
-            "- Basin-scale structural geology\n"
-            "- Regional geological trends\n\n"
-            "Close with:\n"
-            "  record_phase(phase='survey', candidates=[...])"
-        )
-        
-        return base_prompt
+        """Count features in the admitted pool.
+
+        Pre-isolation, layers lived directly under ``store_dir``; the
+        legacy path is checked as a fallback so existing runs whose
+        ``index.json`` was never migrated still report a non-zero count.
+        """
+        admitted_index = Path(variation.store_dir) / "admitted" / "index.json"
+        legacy_index = Path(variation.store_dir) / "index.json"
+        for path in (admitted_index, legacy_index):
+            if not path.exists():
+                continue
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                return len(data.get("layers", {}))
+            except Exception:
+                continue
+        return 0
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> bool:
-        """Check if there are crossbreed pairs available for Kazakhstan."""
-        experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+        """Check if there are crossbreed pairs available."""
+        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
         if not experiments_file.exists():
             return False
         try:
@@ -1847,16 +2550,17 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         self,
         variation: FeatureHypothesisKazakhstanVariation,
     ) -> dict[str, Any]:
-        """Get crossbreed prompt and parent IDs for Kazakhstan experiments."""
+        """Get crossbreed prompt and parent IDs using JSONL knowledge graph."""
         import json
         
         try:
-            experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
-            
+            experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
+            crossbreed_file = Path(variation.kg_dir) / _KG_CROSSBREED_INDEX
+
             if not experiments_file.exists():
                 return {}
             
-            # Load successful Kazakhstan experiments
+            # Load all successful experiments
             experiments = []
             with open(experiments_file, 'r') as f:
                 for line in f:
@@ -1872,98 +2576,658 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             if len(experiments) < 2:
                 return {}
             
-            # Get already used crossbreed pairs
-            used_pairs = self._get_used_crossbreed_pairs(variation)
+            # Load mutual information index if available
+            mi_index = {}
+            if crossbreed_file.exists():
+                with open(crossbreed_file, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                mi_record = json.loads(line)
+                                pair_id = mi_record["pair_id"]
+                                mi_index[pair_id] = mi_record["mutual_information"]
+                            except (json.JSONDecodeError, KeyError):
+                                continue
             
-            # Find best unused crossbreed pair (maximum combined BIC improvement)
+            # Find best crossbreed pair (high BIC improvement + low MI)
             best_pair = None
             best_score = float('-inf')
             
             for i, exp_a in enumerate(experiments):
                 for exp_b in experiments[i+1:]:
-                    # Skip if this pair was already crossbred
-                    if self._is_pair_already_used(exp_a['node_id'], exp_b['node_id'], used_pairs):
-                        continue
-                    
                     # Calculate combined BIC improvement
                     bic_a = abs(exp_a.get("bic_delta", 0))
                     bic_b = abs(exp_b.get("bic_delta", 0))
                     combined_bic = bic_a + bic_b
                     
-                    if combined_bic > best_score:
-                        best_score = combined_bic
+                    # Get mutual information (prefer low MI = orthogonal features)
+                    pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
+                    mi_score = mi_index.get(pair_id, 0.0)
+                    
+                    # Combined score: high BIC improvement, low MI
+                    pair_score = combined_bic - mi_score
+                    
+                    if pair_score > best_score:
+                        best_score = pair_score
                         best_pair = (exp_a, exp_b)
-            
-            # If no unused pairs found, fall back to highest BIC pair with warning
-            if not best_pair:
-                print("Warning: All Kazakhstan high-BIC pairs already used, selecting highest BIC pair")
-                for i, exp_a in enumerate(experiments):
-                    for exp_b in experiments[i+1:]:
-                        bic_a = abs(exp_a.get("bic_delta", 0))
-                        bic_b = abs(exp_b.get("bic_delta", 0))
-                        combined_bic = bic_a + bic_b
-                        
-                        if combined_bic > best_score:
-                            best_score = combined_bic
-                            best_pair = (exp_a, exp_b)
             
             if not best_pair:
                 return {}
             
             exp_a, exp_b = best_pair
             
-            print(f"Selected Kazakhstan crossbreed pair: {exp_a['node_id']} (BIC: {abs(exp_a.get('bic_delta', 0)):.2f}) + {exp_b['node_id']} (BIC: {abs(exp_b.get('bic_delta', 0)):.2f})")
-            
-            crossbreed_prompt = (
-                f"Combine insights from these successful Kazakhstan experiments:\n\n"
-                f"Experiment A: {exp_a.get('hypothesis', 'Unknown')}\n"
-                f"Result A: BIC delta {exp_a.get('bic_delta', 'N/A')}\n\n"
-                f"Experiment B: {exp_b.get('hypothesis', 'Unknown')}\n"
-                f"Result B: BIC delta {exp_b.get('bic_delta', 'N/A')}\n\n"
-                f"Create a new hypothesis that combines or builds on these findings "
-                f"for Kazakhstan basin-scale analysis."
+            prompt = (
+                f"These experiments both improved the world model:\n\n"
+                f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_a.get('layer_name', '')}\n"
+                f"- BIC improvement: {abs(exp_a.get('bic_delta', 0)):.2f}\n\n"
+                f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_b.get('layer_name', '')}\n"
+                f"- BIC improvement: {abs(exp_b.get('bic_delta', 0)):.2f}\n\n"
+                f"Given that both patterns exist in the data, what new hypothesis "
+                f"would you propose that combines or builds on these findings?"
             )
             
             return {
-                "prompt": crossbreed_prompt,
+                "prompt": prompt,
                 "parent_ids": [exp_a["node_id"], exp_b["node_id"]],
             }
-            
         except Exception as e:
-            print(f"Warning: Could not load Kazakhstan crossbreed context: {e}")
-            return {}
+            print(f"Warning: JSONL crossbreed failed, using simple fallback: {e}")
+            return self._get_crossbreed_context_simple(variation)
     
-    def _get_used_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> set[tuple[str, str]]:
-        """Extract already used crossbreed pairs from Kazakhstan knowledge graph."""
-        import json
-        used_pairs = set()
+    def _get_crossbreed_context_simple(
+        self,
+        variation: FeatureHypothesisKazakhstanVariation,
+    ) -> dict[str, Any]:
+        """Simple fallback crossbreed selection - just first two admitted."""
+        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
+        if not experiments_file.exists():
+            return {}
         
         try:
-            experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
-            if not experiments_file.exists():
-                return used_pairs
-            
+            # Load first two successful experiments from JSONL
+            experiments = []
             with open(experiments_file, 'r') as f:
                 for line in f:
                     line = line.strip()
                     if line:
                         try:
                             exp = json.loads(line)
-                            parent_1 = exp.get("parent_node_1")
-                            parent_2 = exp.get("parent_node_2")
-                            if parent_1 and parent_2:
-                                # Normalize pair order for consistent checking
-                                pair = tuple(sorted([parent_1, parent_2]))
-                                used_pairs.add(pair)
+                            if exp.get("bic_delta", 0) < 0:  # Only successful experiments
+                                experiments.append(exp)
+                                if len(experiments) >= 2:
+                                    break  # Just need first two
                         except json.JSONDecodeError:
                             continue
-        except Exception as e:
-            print(f"Warning: Could not load used Kazakhstan crossbreed pairs: {e}")
-        
-        return used_pairs
-    
-    def _is_pair_already_used(self, node_a: str, node_b: str, used_pairs: set[tuple[str, str]]) -> bool:
-        """Check if a pair of Kazakhstan experiments has already been crossbred."""
-        # Normalize pair order for consistent checking
-        pair = tuple(sorted([node_a, node_b]))
-        return pair in used_pairs
+            
+            if len(experiments) < 2:
+                return {}
+            
+            exp_a, exp_b = experiments[0], experiments[1]
+            
+            prompt = (
+                f"These experiments both improved the world model:\n\n"
+                f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_a.get('layer_name', '')}\n\n"
+                f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
+                f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+                f"- Feature: {exp_b.get('layer_name', '')}\n\n"
+                f"Given that both patterns exist in the data, what new hypothesis "
+                f"would you propose that combines or builds on these findings?"
+            )
+            
+            return {
+                "prompt": prompt,
+                "parent_ids": [exp_a["node_id"], exp_b["node_id"]],
+            }
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _crossbreed_prompt(exp_a: dict[str, Any], exp_b: dict[str, Any]) -> str:
+        """Render the crossbreed prompt for a specific ordered (A, B) pair."""
+        return (
+            f"These experiments both improved the world model:\n\n"
+            f"Experiment 1: \"{exp_a.get('hypothesis', '')}\"\n"
+            f"- Result: {exp_a.get('response', '').split('.')[0] if exp_a.get('response') else 'N/A'}\n"
+            f"- Feature: {exp_a.get('layer_name', '')}\n"
+            f"- BIC improvement: {abs(float(exp_a.get('bic_delta', 0.0))):.2f}\n\n"
+            f"Experiment 2: \"{exp_b.get('hypothesis', '')}\"\n"
+            f"- Result: {exp_b.get('response', '').split('.')[0] if exp_b.get('response') else 'N/A'}\n"
+            f"- Feature: {exp_b.get('layer_name', '')}\n"
+            f"- BIC improvement: {abs(float(exp_b.get('bic_delta', 0.0))):.2f}\n\n"
+            f"Given that both patterns exist in the data, what new hypothesis "
+            f"would you propose that combines or builds on these findings?"
+        )
+
+    def _build_crossbreed_context_for_pair(
+        self,
+        kg_dir: Path,
+        parent_a_id: str,
+        parent_b_id: str,
+    ) -> dict[str, Any]:
+        """Build crossbreed_context for a specific parent pair, popped from the queue.
+
+        Falls back to an empty dict if either parent cannot be found in
+        experiments.jsonl (e.g. a stale queue entry whose record was pruned).
+        """
+        experiments = self._load_successful_experiments(kg_dir)
+        by_id = {exp.get("node_id"): exp for exp in experiments}
+        exp_a = by_id.get(parent_a_id)
+        exp_b = by_id.get(parent_b_id)
+        if not (isinstance(exp_a, dict) and isinstance(exp_b, dict)):
+            return {}
+        return {
+            "prompt": self._crossbreed_prompt(exp_a, exp_b),
+            "parent_ids": [parent_a_id, parent_b_id],
+        }
+
+    # ------------------------------------------------------------------
+    # Duplicate handling + bootstrap pacing
+    # ------------------------------------------------------------------
+    # All coordination is file-based so it survives across the parallel
+    # worker threads that share a single TaskSpec instance. Mirrors the
+    # `_pool_lock`/`_read_pool_index` pattern from `tasks/geology_graph.py`.
+
+    @contextmanager
+    def _kg_lock(self, kg_dir: Path | str) -> Iterator[None]:
+        kg_path = Path(kg_dir)
+        kg_path.mkdir(parents=True, exist_ok=True)
+        lock_path = kg_path / _KG_LOCK
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _atomic_write_json(path: Path, obj: Any) -> None:
+        """Tmp-then-replace JSON writer. Unique tmp per pid+uuid prevents
+        cross-process ENOENT races (see `geology_graph._write_pool_index`)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+
+    @staticmethod
+    def _atomic_write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+        with tmp.open("w", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(json.dumps(entry) + "\n")
+        tmp.replace(path)
+
+    @staticmethod
+    def _read_json_or(path: Path, default: dict[str, Any]) -> dict[str, Any]:
+        if not path.exists():
+            return dict(default)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return dict(default)
+        if not isinstance(data, dict):
+            return dict(default)
+        return data
+
+    @staticmethod
+    def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        out: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+        return out
+
+    @staticmethod
+    def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:
+        """SHA256 over ordered parents + whitespace-normalised hypothesis.
+
+        Order-sensitive: `(A, B)` and `(B, A)` hash differently because the
+        agent sees parents in order — the resulting hypotheses are legitimately
+        distinct experiments. Hypothesis normalisation stops at whitespace;
+        anything stronger (lower-case, stemming) risks false dedups.
+        """
+        parents = list(parent_experiments or [])
+        normalized = re.sub(r"\s+", " ", (hypothesis or "")).strip()
+        payload = "|".join(parents) + "::" + normalized
+        return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _admit_with_dedup(
+        self,
+        kg_dir: Path | str,
+        kg_record: dict,
+        *,
+        parents: list[str],
+        hypothesis: str,
+        scratch_dir: Path | str | None = None,
+        admitted_dir: Path | str | None = None,
+        layer_name: str | None = None,
+    ) -> bool:
+        """Append kg_record to experiments.jsonl iff (parents, hypothesis)
+        is unseen. Returns True if newly admitted, False on duplicate.
+
+        When ``scratch_dir`` / ``admitted_dir`` / ``layer_name`` are all
+        supplied, the candidate's ``.npy`` is *promoted* from scratch into
+        the admitted pool atomically inside the kg lock — only if the
+        fingerprint is fresh. Duplicates leave the scratch file in place
+        (the cleanup hook reclaims it after ``finalize_episode``).
+
+        Duplicates leave the episode's reward intact — the design intent
+        is "duplicates count as successes but do not flood the pool".
+        """
+        kg_path = Path(kg_dir)
+        fp = self._fingerprint(parents, hypothesis)
+
+        with self._kg_lock(kg_path):
+            ledger = self._read_json_or(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": []})
+            seen: list[str] = list(ledger.get("fingerprints", []))
+            if fp in seen:
+                return False
+            if (
+                scratch_dir is not None
+                and admitted_dir is not None
+                and isinstance(layer_name, str)
+                and layer_name
+            ):
+                self._promote_scratch_layer(
+                    Path(scratch_dir), Path(admitted_dir), layer_name
+                )
+            with (kg_path / _KG_EXPERIMENTS).open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(kg_record) + "\n")
+            seen.append(fp)
+            self._atomic_write_json(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": seen})
+        return True
+
+    @staticmethod
+    def _promote_scratch_layer(
+        scratch_dir: Path,
+        admitted_dir: Path,
+        layer_name: str,
+    ) -> None:
+        """Move ``scratch/layers/<name>.npy`` into ``admitted/layers/`` and
+        register it in ``admitted/index.json``. Called inside the kg lock.
+
+        The npy is moved (not copied) so the scratch dir contains no stale
+        copies after cleanup. The admitted ``index.json`` is updated via
+        ``SpatialVoxelStore`` so the layer metadata format stays consistent
+        with the rest of the codebase (e.g. content hashes, dtypes).
+        """
+        from voxel_features.spatial import SpatialVoxelStore
+        from voxel_features.store import GridSpec
+
+        scratch_npy = scratch_dir / "layers" / f"{layer_name}.npy"
+        if not scratch_npy.exists():
+            logger.warning(
+                f"feature_hypothesis: promote skipped — {scratch_npy} missing"
+            )
+            return
+
+        # Need the scratch store's grid to seed admitted when it doesn't
+        # yet exist. SpatialVoxelStore raises on missing index, so read
+        # the JSON directly here.
+        scratch_index = scratch_dir / "index.json"
+        if not scratch_index.exists():
+            logger.warning(
+                f"feature_hypothesis: promote skipped — {scratch_index} missing"
+            )
+            return
+        try:
+            scratch_data = json.loads(scratch_index.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                f"feature_hypothesis: promote skipped — bad scratch index: {exc}"
+            )
+            return
+        grid = GridSpec.from_dict(scratch_data["grid"])
+
+        # Build / open the admitted store and add the layer there. Use
+        # the npy values from scratch so the content hash matches.
+        import numpy as np
+
+        values = np.load(scratch_npy)
+        admitted_dir.mkdir(parents=True, exist_ok=True)
+        admitted_store = SpatialVoxelStore(admitted_dir, grid)
+        if layer_name in admitted_store.layer_names:
+            # Another slot promoted a same-named layer first. Skip the
+            # second promotion — the kg ledger still appends the new
+            # fingerprint, but the admitted pool keeps the first values.
+            scratch_npy.unlink(missing_ok=True)
+            return
+        scratch_layer_meta = (
+            scratch_data.get("layers", {}).get(layer_name, {})
+        )
+        admitted_store.add_layer(
+            name=layer_name,
+            values=values,
+            dtype=scratch_layer_meta.get("dtype", "float"),
+            metadata=scratch_layer_meta.get("metadata", {}),
+            hypothesis_uri=scratch_layer_meta.get("hypothesis_uri"),
+            experiment_id=scratch_layer_meta.get("experiment_id"),
+        )
+        scratch_npy.unlink(missing_ok=True)
+
+    # ----- Bootstrap concurrency ramp ---------------------------------
+
+    @staticmethod
+    def _bootstrap_target_active(
+        bootstrap_episodes_seen: int,
+        configured_slots: int,
+        window_size: int,
+        min_fraction: float,
+    ) -> int:
+        """Active-slot target as the bootstrap window progresses.
+
+        progress = seen / window  ∈ [0, 1]
+        fraction = min_fraction + (1 - min_fraction) * progress  ∈ [min, 1]
+        target   = ceil(configured_slots * fraction)
+
+        window_size <= 0 means "no ramp" — every slot is allowed.
+        """
+        if window_size <= 0 or configured_slots <= 0:
+            return max(0, configured_slots)
+        progress = min(max(bootstrap_episodes_seen / window_size, 0.0), 1.0)
+        fraction = min_fraction + (1.0 - min_fraction) * progress
+        return max(1, math.ceil(configured_slots * fraction))
+
+    def _read_bootstrap_state(self, kg_dir: Path) -> dict[str, Any]:
+        data = self._read_json_or(
+            kg_dir / _KG_BOOTSTRAP_STATE,
+            {"bootstrap_episodes_seen": 0, "in_flight": []},
+        )
+        data.setdefault("bootstrap_episodes_seen", 0)
+        data.setdefault("in_flight", [])
+        return data
+
+    def _acquire_bootstrap_permit(
+        self,
+        kg_dir: Path | str,
+        slot_id: str,
+        configured_slots: int,
+        window_size: int,
+        min_fraction: float,
+        timeout_s: float = 600.0,
+        stale_after_s: float = 1800.0,
+        poll_interval_s: float = 0.5,
+    ) -> bool:
+        """Block until in-flight slots < target, then claim a permit.
+
+        Returns False on timeout. The caller MUST call
+        `_release_bootstrap_permit(slot_id)` once the episode finishes,
+        or the in-flight entry will linger until it ages out via
+        ``stale_after_s``. The 0.5 s poll interval is deliberate: the ramp
+        unit is "episodes", not subseconds, so faster polling just burns
+        lock contention with no scheduling benefit.
+        """
+        kg_path = Path(kg_dir)
+        state_path = kg_path / _KG_BOOTSTRAP_STATE
+        deadline = time.monotonic() + max(timeout_s, 0.0)
+
+        while True:
+            with self._kg_lock(kg_path):
+                state = self._read_bootstrap_state(kg_path)
+                now = time.time()
+                raw_in_flight = list(state.get("in_flight", []))
+                # Reap stale entries: a crashed slot leaves its permit
+                # behind; without this the run deadlocks.
+                in_flight = [
+                    entry
+                    for entry in raw_in_flight
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("acquired_at"), (int, float))
+                    and (now - float(entry["acquired_at"])) < stale_after_s
+                ]
+                target = self._bootstrap_target_active(
+                    bootstrap_episodes_seen=int(state.get("bootstrap_episodes_seen", 0)),
+                    configured_slots=configured_slots,
+                    window_size=window_size,
+                    min_fraction=min_fraction,
+                )
+                if len(in_flight) < target:
+                    in_flight.append({"slot_id": slot_id, "acquired_at": now})
+                    state["in_flight"] = in_flight
+                    # `bootstrap_episodes_seen` increments on RELEASE, not
+                    # acquire — otherwise the ramp accelerates with raw
+                    # parallelism and lets configured concurrency in before
+                    # any episode has actually completed.
+                    self._atomic_write_json(state_path, state)
+                    return True
+                # Persist the reap so other slots benefit when they next
+                # acquire — but only if we actually changed anything.
+                if in_flight != raw_in_flight:
+                    state["in_flight"] = in_flight
+                    self._atomic_write_json(state_path, state)
+
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll_interval_s)
+
+    def _release_bootstrap_permit(self, kg_dir: Path | str, slot_id: str) -> None:
+        kg_path = Path(kg_dir)
+        state_path = kg_path / _KG_BOOTSTRAP_STATE
+        if not state_path.exists():
+            return
+        with self._kg_lock(kg_path):
+            state = self._read_bootstrap_state(kg_path)
+            before = state.get("in_flight", [])
+            after = [
+                entry
+                for entry in before
+                if not (isinstance(entry, dict) and entry.get("slot_id") == slot_id)
+            ]
+            state["in_flight"] = after
+            # Each *completed* episode (release) advances the ramp. Acquires
+            # that never complete (stale, reaped) do not bump the counter.
+            if len(after) != len(before):
+                state["bootstrap_episodes_seen"] = (
+                    int(state.get("bootstrap_episodes_seen", 0)) + 1
+                )
+            self._atomic_write_json(state_path, state)
+
+    # ----- Crossbreed queue -------------------------------------------
+
+    @classmethod
+    def _load_successful_experiments(cls, kg_dir: Path) -> list[dict[str, Any]]:
+        return [
+            rec
+            for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS)
+            if rec.get("bic_delta", 0) < 0
+        ]
+
+    @classmethod
+    def _load_mi_index(cls, kg_dir: Path) -> dict[str, float]:
+        mi: dict[str, float] = {}
+        for rec in cls._read_jsonl_records(kg_dir / _KG_CROSSBREED_INDEX):
+            pair_id = rec.get("pair_id")
+            if not isinstance(pair_id, str):
+                continue
+            try:
+                mi[pair_id] = float(rec.get("mutual_information", 0.0))
+            except (TypeError, ValueError):
+                continue
+        return mi
+
+    @staticmethod
+    def _ordered_pair_id(a: str, b: str) -> str:
+        # Pair ID is ORDERED — keeps (A,B) and (B,A) distinct in the queue.
+        return f"{a}->{b}"
+
+    def _enumerate_pairs(self, kg_dir: Path) -> list[dict[str, Any]]:
+        experiments = self._load_successful_experiments(kg_dir)
+        mi_index = self._load_mi_index(kg_dir)
+        out: list[dict[str, Any]] = []
+        for exp_a in experiments:
+            for exp_b in experiments:
+                if exp_a["node_id"] == exp_b["node_id"]:
+                    continue
+                bic_a = abs(float(exp_a.get("bic_delta", 0.0)))
+                bic_b = abs(float(exp_b.get("bic_delta", 0.0)))
+                # MI is symmetric and uses the alphabetically-sorted pair
+                # id (matches `_update_crossbreed_index`).
+                mi_pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
+                mi = mi_index.get(mi_pair_id, 0.0)
+                out.append({
+                    "pair_id": self._ordered_pair_id(exp_a["node_id"], exp_b["node_id"]),
+                    "parents": [exp_a["node_id"], exp_b["node_id"]],
+                    "score": (bic_a + bic_b) - mi,
+                    "popped_at": None,
+                    "attempt_count": 0,
+                })
+        out.sort(key=lambda entry: entry["score"], reverse=True)
+        return out
+
+    @classmethod
+    def _read_queue(cls, kg_dir: Path) -> list[dict[str, Any]]:
+        return cls._read_jsonl_records(kg_dir / _KG_QUEUE)
+
+    @classmethod
+    def _write_queue(cls, kg_dir: Path, entries: list[dict[str, Any]]) -> None:
+        cls._atomic_write_jsonl(kg_dir / _KG_QUEUE, entries)
+
+    @staticmethod
+    def _experiments_changed_since_queue(kg_dir: Path) -> bool:
+        """True if experiments.jsonl has been modified after the queue was last
+        written (or the queue does not yet exist). Lets us skip the O(N²)
+        re-enumeration when the experiment set is unchanged."""
+        queue_path = kg_dir / _KG_QUEUE
+        exp_path = kg_dir / _KG_EXPERIMENTS
+        if not queue_path.exists():
+            return True
+        if not exp_path.exists():
+            return False
+        return exp_path.stat().st_mtime > queue_path.stat().st_mtime
+
+    def _merge_new_pairs(
+        self,
+        kg_dir: Path,
+        existing: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Union existing queue entries with freshly-enumerated pairs.
+
+        Existing entries (including their popped_at state) are preserved;
+        new pairs from newly-admitted experiments are inserted. Re-sorted
+        by score desc.
+        """
+        merged = {entry.get("pair_id"): entry for entry in existing}
+        for entry in self._enumerate_pairs(kg_dir):
+            pid = entry["pair_id"]
+            if pid in merged:
+                # Refresh score in case MI/BIC moved; preserve popped state.
+                merged[pid]["score"] = entry["score"]
+            else:
+                merged[pid] = entry
+        return sorted(merged.values(), key=lambda e: e["score"], reverse=True)
+
+    def _queue_refill(self, kg_dir: Path | str) -> None:
+        """Re-enumerate ordered pairs and insert any missing ones into the queue.
+
+        Existing entries (popped or not) are preserved so partial progress
+        across episodes isn't lost. New experiments added between calls
+        introduce new pairs that take their place in score order.
+        """
+        kg_path = Path(kg_dir)
+        with self._kg_lock(kg_path):
+            self._write_queue(kg_path, self._merge_new_pairs(kg_path, self._read_queue(kg_path)))
+
+    def _queue_pop_pair(self, kg_dir: Path | str) -> tuple[str, str] | None:
+        """Pop the next pair under the kg lock.
+
+        Selection scores each entry as
+            score / (1 + α · attempt_count)              (unconsummated), or
+            score · β / (1 + α · attempt_count)          (consummated).
+        A pair is *consummated* when any admitted experiment in
+        experiments.jsonl already lists its two parents (in either order)
+        as parent_node_1, parent_node_2 — i.e. the joint info has been
+        captured by at least one descendant.
+
+        The chosen entry's ``attempt_count`` is bumped and ``popped_at``
+        stamped (popped_at is retained for telemetry only; the score-decay
+        replaces the earlier round-robin reset).
+
+        Returns ``(parent_a, parent_b)`` or None when fewer than two admitted
+        experiments exist.
+        """
+        kg_path = Path(kg_dir)
+        # Cheap pre-check outside the lock — if there are <2 experiments,
+        # there is no way to pop. Inside the lock we may still re-check after
+        # acquiring the queue, but this avoids the lock overhead in the
+        # common steady-state survey-only case.
+        if len(self._load_successful_experiments(kg_path)) < 2:
+            return None
+
+        with self._kg_lock(kg_path):
+            entries = self._read_queue(kg_path)
+            # Only re-enumerate (the O(N²) hot path) when experiments.jsonl
+            # has grown since the last queue write. In the steady state this
+            # skips the enumeration entirely.
+            if not entries or self._experiments_changed_since_queue(kg_path):
+                entries = self._merge_new_pairs(kg_path, entries)
+
+            if not entries:
+                return None
+
+            consummated = self._consummated_pairs(kg_path)
+            chosen = max(
+                entries,
+                key=lambda entry: self._effective_pair_score(entry, consummated),
+            )
+
+            chosen["attempt_count"] = int(chosen.get("attempt_count", 0)) + 1
+            chosen["popped_at"] = time.time()
+            self._write_queue(kg_path, entries)
+
+            parents = chosen.get("parents") or []
+            if len(parents) != 2:
+                return None
+            return str(parents[0]), str(parents[1])
+
+    @classmethod
+    def _consummated_pairs(cls, kg_dir: Path) -> set[frozenset[str]]:
+        """Unordered parent pairs that already have an admitted child.
+
+        Treats (A,B) and (B,A) as the same consummation — the joint
+        information has been captured regardless of which ordering produced
+        the child.
+        """
+        out: set[frozenset[str]] = set()
+        for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS):
+            if rec.get("bic_delta", 0) >= 0:
+                continue
+            p1 = rec.get("parent_node_1")
+            p2 = rec.get("parent_node_2")
+            if (
+                isinstance(p1, str) and p1
+                and isinstance(p2, str) and p2
+                and p1 != p2
+            ):
+                out.add(frozenset({p1, p2}))
+        return out
+
+    @staticmethod
+    def _effective_pair_score(
+        entry: dict[str, Any],
+        consummated: set[frozenset[str]],
+    ) -> float:
+        score = float(entry.get("score", 0.0))
+        attempts = int(entry.get("attempt_count", 0))
+        decayed = score / (1.0 + _PAIR_ATTEMPT_DECAY * attempts)
+        parents = entry.get("parents") or []
+        if len(parents) == 2 and frozenset(parents) in consummated:
+            decayed *= _CONSUMMATED_DISCOUNT
+        return decayed
+

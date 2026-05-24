@@ -1,0 +1,21 @@
+# Build context for the agent + analysis services. Neither Dockerfile COPYs
+# anything from this context — they only `pip install` packages and define
+# entrypoints — so anything we ship is wasted daemon I/O. Strip the heavy
+# dirs to avoid the multi-GB transfer that stalls compose up -d --build.
+.venv/
+data/
+logs/
+models/
+.model-cache/
+wandb/
+unsloth_compiled_cache/
+.git/
+.pytest_cache/
+.llama/
+code/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+*.lock
+negative_space_learning.egg-info/

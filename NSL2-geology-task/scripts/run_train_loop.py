@@ -35,6 +35,8 @@ from src.typing.config import AppConfig
 from src.typing.trajectory import GenerationData
 
 RUN_FILENAME = "run.json"
+GENERATION_METADATA_FILENAME = "metadata.json"
+TRAINING_INFO_FILENAME = "training_info.json"
 DEFAULT_VLLM_MODELS_URL = "http://127.0.0.1:8000/v1/models"
 
 
@@ -167,6 +169,42 @@ def _collect_training_window_paths(
 
 def _run_doc_path(generation_root: Path) -> Path:
     return generation_root / RUN_FILENAME
+
+
+def _generation_phase_complete(generation_root: Path, generation_id: int) -> bool:
+    """Complete iff metadata.json exists AND the active SFT export resolves
+    to an existing rows file. save_generation_data writes metadata.json last
+    (after publishing the SFT export), so seeing both means the prior run
+    finished the generation phase cleanly."""
+    generation_dir = generation_root / f"generation_{generation_id}"
+    if not (generation_dir / GENERATION_METADATA_FILENAME).exists():
+        return False
+    try:
+        resolve_latest_sft_training_rows_path(generation_dir)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _load_generation_metadata(
+    generation_root: Path, generation_id: int
+) -> dict[str, Any]:
+    metadata_path = (
+        generation_root / f"generation_{generation_id}" / GENERATION_METADATA_FILENAME
+    )
+    return json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def _training_artifact_complete(artifact_path: Path, export_format: str) -> bool:
+    """Detect a fully-saved training artifact. _save_training_artifact writes
+    training_info.json (or the .training_info.json sibling for GGUF) as its
+    last step, so its presence is the safe completion marker — partial writes
+    don't have it and will be re-trained on resume."""
+    if export_format == "gguf":
+        return artifact_path.exists() and artifact_path.with_suffix(
+            ".training_info.json"
+        ).exists()
+    return artifact_path.is_dir() and (artifact_path / TRAINING_INFO_FILENAME).exists()
 
 
 def _vllm_server_is_ready(models_url: str = DEFAULT_VLLM_MODELS_URL) -> bool:
@@ -541,20 +579,33 @@ def run_loop(
                 generation_id,
             )
 
-            generation_dir, generation_data = run_generation_phase(
-                generation_config,
-                generation_id,
-                active_run_id,
-                active_docker_client,
-                metrics_collector=metrics_collector,
-                task=task,
-            )
-            generation_metrics = generation_data.to_metadata_dict(run_id=active_run_id)
-            logger.info(
-                f"Generation {generation_id} complete: "
-                f"rows={generation_data.training_row_count}, "
-                f"episodes={generation_data.total_episodes_run}"
-            )
+            if _generation_phase_complete(generation_root, generation_id):
+                generation_dir = generation_root / f"generation_{generation_id}"
+                generation_metrics = _load_generation_metadata(
+                    generation_root, generation_id
+                )
+                logger.info(
+                    f"Generation {generation_id} resumed from disk: "
+                    f"rows={generation_metrics.get('training_row_count', 0)}, "
+                    f"episodes={generation_metrics.get('total_episodes_run', 0)}"
+                )
+            else:
+                generation_dir, generation_data = run_generation_phase(
+                    generation_config,
+                    generation_id,
+                    active_run_id,
+                    active_docker_client,
+                    metrics_collector=metrics_collector,
+                    task=task,
+                )
+                generation_metrics = generation_data.to_metadata_dict(
+                    run_id=active_run_id
+                )
+                logger.info(
+                    f"Generation {generation_id} complete: "
+                    f"rows={generation_data.training_row_count}, "
+                    f"episodes={generation_data.total_episodes_run}"
+                )
 
             generation_result = {
                 "generation_id": generation_id,
@@ -574,15 +625,11 @@ def run_loop(
             if generation_id < num_gens - 1:
                 _try_write_run_doc("in_progress")
 
-                if should_wait_for_gpu_release:
-                    logger.info("Waiting for GPU memory to be released before training")
-                    wait_for_gpu_memory_release(
-                        min_free_memory_fraction=(
-                            config.training.gpu_wait_min_free_memory_fraction
-                        ),
-                        timeout_s=config.training.gpu_wait_timeout_seconds,
-                    )
-
+                artifact_output_dir = _training_artifact_path(
+                    adapter_root,
+                    generation_id,
+                    training_export_format,
+                )
                 training_paths = _collect_training_window_paths(
                     generation_root,
                     end_generation_id=generation_id,
@@ -591,24 +638,44 @@ def run_loop(
                 generation_result["training_data_paths"] = [
                     str(path) for path in training_paths
                 ]
-                logger.info(
-                    f"{'─' * 60}\n"
-                    f"  Training on {len(training_paths)} generation(s), "
-                    f"max_steps={config.training.max_steps}\n"
-                    f"{'─' * 60}"
-                )
-                trained_artifact_path = _invoke_train_sft(
-                    config,
-                    training_paths=training_paths,
-                    output_dir=_training_artifact_path(
-                        adapter_root,
-                        generation_id,
-                        training_export_format,
-                    ),
-                    export_format=training_export_format,
-                )
-                if trained_artifact_path is None:
-                    raise RuntimeError("training subprocess returned no artifact path")
+
+                if _training_artifact_complete(
+                    artifact_output_dir, training_export_format
+                ):
+                    trained_artifact_path = artifact_output_dir
+                    logger.info(
+                        f"Training resumed from disk: artifact={trained_artifact_path}"
+                    )
+                else:
+                    if should_wait_for_gpu_release:
+                        logger.info(
+                            "Waiting for GPU memory to be released before training"
+                        )
+                        wait_for_gpu_memory_release(
+                            min_free_memory_fraction=(
+                                config.training.gpu_wait_min_free_memory_fraction
+                            ),
+                            timeout_s=config.training.gpu_wait_timeout_seconds,
+                        )
+
+                    logger.info(
+                        f"{'─' * 60}\n"
+                        f"  Training on {len(training_paths)} generation(s), "
+                        f"max_steps={config.training.max_steps}\n"
+                        f"{'─' * 60}"
+                    )
+                    trained_artifact_path = _invoke_train_sft(
+                        config,
+                        training_paths=training_paths,
+                        output_dir=artifact_output_dir,
+                        export_format=training_export_format,
+                    )
+                    if trained_artifact_path is None:
+                        raise RuntimeError(
+                            "training subprocess returned no artifact path"
+                        )
+                    logger.info(f"Training complete: artifact={trained_artifact_path}")
+
                 latest_artifact_path = trained_artifact_path
                 generation_result["trained_adapter_dir"] = (
                     str(trained_artifact_path)
@@ -616,7 +683,6 @@ def run_loop(
                     else None
                 )
                 generation_result["trained_artifact_path"] = str(trained_artifact_path)
-                logger.info(f"Training complete: artifact={trained_artifact_path}")
                 _try_write_run_doc("in_progress")
     except Exception:
         _try_write_run_doc("failed", ended_at=_utc_now_iso())
@@ -631,6 +697,16 @@ def main(argv: list[str] | None = None) -> Path:
     parser.add_argument("--config", default="config/config-test-loop.toml")
     parser.add_argument("--hardware-tag", action="append", default=[])
     parser.add_argument("--load-tag", action="append", default=[])
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Resume an existing run by id. Generations whose "
+        "metadata.json + SFT export rows are on disk are skipped, and "
+        "training steps whose adapter (with training_info.json) exists "
+        "are reused. Omit to start a fresh run with a generated id. "
+        "Designed to pair with scripts/run_train_loop_resumable.sh and "
+        "the host's nsl2-resume.service for hardware-reboot recovery.",
+    )
     parser.add_argument(
         "--rebuild-harness",
         action="store_true",
@@ -661,7 +737,7 @@ def main(argv: list[str] | None = None) -> Path:
     task = load_task(config.task.class_, config.task.config)
     logger.info(f"Loaded task: {task.name} ({task.description})")
 
-    run_id = generate_readable_run_id()
+    run_id = args.run_id or generate_readable_run_id()
     metrics_collector = MetricsCollector.from_config(config, run_id)
     run_loop(
         config,

@@ -186,5 +186,6 @@ class HarnessContext:
                 workflow_step=self.workflow_step,
                 episode_context=self.episode_context,
                 budget_exhaustion=budget_exhaustion,
+                recorder=self.recorder,
             ),
         )

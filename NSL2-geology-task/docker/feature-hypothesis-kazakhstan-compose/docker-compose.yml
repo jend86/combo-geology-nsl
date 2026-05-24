@@ -11,8 +11,11 @@ services:
 
   vfm:
     build:
-      context: ../..
-      dockerfile: docker/feature-hypothesis-kazakhstan-compose/Dockerfile.vfm
+      # Context is combo-geology-nsl root (not NSL2-geology-task) so the
+      # Dockerfile can COPY voxel-features-mcp/voxel_features, which lives
+      # as a sibling of NSL2-geology-task. See Dockerfile.vfm.
+      context: ../../..
+      dockerfile: NSL2-geology-task/docker/feature-hypothesis-kazakhstan-compose/Dockerfile.vfm
     restart: unless-stopped
     tty: true
     stdin_open: true
