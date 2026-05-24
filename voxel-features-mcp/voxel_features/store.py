@@ -164,13 +164,24 @@ class VoxelStore:
             )
     
     def _save_index(self) -> None:
-        """Save store index to disk."""
+        """Save store index to disk atomically.
+
+        Writes to a sibling ``.tmp`` file then ``os.replace()``s into place so
+        concurrent readers (e.g. parallel episodes in the feature-hypothesis
+        task) never observe a truncated/empty ``index.json``. The previous
+        ``open(path, "w")`` left a window between truncation and content where
+        a peer reader would JSONDecodeError on ``line 1 column 1 (char 0)``.
+        """
         data = {
             "grid": self._grid.to_dict(),
             "layers": {name: layer.to_dict() for name, layer in self._layers.items()},
         }
-        with open(self._index_path, "w") as f:
+        tmp_path = self._index_path.with_suffix(self._index_path.suffix + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self._index_path)
     
     def add_layer(
         self,
