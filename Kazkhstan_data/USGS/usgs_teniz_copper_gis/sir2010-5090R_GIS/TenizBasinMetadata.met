@@ -1,0 +1,499 @@
+Identification_Information:
+  Citation:
+    Citation_Information:
+      Online_Linkage: http://pubs.usgs.gov/sir/2010/5090-R
+      Online_Linkage:  http://dx.doi.org/10.3133/sir20105090r
+      Publication_Date: 2014
+      Title: Sediment-hosted sandstone copper assessment of the Teniz Basin, central Kazakhstan
+      Edition: 1.0
+      Geospatial_Data_Presentation_Form: report and vector digital data
+      Publication_Information:
+        Publisher: U.S. Geological Survey
+        Publication_Place: Menlo Park, California
+      Originator: P.M. Cossette
+      Originator: A.A. Bookstrom
+      Originator: T.S. Hayes
+      Originator: G.R. Robinson
+      Originator: J.C. Wallis
+      Originator: M.L. Zientek
+      Series_Information:
+        Series_Name: Scientific Investigations Report
+        Issue_Identification: 2010-5090-R
+  Description:
+    Abstract:
+      The U.S. Geological Survey (USGS) conducts national and global resource assessments (mineral, energy, water, and biological) to provide data and scientific analyses to support decision making. Three-part mineral resource assessments result in informed, unbiased, quantitative, and probabilistic estimates of undiscovered mineral resources and deposits. In particular, mineral assessment results inform decisions concerning land-use and mineral-resource development. A probabilistic mineral resource assessment of the sandstone subtype of sediment-hosted stratabound copper deposits in the Teniz Basin, Kazakhstan, was undertaken by the USGS.
+      The Teniz Basin is located in Akmola Oblast, central and western Kazakhstan. With an areal extent of almost 78,000 km2, the basin contains many sediment-hosted stratabound copper prospects, none of which are well described, and the majority of which may belong to the sandstone subtype of sediment-hosted copper deposits. There are no known locations within the Teniz Basin currently mined for copper. Within the basin, however, map units permissive for the sandstone subtype of sediment-hosted stratabound copper deposits include (from oldest to youngest): the Middle Carboniferous Kiery Suite; the Middle to Upper Carboniferous Vladimirov Suite (a stratigraphic equivalent of the Dzhezkazgan Suite, Chu-Sarysu Basin); and the Upper Carboniferous or lowest Permian Kayraktin Suite. The multicolored sedimentary rocks of the Vladimirov Suite, in which 14 potentially ore-bearing horizons of gray beds have been recorded, have the greatest potential for undiscovered, sandstone subtype, sediment-hosted stratabound copper deposits.
+      A quantitative mineral resource assessment has been completed that (1) delineates one 49,714 km2 tract permissive for undiscovered, sandstone subtype, sediment-hosted stratabound copper deposits, and (2) provides probabilistic estimates of numbers of undiscovered deposits and probable amounts of copper resource contained in those deposits. The permissive tract delineated in this assessment encompasses no previously known sandstone subtype, sediment-hosted stratabound copper deposits. However, this assessment estimates (with 30 percent probability) that a mean of nine undiscovered sandstone subtype copper deposits may be present in the Teniz Basin and could contain a mean total of 8.9 million metric tons of copper and 7,500 metric tons of silver.
+    Purpose:
+      The USGS conducts national and global assessments of renewable and nonrenewable resources to support decision making. Mineral resource assessments provide a synthesis of available information about where mineral deposits are known and suspected in the Earth’s crust, what commodities may be present, and amounts of undiscovered resources.  In response to the growing demand for information on the global mineral-resource base, the U.S. Geological Survey (USGS) has untaken the Global Mineral Resource Assessment Project (GMRAP), a cooperative international project, to assess undiscovered resources for porphyry and sediment-hosted copper, platinum-group elements, and potash (http://pubs.usgs.gov/fs/fs053-03/fs053-03.html, http://minerals.usgs.gov/global/).  The purposes of the  study are to provide (1) the first globally consistent and comprehensive analysis of selected types of undiscovered nonfuel mineral resources, and (2) all nations with a regional and global context for evaluating their mineral resources, planning for new mineral exploration and anticipating the economic, environmental, and social impacts of mineral development, and making land use decisions.
+
+      This report presents the results of an assessment of the Upper Paleozoic Teniz Basin in central Kazakhstan for the potential occurrence, quality and quantity of undiscovered sandstone copper deposits and complements the results of the sandstone copper assessment of the Chu-Sarysu basin, central Kazakhstan, to the south (Box and others, 2012).
+
+      Regional assessment studies such as this compile and integrate existing information using GIS technology.  Results are presented at a scale of 1:1,000,000. Data sets include: spatial databases and digital maps of the location, size, and geologic type of known mineral deposits and occurrences; maps and explanations of regional geology, metallogeny, tectonics, geochemistry, and geophysics; and available information about regional mineral exploration history. The integrated information is used to delineate tracts of land permissive for particular types of undiscovered nonfuel mineral deposits and to make and constrain probabilistic estimates of the quantity and quality of the undiscovered resource. The quantitative mineral resource assessment results can be evaluated using economic filters and cash flow models for economic and policy analysis, and can be applied to mineral supply, economic, environmental, and land-use planning. Such economic evaluations are not part of this report.
+    Supplemental_Information:
+      The U.S. Geological Survey (USGS) is conducting a cooperative international project to assess the world's undiscovered nonfuel mineral resources. The Global Mineral Resource Assessment Project (GMRAP) is a research project that will develop and test methods of assessing the undiscovered mineral resources of the terrestrial earth. The primary objectives of the project are to outline the principal areas in the world that have potential for selected undiscovered mineral resources and to estimate the probable amounts of those mineral resources to a depth of 1-2 kilometers (0.6-1.2 miles) below the earth's surface. The project will initially undertake global assessments of copper, platinum-group metals, and potassium (or potash) resources (http://pubs.usgs.gov/fs/fs053-03/fs053-03.pdf).
+
+      A probabilistic mineral resource assessment of undiscovered (sediment-hosted) sandstone - copper deposits within the Upper Paleozoic Teniz Basin in central Kazakhstan was completed as a contribution to the global assessment of mineral resources (GMRAP) currently being conducted by the U.S. Geological Survey.
+  Time_Period_of_Content:
+    Currentness_Reference: current
+    Time_Period_Information:
+      Single_Date/Time:
+        Calendar_Date: 2014
+  Status:
+    Progress: Complete
+    Maintenance_and_Update_Frequency: None planned
+  Spatial_Domain:
+    Bounding_Coordinates:
+      West_Bounding_Coordinate: 66.43875
+      East_Bounding_Coordinate: 70.15060
+      North_Bounding_Coordinate: 52.48428
+      South_Bounding_Coordinate: 50.00902
+  Keywords:
+    Theme:
+      Theme_Keyword_Thesaurus: none
+      Theme_Keyword: sediment-hosted copper
+      Theme_Keyword: sandstone subtype
+      Theme_Keyword: sandstone
+      Theme_Keyword: permissive tract
+      Theme_Keyword: deposit
+      Theme_Keyword: prospect
+    Place:
+      Place_Keyword_Thesaurus: International Organization for Standardization (ISO)
+      Place_Keyword: Central Asia
+      Place_Keyword: Kazakhstan
+      Place_Keyword: Teniz Basin
+      Place_Keyword: Tengiz Depression
+    Stratum:
+      Stratum_Keyword_Thesaurus: none
+      Stratum_Keyword: Shoptykul Suite
+      Stratum_Keyword: Kiymin Suite
+      Stratum_Keyword: Kayraktin Suite
+      Stratum_Keyword: Vladimirov Suite
+      Stratum_Keyword: Kirey Suite
+    Temporal:
+      Temporal_Keyword_Thesaurus: USGS Thesaurus
+      Temporal_Keyword: Permian Period
+      Temporal_Keyword: Carboniferous Period
+      Temporal_Keyword: Devonian Period
+  Access_Constraints: none
+  Use_Constraints: This spatial database is not meant to be used or displayed at any scale larger than 1:1,000,000 (for example, 1:250,000). Any hardcopies utilizing these datasets shall clearly indicate their source. If the user has modified the data in any way, they are obligated to describe the types of modifications they have performed on the hardcopy map. User specifically agrees not to misrepresent these data sets, nor imply that changes they made were approved by the U.S. Geological Survey.
+  Point_of_Contact:
+    Contact_Information:
+      Contact_Person_Primary:
+        Contact_Person: Pamela M. Cossette
+        Contact_Organization: U.S. Geological Survey
+      Contact_Position: geologist
+      Contact_Address:
+        Address_Type: mailing and physical address
+        Address: 904 W. Riverside Ave
+        City: Spokane
+        State_or_Province: WA
+        Postal_Code: 99201-1087
+        Country: USA
+      Contact_Voice_Telephone: 509-368-3121
+      Contact_Facsimile_Telephone: 509-368-3199
+      Contact_Electronic_Mail_Address: pcossette@usgs.gov
+  Data_Set_Credit:
+    Michael L. Zientek provided science and procedural guidance and oversight.
+    Stephen E. Box provided the fundamental scientific and geological data sources, many of which were acquired from the Centre for Russian and Central EurAsian Mineral Studies (CERCAMS) National Museum of History, London and Economic Consulting Ltd., Almaty, Kazakhstan.
+    We thank Boris Syusyura (Economic Consulting Ltd., Almaty, Kazakhstan) who kindly shared data and provided personal interpretations to assist in the difficulties that are inherent in multi-national cooperative efforts.  This work relies heavily on those data that were initially provided to Stephen E. Box in order to facilitate the sandstone copper assessment of the Chu-Sarysu Basin, central Kazakhstan http://pubs.usgs.gov/sir/2010/5090/e.
+    Timothy S. Hayes provided significant insight into processes that are responsible for sediment-hosted copper deposits, such as those assessed in this report.
+    Arthur A. Bookstrom, Timothy S. Hayes and Gilpin R. Robinson participated in the estimation process.
+    John C. Wallis provided data processing and unwavering support.
+
+    USGS colleagues Stephen Box, George Breit, Susan Hall, and Jane Hammarstrom served as the assessment oversight committee to review the preliminary results. USGS colleagues George Breit and Susan Hall provided helpful and timely technical reviews of the final report. USGS colleague Robert Miller provided a helpful technical review of the GIS data accompanying the final report. Kathleen M. Johnson provided the Series edit.
+  Cross_Reference:
+    Citation_Information:
+      Originator: Boris Syusyura
+      Originator: Stephen E. Box
+      Originator: John C. Wallis
+      Publication_Date: 2010
+      Title: Spatial Databases of Geological, Geophysical, and Mineral Resource Data Relevant to Sandstone-Hosted Copper Deposits in Central Kazakhstan
+      Edition: 1.0
+      Geospatial_Data_Presentation_Form: report and vector data
+      Series_Information:
+        Series_Name: Open-File Report
+        Issue_Identification: Open-File Report 2010-1124
+      Publication_Information:
+        Publication_Place: Menlo Park, California
+        Publisher: U.S. Geological Survey
+      Online_Linkage: http://pubs.usgs.gov/of/2010/1124/
+Data_Quality_Information:
+  Logical_Consistency_Report: No duplicate features exist.
+  Completeness_Report: SIR2011-5090-R includes GIS spatial datasets (ESRI shapefiles and geodatabase feature classes) that describe one sediment-hosted copper tract located in the Teniz basin, Kazakhstan, Central Asia. This area (tract) was assessed by the USGS as part of the 2010 Global Minerals Resource Assessment Project and is the result of extensive analysis of data and assets acquired from and shared by CERCAM and MEC, along with addition data compilation and integration of Soviet-era 1:200,000 scale geological mapping and multiple global mineral deposit databases.
+  Lineage:
+    Process_Step:
+      Process_Description:
+        For details regarding steps taken as complex and disparate data sources were compiled and analyzed, please see this report:
+
+        Cossette, P. M., Bookstrom, A.A.., Hayes, T. S.,  Wallis, J.C., and Zientek, M. L.,  2014, Sediment-hosted sandstone copper assessment of the Teniz Basin, central Kazakhstan: U. S. Geological Survey Scientific Investigations Report 2010-5090-R.
+      Process_Contact:
+        Contact_Information:
+          Contact_Person_Primary:
+            Contact_Person: Pamela M Cossette
+            Contact_Organization: U. S. Geological Survey
+          Contact_Position: geologist
+          Contact_Address:
+            Address_Type: mailing and physical address
+            Address: 904 W. Riverside Ave.
+            City: Spokane
+            State_or_Province: WA
+            Postal_Code: 99201-1087
+            Country: USA
+          Contact_TDD/TTY_Telephone: 509-368-3121
+          Contact_Facsimile_Telephone: 509-368-3199
+          Contact_Electronic_Mail_Address: pcossette@usgs.gov
+  Attribute_Accuracy:
+    Attribute_Accuracy_Report: Attribute accuracy was verified by manual comparison of the source maps with hard copy plots, printouts, and by on-screen evaluation.
+  Positional_Accuracy:
+    Horizontal_Positional_Accuracy:
+      Horizontal_Positional_Accuracy_Report: The horizontal positional accuracy of the polygon features varies: it is dependent on several factors including the original scale and quality of the base maps used in mapping the geology (which was subsequently used to delineate the mineral resource tracts).
+Spatial_Data_Organization_Information:
+  Direct_Spatial_Reference_Method: Vector
+  Point_and_Vector_Object_Information:
+    SDTS_Terms_Description:
+      SDTS_Point_and_Vector_Object_Type: G-polygon
+Spatial_Reference_Information:
+  Horizontal_Coordinate_System_Definition:
+    Geographic:
+      Latitude_Resolution: 0.000000
+      Longitude_Resolution: 0.000000
+      Geographic_Coordinate_Units: Decimal degrees
+    Geodetic_Model:
+      Horizontal_Datum_Name: GCS_WGS_1984
+      Ellipsoid_Name: WGS_1984
+      Semi-major_Axis: 6378137.000000
+      Denominator_of_Flattening_Ratio: 298.257224
+Entity_and_Attribute_Information:
+  Detailed_Description:
+    Entity_Type:
+      Entity_Type_Label: TZ_ssCu_Tract
+      Entity_Type_Definition:
+        ESRI SHAPEFILE - A file that spatially describes the single mineral resource tract (polygon feature) which is permissive for sediment-hosted copper.
+
+        ESRI Geodatabase FEATURE CLASS - File created and stored in a file geodatabase that describes the assessed mineral resource tract (polygon feature) which is permissive for sediment-hosted copper. In addition to the common set of attributes associated with tract feature classes (GMRAP) there are four additional attributes that  (1) describe the area studied and (2) identify three classes of criteria used to define the Teniz Basin permissive tract. These four fields are: descr, criterion1, criterion2, and criterion3.
+      Entity_Type_Definition_Source:
+        Singer, D.A., 1993, Basic concepts in three-part quantitative assessments of undiscovered mineral resources: Nonrenewable Resources, v. 2, no. 2, p. 69-81.
+
+        This study.
+    Attribute:
+      Attribute_Label: Tract_ID
+      Attribute_Definition: User-defined, unique identifier assigned to permissive tract
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Coded_ID
+      Attribute_Definition: Coded, unique identifier assigned to permissive tract.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Tract_name
+      Attribute_Definition: Informal (author-defined) name of permissive tract
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Unregcode
+      Attribute_Definition: Three digit UN code for the region that underlies most of the permissive tract.
+      Attribute_Definition_Source: UN Standard Country or Area Codes for Statistical Use: Composition of macro geographical (continental) regions, geographical sub-regions, and selected economic and other groupings (http://unstats.un.org/unsd/methods/m49/m49regin.htm)
+    Attribute:
+      Attribute_Label: Country
+      Attribute_Definition: Country(ies) in which permissive tract is located
+      Attribute_Definition_Source: ISO 3166-1 country_name
+    Attribute:
+      Attribute_Label: Commodity
+      Attribute_Definition: Primary commodity being assessed
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Dep_type
+      Attribute_Definition: Name of the deposit type assessed
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: GT_model
+      Attribute_Definition: Grade-tonnage model used for the undiscovered deposit estimate
+      Attribute_Definition_Source: Zientek, M.L., Hayes, T.S., and Hammarstrom, J.H., 2013, Overview of a new descriptive model for sediment-hosted stratabound copper deposits, in Taylor, C.D., Causey, J.D., Denning, P.D., Hammarstrom, J.M., Hayes, T.S., Horton, J.D., Kirschbaum, M.J., Parks, H.L., Wilson, A.B., Wintzer, N.E., and Zientek, M.L., Descriptive models, grade-tonnage relationships, and databases for the assessment of sediment-hosted copper deposits-With emphasis on deposits in the Central Africa Copperbelt, Democratic Republic of the Congo and Zambia: U.S. Geological Survey Scientific Investigations Report 2010-5090-J, p. 2-16. (Also available at http://pubs.usgs.gov/sir/2010/5090/j/.)
+    Attribute:
+      Attribute_Label: Geology
+      Attribute_Definition: Geologic feature assessed
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Age
+      Attribute_Definition: Age of geologic feature assessed
+      Attribute_Definition_Source: Geologic time terms in USGS Divisions of geologic time (Suggestions to Authors fig. 15, p. 59); Geological Society of America 1999 Geologic time scale; or International Commission on Stratigraphy Geologic Time Scale 2004
+    Attribute:
+      Attribute_Label: Asmt_date
+      Attribute_Definition: Year assessment was conducted
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Asmt_depth
+      Attribute_Definition: Maximum depth beneath the Earth's surface used for the assessment, in kilometers.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Est_levels
+      Attribute_Definition: The set of percentile (probability) levels at which undiscovered deposit estimates were made
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N90
+      Attribute_Definition: Estimated number of deposits associated with the 90th percentile (90 percent probability of at least the indicated number of deposits).
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N50
+      Attribute_Definition: Estimated number of deposits associated with the 50th percentile (50 percent probability of at least the indicated number of deposits). Values for N90 <or=N50 <or= N10<or= N05<or= N01
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N10
+      Attribute_Definition: Estimated number of deposits associated with the 10th percentile (10 percent probability of at least the indicated number of deposits). Values for N90 <or = N50 <or= N10<or= N05 <or=N01
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N05
+      Attribute_Definition: Estimated number of deposits associated with the 5th percentile (5 percent probability of at least the indicated number of deposits).
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N01
+      Attribute_Definition: Estimated number of deposits associated with the 1st percentile (1 percent probability of at least the indicated number of deposits).
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N_expected
+      Attribute_Definition: Expected (mean) number of deposits: N_Expected = (0.233*N90) + (0.4*N50) + (0.225*N10) + (0.045*N05) + (0.03*N01)
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: s
+      Attribute_Definition: Standard deviation: s = 0.121 - (0.237*N90) - (0.093*N50) + (0.183*N10) + (0.073*N05) + (0.123*N01)
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Cv_percent
+      Attribute_Definition: Coefficient of variance, in percent: Cv = (s/N_Expected) * 100
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N_known
+      Attribute_Definition: Number of known deposits in the tract
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: N_total
+      Attribute_Definition: Total number of deposits: N_total = N_Expected + N_Known
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Area_km2
+      Attribute_Definition: Area of permissive tract, in square kilometers
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: DepDensity
+      Attribute_Definition: Deposit density (total number of deposits per square kilometer).: DepDensity = N_total/Area_km2
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: DepDen10E5
+      Attribute_Definition: Deposit density per 100,000 square kilometers: DepDen10E5 = DepDensity*100,000
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Estimators
+      Attribute_Definition: Names of people on the estimation team
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Notes
+      Attribute_Definition: Notes or comments
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: description
+      Attribute_Definition: Summary description of permissive tract.
+      Attribute_Definition_Source: GMRAP
+  Detailed_Description:
+    Entity_Type:
+      Entity_Type_Label: TZ_ssCu_Prospects
+      Entity_Type_Definition:
+        Sediment-hosted sandstone copper prospects, Teniz Basin, central Kazakhstan
+
+        ESRI SHAPEFILE - files that spatially describe deposits and prospects (point features) used to delineate the extent of the assessed mineral resource tract (polygon feature) which is permissive for sediment-hosted copper.
+
+        ESRI Geodatabase FEATURE CLASS -  created and stored in a file geodatabase that describes  prospects (point features) used to delineate the extent of the assessed mineral resource tract (polygon feature) which is permissive for sediment-hosted copper.
+
+      Entity_Type_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Coded_ID
+      Attribute_Definition: Coded, unique identifier assigned to permissive tract within which the site is located.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Tract_name
+      Attribute_Definition: GMRAP user-defined informal tract name
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Group_name
+      Attribute_Definition: Group name for sites which have been grouped together for aggregation/modeling purposes.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Name
+      Attribute_Definition: Name or identity (where known) of prospect or deposit site
+      Attribute_Definition_Source: Author(s) and source databases
+    Attribute:
+      Attribute_Label: Name_other
+      Attribute_Definition: Other names used for the site
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Includes
+      Attribute_Definition: Where applicable (other studies): names of deposits that have been combined with the primary deposit as a result of the 500 m aggregation rule used for calculating grades and tonnages.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Includes2
+      Attribute_Definition: Overflow field for "Includes" field.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: SiteStatus
+      Attribute_Definition: Deposit-a site that has grade and tonnage. Historic mine - 19th century or earlier-a site that is a no longer active historic mine. Prospect-a site with no grade and tonnage values provided. Prospect - mineralized material estimated-a site that has estimated mineralized material. Site-a site that occurs in sedimentary rock but has no other descriptive information.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: SiteStat2
+      Attribute_Definition:
+        Additional category for status of site.
+
+        Significant prospect-a site that is consistently documented in various data sources and may be referred to as “small deposit,” even though tonnage and grade is not reported.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: SiteStat3
+      Attribute_Definition: Additional miscellaneous comments on the status of the site.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Country
+      Attribute_Definition: Country(countries) in which site is located
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: State_Prov
+      Attribute_Definition: State or province in which the site is located.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Latitude
+      Attribute_Definition: Latitude in decimal degrees. -90.00000 to 90.00000. Negative south of the equator
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Longitude
+      Attribute_Definition: Longitude in decimal degrees. -180.00000 to 180.00000. Negative east of the Greenwich meridian
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Type
+      Attribute_Definition: Mineral deposit type
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Subtype
+      Attribute_Definition: Sandstone copper subtype
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Agehost
+      Attribute_Definition: Age of host rock, in standard divisions of geologic time.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Age_Ma
+      Attribute_Definition: Age in millions of years before present. Age is average for geologic era, period, or epoch listed.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Unit
+      Attribute_Definition: Geologic unit in which site is located.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: HostRocks
+      Attribute_Definition: Simplified lithologic description of host rocks.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Comm_major
+      Attribute_Definition: Major commodities in decreasing order of economic importance.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Tonnage_Mt
+      Attribute_Definition: Ore tonnage in millions of metric tons. -9999 indicates no data.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Cu_pct
+      Attribute_Definition: Average copper grade in weight percent. -9999 indicates no data.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Co_pct
+      Attribute_Definition: Average cobalt grade, in weight percent, -9999 indicates no data.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Ag_g_t
+      Attribute_Definition: Average silver grade in ppm (=grams per ton). -9999 indicates no data.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Con_Cu_t
+      Attribute_Definition: Million metric tons of contained Copper. -9999 indicates no data.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: COMMENTS
+      Attribute_Definition:
+        Lists the original source of the point datum.
+
+        Miscellaneous comments.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Multi-Source_Classification
+      Attribute_Definition: Lists type of mineralized site as recorded in one or more of the four principal data sources (see table 2) used in the compilation of the prospects database for the Teniz Basin.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Mineralogy
+      Attribute_Definition: Ore and gangue minerals in approximate order of abundance.
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Ref_short
+      Attribute_Definition: Short reference; abbreviated citation for reference; full reference is provided in accompanying report
+      Attribute_Definition_Source: GMRAP
+    Attribute:
+      Attribute_Label: Report
+      Attribute_Definition: Informal name of the source report for the site.
+      Attribute_Definition_Source: GMRAP
+Distribution_Information:
+  Standard_Order_Process:
+    Digital_Form:
+      Digital_Transfer_Information:
+        Format_Name: ZIP
+        Format_Information_Content: ZIP archive for SIR 2010-5090-R
+      Digital_Transfer_Option:
+        Online_Option:
+          Computer_Contact_Information:
+            Network_Address:
+              Network_Resource_Name: http://pubs.usgs.gov/sir/2010/5090-r
+    Fees: No fee for downloadable data and report.
+    Digital_Form:
+      Digital_Transfer_Information:
+        Format_Name: SHP
+        Format_Information_Content: ESRI shapefile
+      Digital_Transfer_Information:
+        Format_Name: GDB
+        Format_Information_Content: ESR1 geodatabase
+      Digital_Transfer_Option:
+        Offline_Option:
+          Offline_Media: CD-ROM
+        Online_Option:
+          Computer_Contact_Information:
+            Network_Address:
+              Network_Resource_Name: http://pubs.usgs.gov/sir/2010/5090-r
+  Distributor:
+    Contact_Information:
+      Contact_Voice_Telephone: (888) ASK-USGS
+      Contact_Organization_Primary:
+        Contact_Organization: U.S. Geological Survey Information Services
+      Contact_Address:
+        Address_Type: mailing address
+        Address: P.O. Box 25286
+        City: Denver
+        State_or_Province: CO
+        Postal_Code: 80225
+        Country: USA
+        Address: Denver Federal Center
+      Contact_Voice_Telephone: (888) 275-8747
+      Contact_Electronic_Mail_Address: infoservices@usgs.gov
+  Resource_Description: Downloadable data for USGS [Scientific Investigations Report, SIR] [2010-5090-R].
+  Distribution_Liability: The U.S. Geological Survey (USGS) provides these geographic data "as is." The USGS makes no guarantee or warranty concerning the accuracy of information contained in the geographic data. The USGS further makes no warranties, either expressed or implied as to any other matter whatsoever, including, without limitation, the condition of the product, or its fitness for any particular purpose. The burden for determining fitness for use lies entirely with the user. Although these data have been processed successfully on computers of the USGS, no warranty, expressed or implied, is made by the USGS regarding the use of these data on any other system, nor does the fact of distribution constitute or imply such warranty. In no event shall the USGS have liability whatsoever for payment of any consequential, incidental, indirect, special, or tort damages of any kind, including, but not limited to, any loss of profits arising out of use of or reliance on the geographic data or arising out of the delivery, installation, operation, or support by the USGS. This spatial database is not meant to be used or displayed at any scale larger than 1:1,000,000 (for example, 1:250,000).
+  Technical_Prerequisites: User must have geographic information system (GIS) software capable of reading ESRI ArcGIS file formats
+Metadata_Reference_Information:
+  Metadata_Date: 20120119
+  Metadata_Access_Constraints: none
+  Metadata_Use_Constraints: none
+  Metadata_Contact:
+    Contact_Information:
+      Contact_Person_Primary:
+        Contact_Person: Pamela M. Cossette
+        Contact_Organization: U. S. Geological Survey
+      Contact_Address:
+        Address_Type: mailing and physical address
+        Address: 904 W. Riverside Ave.
+        City: Spokane
+        State_or_Province: WA
+        Postal_Code: 99201-1087
+        Country: USA
+      Contact_Voice_Telephone: 509-368-3121
+      Contact_Facsimile_Telephone: 509-368-3199
+      Contact_Electronic_Mail_Address: pcossette@usgs.gov
+      Contact_Position: Geologist

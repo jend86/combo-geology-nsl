@@ -11,6 +11,7 @@ wheels/
 
 *.lock
 .env
+!docker/**/requirements.lock
 
 data/
 code/

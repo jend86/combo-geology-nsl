@@ -242,11 +242,11 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         default_dataset = repo_root.parent / "Coe Fairbairn"
         self._dataset_dir = Path(task_config.get("dataset_dir", default_dataset)).resolve()
         
-        # Store paths
-        default_store = repo_root / "tasks" / "feature_hypothesis" / "store"
+        # Store paths - Australia regional structure
+        default_store = repo_root / "data" / "australia" / "feature-hypothesis" / "store"
         self._store_dir = Path(task_config.get("store_dir", default_store)).resolve()
         
-        default_kg = repo_root / "tasks" / "feature_hypothesis" / "knowledge"
+        default_kg = repo_root / "data" / "australia" / "feature-hypothesis" / "knowledge"
         self._kg_dir = Path(task_config.get("kg_dir", default_kg)).resolve()
         
         self._docker_compose_dir = task_config.get(
@@ -472,22 +472,16 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
+        # Generate dynamic survey prompt with recent experiments context
+        survey_prompt = self._generate_survey_prompt_with_context()
+        
         return Workflow(
             steps=(
                 # HYPOTHESIS AGENT: Phase 1
                 WorkflowStep(
                     name="survey",
                     is_entry=True,
-                    prompt=(
-                        "Phase 1: Survey\n\n"
-                        "Explore the dataset to identify feature opportunities.\n\n"
-                        "Use analysis_shell to:\n"
-                        "- Read file headers and schemas\n"
-                        "- Identify interesting patterns\n\n"
-                        "Find 2-3 promising feature layer candidates.\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='survey', candidates=[...])"
-                    ),
+                    prompt=survey_prompt,
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -589,7 +583,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                         "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
                         "3. -Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
-                        " - Values must be floats or booleans: 'clay' → has_clay=True\n", 
+                        " - Values must be floats or booleans: 'clay' → has_clay=True\n"
                         "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
                         "            spatial_add_line(name='mineralization_potential', ...) \n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
@@ -1471,9 +1465,9 @@ finally:
         
         # Extract data paths - need to get base data directory
         if store_dir:
-            data_base_path = Path(store_dir).parent.parent  # from store/coe_fairbairn to data/feature-hypothesis
+            data_base_path = Path(store_dir).parent.parent  # from store/coe_fairbairn to data/australia/feature-hypothesis
         else:
-            data_base_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/data/feature-hypothesis")
+            data_base_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/data/australia/feature-hypothesis")
         
         # Extract two-stage scoring results
         masking_test_passed = evaluate.get('masking_test_passed', True)
@@ -1639,6 +1633,7 @@ finally:
         self,
         knowledge_dir: Path,
         new_node_id: str,
+        new_layer_name: str,
         new_mutual_info: dict[str, float]
     ) -> None:
         """Update crossbreed index with mutual information scores for new experiment."""
@@ -1676,8 +1671,8 @@ finally:
                 # Look for cross-references in mutual info dictionaries
                 if existing_exp.get('layer_name') in new_layer:
                     mi_score = new_layer[existing_exp['layer_name']]
-                elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
-                    mi_score = existing_layer[locals()['layer_name']]
+                elif new_layer_name in existing_layer:
+                    mi_score = existing_layer[new_layer_name]
                 
                 # Create pair record
                 pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
@@ -1811,6 +1806,15 @@ finally:
                     success=False,
                     error=f"Unknown execution capability: {capability_name}"
                 )
+            
+            # Special handling for execution_submit - pass analysis container
+            if capability_name == "execution_submit":
+                analysis = self._pick_container(containers, "analysis")
+                if analysis is not None:
+                    args = {**args, "container": analysis}
+                else:
+                    # Log warning but continue - will use fallback mode
+                    print(f"Warning: No analysis container available for execution_submit, using fallback mode")
             
             # Call the tool function directly
             tool_func = tool_functions[capability_name]
@@ -2145,7 +2149,9 @@ finally:
             # Both stages passed - full success
             # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
             stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))  # Stage 2 contribution
+            # Recalibrated for MAE + Laplace BIC system  
+            # Realistic geological improvements: 1-20 BIC units, exceptional: 20+
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 20.0))  # Stage 2 contribution
             
             # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
             value = 0.4 * stage1_reward + 0.6 * stage2_reward
@@ -2270,6 +2276,61 @@ finally:
         except Exception:
             return 0
     
+    def _generate_survey_prompt_with_context(self) -> str:
+        """Generate survey prompt with recent experiments context for deduplication."""
+        base_prompt = (
+            "Phase 1: Survey\n\n"
+            "Explore the dataset to identify feature opportunities.\n\n"
+            "Use analysis_shell to:\n"
+            "- Read file headers and schemas\n"
+            "- Identify interesting patterns\n\n"
+        )
+        
+        # Try to get recent experiments for context
+        try:
+            import sys
+            from pathlib import Path
+            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+            if vfm_path not in sys.path:
+                sys.path.append(vfm_path)
+            
+            from voxel_features.knowledge_graph import KnowledgeGraph
+            from voxel_features.store import COE_FAIRBAIRN_GRID
+            
+            kg = KnowledgeGraph(COE_FAIRBAIRN_GRID)
+            all_experiments = kg.list_all()
+            
+            if all_experiments:
+                # Get 5 most recent experiments
+                recent_experiments = sorted(
+                    all_experiments,
+                    key=lambda exp: exp.timestamp,
+                    reverse=True
+                )[:5]
+                
+                context_prompt = "\n**AVOID REPEATING RECENT EXPERIMENTS:**\n"
+                context_prompt += "Recent hypotheses already tested (don't repeat these patterns):\n"
+                
+                for i, exp in enumerate(recent_experiments, 1):
+                    status = "✅ ADMITTED" if exp.admitted else "❌ REJECTED"
+                    context_prompt += f"{i}. {exp.hypothesis} [{status}]\n"
+                    context_prompt += f"   Result: {exp.result_summary[:100]}...\n"
+                
+                context_prompt += "\nFocus on NEW geological patterns not covered above.\n\n"
+                base_prompt += context_prompt
+            
+        except Exception as e:
+            # If we can't get recent experiments, continue with base prompt
+            print(f"Warning: Could not load recent experiments context: {e}")
+        
+        base_prompt += (
+            "Find 2-3 promising feature layer candidates.\n\n"
+            "Close with:\n"
+            "  record_phase(phase='survey', candidates=[...])"
+        )
+        
+        return base_prompt
+    
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
         """Check if there are crossbreed pairs available."""
         experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
@@ -2336,27 +2397,40 @@ finally:
                             except (json.JSONDecodeError, KeyError):
                                 continue
             
-            # Find best crossbreed pair (high BIC improvement + low MI)
+            # Get already used crossbreed pairs
+            used_pairs = self._get_used_crossbreed_pairs(variation)
+            
+            # Find best unused crossbreed pair (maximum combined BIC improvement)
             best_pair = None
             best_score = float('-inf')
             
             for i, exp_a in enumerate(experiments):
                 for exp_b in experiments[i+1:]:
+                    # Skip if this pair was already crossbred
+                    if self._is_pair_already_used(exp_a['node_id'], exp_b['node_id'], used_pairs):
+                        continue
+                    
                     # Calculate combined BIC improvement
                     bic_a = abs(exp_a.get("bic_delta", 0))
                     bic_b = abs(exp_b.get("bic_delta", 0))
                     combined_bic = bic_a + bic_b
                     
-                    # Get mutual information (prefer low MI = orthogonal features)
-                    pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
-                    mi_score = mi_index.get(pair_id, 0.0)
-                    
-                    # Combined score: high BIC improvement, low MI
-                    pair_score = combined_bic - mi_score
-                    
-                    if pair_score > best_score:
-                        best_score = pair_score
+                    if combined_bic > best_score:
+                        best_score = combined_bic
                         best_pair = (exp_a, exp_b)
+            
+            # If no unused pairs found, fall back to highest BIC pair with warning
+            if not best_pair:
+                print("Warning: All high-BIC pairs already used, selecting highest BIC pair")
+                for i, exp_a in enumerate(experiments):
+                    for exp_b in experiments[i+1:]:
+                        bic_a = abs(exp_a.get("bic_delta", 0))
+                        bic_b = abs(exp_b.get("bic_delta", 0))
+                        combined_bic = bic_a + bic_b
+                        
+                        if combined_bic > best_score:
+                            best_score = combined_bic
+                            best_pair = (exp_a, exp_b)
             
             if not best_pair:
                 return {}
@@ -2384,6 +2458,41 @@ finally:
         except Exception as e:
             print(f"Warning: JSONL crossbreed failed, using simple fallback: {e}")
             return self._get_crossbreed_context_simple(variation)
+    
+    def _get_used_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> set[tuple[str, str]]:
+        """Extract already used crossbreed pairs from knowledge graph."""
+        import json
+        used_pairs = set()
+        
+        try:
+            experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
+            if not experiments_file.exists():
+                return used_pairs
+            
+            with open(experiments_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            exp = json.loads(line)
+                            parent_1 = exp.get("parent_node_1")
+                            parent_2 = exp.get("parent_node_2")
+                            if parent_1 and parent_2:
+                                # Normalize pair order for consistent checking
+                                pair = tuple(sorted([parent_1, parent_2]))
+                                used_pairs.add(pair)
+                        except json.JSONDecodeError:
+                            continue
+        except Exception as e:
+            print(f"Warning: Could not load used crossbreed pairs: {e}")
+        
+        return used_pairs
+    
+    def _is_pair_already_used(self, node_a: str, node_b: str, used_pairs: set[tuple[str, str]]) -> bool:
+        """Check if a pair of experiments has already been crossbred."""
+        # Normalize pair order for consistent checking
+        pair = tuple(sorted([node_a, node_b]))
+        return pair in used_pairs
     
     def _get_crossbreed_context_simple(
         self,
