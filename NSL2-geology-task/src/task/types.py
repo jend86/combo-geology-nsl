@@ -160,12 +160,21 @@ class CapabilityExecutionContext:
     ``CapabilityInvocation`` remains agent-supplied input only. The framework
     owns this object, so tasks can enforce workflow-step and live hand-off
     rules without trusting fields the agent controls.
+
+    ``recorder`` is the live episode :class:`EventRecorder` (typed ``Any``
+    here to avoid a hard import cycle). Tasks may emit synthetic inference
+    rows through ``recorder.record_inference(...)`` — e.g. the rewriter's
+    polished training-pair, which would otherwise be invisible to the SFT
+    export because submit-only turns have an empty ``raw_response``. Optional
+    (defaults to ``None``) so unit tests that construct contexts directly do
+    not require recorder plumbing.
     """
 
     episode_id: str
     workflow_step: str | None
     episode_context: dict[str, Any]
     budget_exhaustion: BudgetExhaustion | None = None
+    recorder: Any = None
 
 
 @dataclass

@@ -20,8 +20,14 @@ class SpatialVoxelStore(VoxelStore):
     while maintaining compatibility with existing BIC scoring system.
     """
     
-    def __init__(self, store_path: Path | str, grid: GridSpec | None = None):
-        super().__init__(store_path, grid)
+    def __init__(
+        self,
+        store_path: Path | str,
+        grid: GridSpec | None = None,
+        *,
+        read_only_overlay: Path | str | None = None,
+    ):
+        super().__init__(store_path, grid, read_only_overlay=read_only_overlay)
         self._spatial_db_path = self.store_path / "spatial.db"
         self._init_spatial_database()
     

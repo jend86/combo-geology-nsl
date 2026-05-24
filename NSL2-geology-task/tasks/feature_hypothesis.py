@@ -230,9 +230,76 @@ class FeatureHypothesisState:
     
     # Crossbreeding context
     parent_experiments: list[str] = field(default_factory=list)
-    
+
     # Training data
     prompt_response_pair: dict[str, str] = field(default_factory=dict)
+
+
+class FeatureHypothesisProposerRows:
+    """SFT transform: keep proposer-persona turns, drop pure executor turns.
+
+    Mirrors :class:`tasks.geology_graph.GeologyProposerRows`. Survey,
+    hypothesise, translate, and rewrite carry the hypothesis-agent / rewriter
+    natural-language reasoning we want the model to learn; the ``code`` phase
+    is an async execution driver whose rows are mostly tool-call noise.
+
+    The synthetic ``rewrite_output`` record emitted by ``_exec_submit_rewrite``
+    inherits ``workflow_step="rewrite"`` so it passes this filter without a
+    dedicated allowlist entry.
+    """
+
+    DEFAULT_INCLUDED_WORKFLOW_STEPS: tuple[str, ...] = (
+        "survey",
+        "hypothesise",
+        "translate",
+        "rewrite",
+    )
+
+    def __init__(self, included_workflow_steps: tuple[str, ...] | None = None) -> None:
+        self._included: tuple[str, ...] = tuple(
+            included_workflow_steps
+            if included_workflow_steps is not None
+            else self.DEFAULT_INCLUDED_WORKFLOW_STEPS
+        )
+
+    @property
+    def name(self) -> str:
+        return "FeatureHypothesisProposerRows[v1]"
+
+    def config(self) -> dict[str, Any]:
+        return {"included_workflow_steps": list(self._included)}
+
+    def transform_export_rows(
+        self,
+        context: Any,
+        episodes: list[Any],
+    ) -> list[Any]:
+        del context
+        from src.training_data.transforms import EpisodeTrainingRows
+
+        allowed = set(self._included)
+        out: list[EpisodeTrainingRows] = []
+        for episode in episodes:
+            kept: list[dict[str, Any]] = []
+            for row in episode.rows:
+                step = row.get("workflow_step")
+                if step is None:
+                    raise ValueError(
+                        "feature_hypothesis export row is missing workflow_step "
+                        f"(row_id={row.get('row_id')!r})"
+                    )
+                if step in allowed:
+                    kept.append(row)
+            out.append(
+                EpisodeTrainingRows(
+                    episode_id=episode.episode_id,
+                    episode_index=episode.episode_index,
+                    generation_id=episode.generation_id,
+                    episode_score=episode.episode_score,
+                    rows=kept,
+                )
+            )
+        return out
 
 
 class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
@@ -269,7 +336,10 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         # _kg_lock().mkdir() / _save_index() etc. fails with PermissionError
         # on subsequent runs. Idempotent (exist_ok=True).
         for sub in ("coe_fairbairn",):
-            (self._store_dir / sub).mkdir(parents=True, exist_ok=True)
+            (self._store_dir / sub / "admitted" / "layers").mkdir(
+                parents=True, exist_ok=True
+            )
+            (self._store_dir / sub / "scratch").mkdir(parents=True, exist_ok=True)
             (self._kg_dir / sub).mkdir(parents=True, exist_ok=True)
 
         # Pre-warm voxel-features imports. _exec_spatial_capability /
@@ -479,7 +549,10 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             budgets=BudgetConstraints(max_task_tool_calls=100, max_llm_turns=120),
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
-    
+
+    def training_data_transforms(self) -> tuple[FeatureHypothesisProposerRows, ...]:
+        return (FeatureHypothesisProposerRows(),)
+
     # ------------------------------------------------------------------
     # Workflows
     # ------------------------------------------------------------------
@@ -1578,6 +1651,7 @@ finally:
             try:
                 knowledge_dir.mkdir(parents=True, exist_ok=True)
                 node_id = f"exp_{episode_id}" if episode_id else f"exp_{int(time.time())}"
+                feature_layer_name = translate.get('feature_layer_name', '') or ''
                 kg_record = {
                     "node_id": node_id,
                     "prompt": training_pair.get('prompt', ''),
@@ -1589,27 +1663,37 @@ finally:
                     "stage_completed": stage_completed,
                     "scoring_version": "two_stage_v1",
                     "artifact_links": {
-                        "layer_file": f"store/coe_fairbairn/layers/{translate.get('feature_layer_name', '')}.npy" if translate.get('feature_layer_name') else None,
-                        "spatial_ops": f"store/coe_fairbairn/spatial.db:experiment_{episode_id}" if episode_id else None
+                        "layer_file": f"store/coe_fairbairn/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
+                        "spatial_ops": f"store/coe_fairbairn/scratch/{episode_id}/spatial.db:experiment_{episode_id}" if episode_id else None
                     },
                     "parent_node_1": parent_node_1,
                     "parent_node_2": parent_node_2,
                     "timestamp": datetime.now().isoformat(),
                     "mutual_info": evaluate.get('mutual_info', {}),
-                    "layer_name": translate.get('feature_layer_name', ''),
+                    "layer_name": feature_layer_name,
                     "hypothesis": hypothesise.get('hypothesis', '')
                 }
 
-                # Atomic dedup: appends to experiments.jsonl only if the
-                # fingerprint (ordered parents + hypothesis) is unseen.
-                # Duplicates keep the episode's reward (the capability still
-                # returns success below) but never enter the pool.
+                # Atomic dedup + scratch→admitted promotion inside the kg
+                # lock. Duplicates keep the episode's reward but never
+                # enter the pool, and leave the scratch file for cleanup.
                 fingerprint_parents = [p for p in parent_experiments if isinstance(p, str) and p]
+                scratch_dir = (
+                    Path(store_dir) / "scratch" / episode_id
+                    if store_dir and episode_id
+                    else None
+                )
+                admitted_dir = (
+                    Path(store_dir) / "admitted" if store_dir else None
+                )
                 admitted_to_kg = self._admit_with_dedup(
                     knowledge_dir,
                     kg_record,
                     parents=fingerprint_parents,
                     hypothesis=hypothesise.get('hypothesis', ''),
+                    scratch_dir=scratch_dir,
+                    admitted_dir=admitted_dir,
+                    layer_name=feature_layer_name or None,
                 )
                 duplicate_rejected = not admitted_to_kg
                 if admitted_to_kg:
@@ -1630,6 +1714,13 @@ finally:
             # the reward breakdown for telemetry.
             ctx.episode_context["duplicate_rejected"] = True
 
+        # Emit a synthetic inference row carrying the rewriter's polished
+        # (prompt, response). The rewrite-step's real inference records have
+        # an empty raw_response (tool-call-only turns), so without this the
+        # SFT export would never see the agent's crafted training pair —
+        # finetuning would learn to emit empty responses.
+        self._record_rewrite_output_row(ctx, training_pair)
+
         return CapabilityResult(
             "submit_rewrite",
             output={
@@ -1648,6 +1739,62 @@ finally:
             success=True,
         )
     
+    @staticmethod
+    def _record_rewrite_output_row(
+        ctx: CapabilityExecutionContext,
+        training_pair: dict[str, str],
+    ) -> None:
+        """Emit one synthetic ``TrajectoryRecord`` for the rewriter's output.
+
+        Why this exists: the rewrite phase's real inference rows are tool-call
+        only (``submit_rewrite(...)``), so their ``raw_response`` is empty.
+        The polished ``(prompt, response)`` the agent crafted lives only in
+        the capability call's args — outside the recorder's view. Without
+        this synthesis, the SFT export carries empty-response rewrite rows
+        and finetuning learns nothing from the rewriter's work.
+
+        No-op when no recorder is wired (e.g. unit tests constructing
+        ``CapabilityExecutionContext`` directly without a harness).
+        """
+        recorder = ctx.recorder
+        if recorder is None:
+            return
+        prompt = training_pair.get("prompt", "")
+        response = training_pair.get("response", "")
+        if not isinstance(prompt, str) or not isinstance(response, str):
+            return
+        if not prompt and not response:
+            return
+
+        from datetime import datetime as _dt
+        from src.harness.recorder import TrajectoryRecord
+
+        record = TrajectoryRecord(
+            episode_id=ctx.episode_id,
+            phase="rewrite_output",
+            messages=[{"role": "user", "content": prompt}],
+            response=response,
+            usage=None,
+            timestamp=_dt.now().isoformat(),
+            success=True,
+            error_message=None,
+            meta={
+                "workflow_step": "rewrite",
+                "actor_role": "rewriter_output",
+                "synthesized": True,
+                "client": "task_synth",
+                "model": "task_synth",
+                "episode_id": ctx.episode_id,
+            },
+        )
+        try:
+            recorder.record_inference(record)
+        except Exception as exc:  # noqa: BLE001
+            # Telemetry is best-effort here — never let it break the capability.
+            logger.warning(
+                f"feature_hypothesis: failed to record rewrite_output row: {exc}"
+            )
+
     def _update_crossbreed_index(
         self,
         knowledge_dir: Path,
@@ -1900,13 +2047,14 @@ finally:
 
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
+            episode_id = ctx.episode_context.get("episode_id", "")
             print(f"🔧 DEBUG: Episode context keys: {list(ctx.episode_context.keys())}")
             print(f"🔧 DEBUG: Store dir: {store_dir}")
-            if not store_dir:
+            if not store_dir or not episode_id:
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error="No store directory available in episode context",
+                    error="No store directory or episode_id available in episode context",
                 )
 
             # Resolve the variation's grid from episode context. Falls back to
@@ -1916,9 +2064,18 @@ finally:
             grid_dict = ctx.episode_context.get("grid_spec") or _COE_FAIRBAIRN_GRID
             grid = GridSpec.from_dict(grid_dict)
 
-            # Create or get spatial store
+            # Per-episode scratch with the admitted pool as read-only
+            # overlay — isolates this slot's in-flight mutations from
+            # every other slot's. See
+            # docs/design/feature_hypothesis_voxel_store_isolation.md.
+            scratch_dir = Path(store_dir) / "scratch" / episode_id
+            admitted_dir = Path(store_dir) / "admitted"
+            admitted_dir.mkdir(parents=True, exist_ok=True)
+
             print("🔧 DEBUG: Creating SpatialVoxelStore...")
-            store = SpatialVoxelStore(store_dir, grid)
+            store = SpatialVoxelStore(
+                scratch_dir, grid, read_only_overlay=admitted_dir
+            )
             print(f"🔧 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
             
@@ -2023,20 +2180,26 @@ finally:
 
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
+            episode_id = ctx.episode_context.get("episode_id", "")
             print(f"🎯 DEBUG: Store dir: {store_dir}")
-            if not store_dir:
+            if not store_dir or not episode_id:
                 return CapabilityResult(
                     capability_name,
                     success=False,
-                    error="No store directory available in episode context",
+                    error="No store directory or episode_id available in episode context",
                 )
 
             grid_dict = ctx.episode_context.get("grid_spec") or _COE_FAIRBAIRN_GRID
             grid = GridSpec.from_dict(grid_dict)
 
-            # Create or get spatial store
+            scratch_dir = Path(store_dir) / "scratch" / episode_id
+            admitted_dir = Path(store_dir) / "admitted"
+            admitted_dir.mkdir(parents=True, exist_ok=True)
+
             print("🎯 DEBUG: Creating SpatialVoxelStore...")
-            store = SpatialVoxelStore(store_dir, grid)
+            store = SpatialVoxelStore(
+                scratch_dir, grid, read_only_overlay=admitted_dir
+            )
             print(f"🎯 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             
             # Route to scoring.create_feature_layer MCP tool
@@ -2275,11 +2438,32 @@ finally:
                         f"feature_hypothesis: bootstrap permit release failed "
                         f"({permit_slot_id}): {exc}"
                     )
+            # Reclaim the per-episode scratch dir. Runs unconditionally so
+            # a crashed mid-episode leaves no orphans.
+            try:
+                self.cleanup_episode_resources(episode_context)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"feature_hypothesis: scratch cleanup failed: {exc}"
+                )
+
+    def cleanup_episode_resources(
+        self, episode_context: dict[str, Any]
+    ) -> None:
+        """Remove the per-episode scratch dir. Idempotent."""
+        import shutil
+
+        store_dir = episode_context.get("store_dir")
+        episode_id = episode_context.get("episode_id")
+        if not isinstance(store_dir, str) or not isinstance(episode_id, str):
+            return
+        scratch_dir = Path(store_dir) / "scratch" / episode_id
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # Helper methods
     # ------------------------------------------------------------------
-    
+
     def _pick_container(
         self,
         containers: list[Container],
@@ -2292,18 +2476,21 @@ finally:
             if container_to_service(container) == service:
                 return container
         return None
-    
+
     def _count_features(self, variation: FeatureHypothesisVariation) -> int:
-        """Count existing features in the store."""
-        store_index = Path(variation.store_dir) / "index.json"
-        if not store_index.exists():
-            return 0
-        try:
-            with open(store_index) as f:
-                data = json.load(f)
-            return len(data.get("layers", {}))
-        except Exception:
-            return 0
+        """Count features in the admitted pool (falls back to legacy path)."""
+        admitted_index = Path(variation.store_dir) / "admitted" / "index.json"
+        legacy_index = Path(variation.store_dir) / "index.json"
+        for path in (admitted_index, legacy_index):
+            if not path.exists():
+                continue
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                return len(data.get("layers", {}))
+            except Exception:
+                continue
+        return 0
     
     def _generate_survey_prompt_with_context(self) -> str:
         """Generate survey prompt with recent experiments context for deduplication."""
@@ -2699,14 +2886,18 @@ finally:
         *,
         parents: list[str],
         hypothesis: str,
+        scratch_dir: Path | str | None = None,
+        admitted_dir: Path | str | None = None,
+        layer_name: str | None = None,
     ) -> bool:
         """Append kg_record to experiments.jsonl iff (parents, hypothesis)
         is unseen. Returns True if newly admitted, False on duplicate.
 
-        Duplicates leave the episode's reward intact — the design intent is
-        "duplicates count as successes but do not flood the pool". Callers
-        pass `parents` and `hypothesis` explicitly so the kg_record schema
-        is decoupled from the fingerprint inputs.
+        When ``scratch_dir`` / ``admitted_dir`` / ``layer_name`` are all
+        supplied, the candidate's ``.npy`` is *promoted* from scratch into
+        the admitted pool atomically inside the kg lock — only if the
+        fingerprint is fresh. Duplicates leave the scratch file in place
+        (the cleanup hook reclaims it after ``finalize_episode``).
         """
         kg_path = Path(kg_dir)
         fp = self._fingerprint(parents, hypothesis)
@@ -2716,11 +2907,75 @@ finally:
             seen: list[str] = list(ledger.get("fingerprints", []))
             if fp in seen:
                 return False
+            if (
+                scratch_dir is not None
+                and admitted_dir is not None
+                and isinstance(layer_name, str)
+                and layer_name
+            ):
+                self._promote_scratch_layer(
+                    Path(scratch_dir), Path(admitted_dir), layer_name
+                )
             with (kg_path / _KG_EXPERIMENTS).open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(kg_record) + "\n")
             seen.append(fp)
             self._atomic_write_json(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": seen})
         return True
+
+    @staticmethod
+    def _promote_scratch_layer(
+        scratch_dir: Path,
+        admitted_dir: Path,
+        layer_name: str,
+    ) -> None:
+        """Move ``scratch/layers/<name>.npy`` into ``admitted/layers/`` and
+        register it in ``admitted/index.json``. Called inside the kg lock.
+        """
+        from voxel_features.spatial import SpatialVoxelStore
+        from voxel_features.store import GridSpec
+
+        scratch_npy = scratch_dir / "layers" / f"{layer_name}.npy"
+        if not scratch_npy.exists():
+            logger.warning(
+                f"feature_hypothesis: promote skipped — {scratch_npy} missing"
+            )
+            return
+
+        scratch_index = scratch_dir / "index.json"
+        if not scratch_index.exists():
+            logger.warning(
+                f"feature_hypothesis: promote skipped — {scratch_index} missing"
+            )
+            return
+        try:
+            scratch_data = json.loads(scratch_index.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                f"feature_hypothesis: promote skipped — bad scratch index: {exc}"
+            )
+            return
+        grid = GridSpec.from_dict(scratch_data["grid"])
+
+        import numpy as np
+
+        values = np.load(scratch_npy)
+        admitted_dir.mkdir(parents=True, exist_ok=True)
+        admitted_store = SpatialVoxelStore(admitted_dir, grid)
+        if layer_name in admitted_store.layer_names:
+            scratch_npy.unlink(missing_ok=True)
+            return
+        scratch_layer_meta = (
+            scratch_data.get("layers", {}).get(layer_name, {})
+        )
+        admitted_store.add_layer(
+            name=layer_name,
+            values=values,
+            dtype=scratch_layer_meta.get("dtype", "float"),
+            metadata=scratch_layer_meta.get("metadata", {}),
+            hypothesis_uri=scratch_layer_meta.get("hypothesis_uri"),
+            experiment_id=scratch_layer_meta.get("experiment_id"),
+        )
+        scratch_npy.unlink(missing_ok=True)
 
     # ----- Bootstrap concurrency ramp ---------------------------------
 
