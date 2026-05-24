@@ -263,6 +263,15 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             "docker_compose_dir", "docker/feature-hypothesis-compose"
         )
 
+        # Pre-create the per-variation store + kg dirs as the calling user.
+        # Otherwise docker compose up's bind-mount auto-creates the missing
+        # path as root (daemon UID), then the host-side Python in
+        # _kg_lock().mkdir() / _save_index() etc. fails with PermissionError
+        # on subsequent runs. Idempotent (exist_ok=True).
+        for sub in ("coe_fairbairn",):
+            (self._store_dir / sub).mkdir(parents=True, exist_ok=True)
+            (self._kg_dir / sub).mkdir(parents=True, exist_ok=True)
+
         # Pre-warm voxel-features imports. _exec_spatial_capability /
         # _exec_scoring_capability import voxel_features.spatial (which pulls
         # in geopandas/pyproj/shapely — a ~3s cold import) synchronously on the
@@ -1882,13 +1891,13 @@ finally:
             # Import required spatial tools
             print("🔧 DEBUG: Importing spatial modules...")
             from voxel_features.spatial import SpatialVoxelStore
-            from voxel_features.store import COE_FAIRBAIRN_GRID
+            from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.spatial_tools import (
                 spatial_add_point, spatial_add_line, spatial_query_region,
                 spatial_coord_to_voxel, spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
-            
+
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
             print(f"🔧 DEBUG: Episode context keys: {list(ctx.episode_context.keys())}")
@@ -1899,10 +1908,17 @@ finally:
                     success=False,
                     error="No store directory available in episode context",
                 )
-            
+
+            # Resolve the variation's grid from episode context. Falls back to
+            # the Coe Fairbairn default if (somehow) absent. Sibling kazakhstan
+            # task does the same with its own constant — both paths used to
+            # import COE_FAIRBAIRN_GRID unconditionally and ignore grid_spec.
+            grid_dict = ctx.episode_context.get("grid_spec") or _COE_FAIRBAIRN_GRID
+            grid = GridSpec.from_dict(grid_dict)
+
             # Create or get spatial store
             print("🔧 DEBUG: Creating SpatialVoxelStore...")
-            store = SpatialVoxelStore(store_dir, COE_FAIRBAIRN_GRID)
+            store = SpatialVoxelStore(store_dir, grid)
             print(f"🔧 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
             
@@ -1999,12 +2015,12 @@ finally:
             # Import required scoring tools
             print("🎯 DEBUG: Importing scoring modules...")
             from voxel_features.spatial import SpatialVoxelStore
-            from voxel_features.store import COE_FAIRBAIRN_GRID
+            from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.scoring_tools import (
                 scoring_create_feature_layer
             )
             print("🎯 DEBUG: ✅ Imports successful")
-            
+
             # Get store directory from episode context
             store_dir = ctx.episode_context.get("store_dir")
             print(f"🎯 DEBUG: Store dir: {store_dir}")
@@ -2014,10 +2030,13 @@ finally:
                     success=False,
                     error="No store directory available in episode context",
                 )
-            
+
+            grid_dict = ctx.episode_context.get("grid_spec") or _COE_FAIRBAIRN_GRID
+            grid = GridSpec.from_dict(grid_dict)
+
             # Create or get spatial store
             print("🎯 DEBUG: Creating SpatialVoxelStore...")
-            store = SpatialVoxelStore(store_dir, COE_FAIRBAIRN_GRID)
+            store = SpatialVoxelStore(store_dir, grid)
             print(f"🎯 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             
             # Route to scoring.create_feature_layer MCP tool

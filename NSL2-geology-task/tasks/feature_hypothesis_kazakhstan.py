@@ -281,6 +281,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             "docker_compose_dir", "docker/feature-hypothesis-kazakhstan-compose"
         )
 
+        # Pre-create the per-variation store + kg dirs as the calling user.
+        # Otherwise docker compose up's bind-mount auto-creates the missing
+        # path as root (daemon UID), then the host-side Python in
+        # _kg_lock().mkdir() / _save_index() etc. fails with PermissionError
+        # on subsequent runs. Idempotent (exist_ok=True).
+        for sub in ("teniz_basin",):
+            (self._store_dir / sub).mkdir(parents=True, exist_ok=True)
+            (self._kg_dir / sub).mkdir(parents=True, exist_ok=True)
+
         # Pre-warm voxel-features imports. _exec_spatial_capability /
         # _exec_scoring_capability import voxel_features.spatial (which pulls
         # in geopandas/pyproj/shapely — a ~3s cold import) synchronously on the
