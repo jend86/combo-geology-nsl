@@ -2362,30 +2362,32 @@ finally:
         bic_delta = final.bic_delta
         masking_test_passed = final.masking_test_passed
         masking_test_improvement = final.masking_test_improvement
+        masking_test_direction = final.masking_test_direction
         admitted = final.admitted
         stage_completed = final.stage_completed
-        
+
         if bic_delta is None:
             # No feature layer created
             return TaskReward(
-                value=0.0, 
-                success=False, 
+                value=0.0,
+                success=False,
                 breakdown={
                     "no_feature": True,
                     "stage_completed": stage_completed
                 }
             )
-        
-        # Two-stage reward calculation
+
+        # Two-stage reward — bic_delta is per-sample normalized post-scoring fix.
+        # auto_pass / first_layer cannot compute a before/after MAE delta, so they
+        # take full Stage 1 credit (no baseline to compare against).
         if masking_test_passed and admitted:
-            # Both stages passed - full success
-            # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
-            stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 1000.0))  # Stage 2 contribution
-            
-            # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 0.1))
             value = 0.4 * stage1_reward + 0.6 * stage2_reward
-            
+
             return TaskReward(
                 value=value,
                 success=True,
@@ -2398,14 +2400,16 @@ finally:
                     "stage2_reward": stage2_reward,
                     "final_reward": value,
                     "both_stages_passed": True,
+                    "region": "kazakhstan",
                 },
             )
         elif masking_test_passed and not admitted:
-            # Stage 1 passed but Stage 2 failed - partial success
-            # Reward for predictive capacity even if complexity penalty too high
-            stage1_reward = min(1.0, masking_test_improvement)
-            value = 0.3 * stage1_reward  # Reduced reward for Stage 1 only
-            
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+            value = 0.3 * stage1_reward
+
             return TaskReward(
                 value=value,
                 success=False,
@@ -2416,12 +2420,12 @@ finally:
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
                     "partial_success": True,
+                    "region": "kazakhstan",
                 },
             )
         else:
-            # Stage 1 failed - no geological understanding
             return TaskReward(
-                value=0.05,  # Very small reward for attempting
+                value=0.05,
                 success=False,
                 breakdown={
                     "stage_1_passed": False,
@@ -2429,6 +2433,7 @@ finally:
                     "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
                     "no_predictive_value": True,
+                    "region": "kazakhstan",
                 },
             )
 

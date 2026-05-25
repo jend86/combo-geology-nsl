@@ -2322,6 +2322,7 @@ finally:
         bic_delta = final.bic_delta
         masking_test_passed = final.masking_test_passed
         masking_test_improvement = final.masking_test_improvement
+        masking_test_direction = final.masking_test_direction
         admitted = final.admitted
         stage_completed = final.stage_completed
         
@@ -2339,11 +2340,17 @@ finally:
         # Two-stage reward calculation
         if masking_test_passed and admitted:
             # Both stages passed - full success
-            # Combine Stage 1 improvement (0-1) and Stage 2 BIC improvement
-            stage1_reward = min(1.0, masking_test_improvement)  # Stage 1 contribution
-            # Recalibrated for MAE + Laplace BIC system  
-            # Realistic geological improvements: 1-20 BIC units, exceptional: 20+
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 20.0))  # Stage 2 contribution
+            # Stage 1: real MAE delta (auto_pass layers get full credit, they have no baseline)
+            # masking_test_improvement is now actual mae_before - mae_after delta
+            # Scale: 0.02 absolute MAE improvement = max reward (tunable)
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0  # Insufficient layers for MAE gate; full credit
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+            # Stage 2: per-sample normalized BIC delta
+            # bic_delta is now normalized by n_effective_samples (~[-0.5, 0] for good layers)
+            # Scale: 0.1/sample BIC improvement = max reward (tunable)
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 0.1))
             
             # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
             value = 0.4 * stage1_reward + 0.6 * stage2_reward
@@ -2365,7 +2372,10 @@ finally:
         elif masking_test_passed and not admitted:
             # Stage 1 passed but Stage 2 failed - partial success
             # Reward for predictive capacity even if complexity penalty too high
-            stage1_reward = min(1.0, masking_test_improvement)
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
             value = 0.3 * stage1_reward  # Reduced reward for Stage 1 only
             
             return TaskReward(
