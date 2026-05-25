@@ -212,6 +212,17 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     bootstrap_min_concurrency_fraction: float = 0.5
     bootstrap_permit_timeout_s: float = 600.0
     bootstrap_permit_stale_after_s: float = 1800.0
+    # Novelty nudge: surface the last K admitted hypotheses in the proposer
+    # prompt as a "do not propose variants of these" block. Counters the
+    # diversity collapse pattern (e.g. 3 unique fingerprints across 245
+    # episodes) at the prompt layer, complementing the lexical dedup gate.
+    # See docs/design/kazakhstan-variance-and-throughput-2026-05-24.md
+    # (Approach B).
+    novelty_nudge_enabled: bool = True
+    novelty_recent_k: int = 8
+    # Per-entry cap so the block stays bounded under long hypotheses; the
+    # rendering uses an ellipsis when exceeded.
+    novelty_max_chars_per_hypothesis: int = 280
 
 
 @dataclass
@@ -578,7 +589,20 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         episode_context: dict[str, Any],
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
-        
+
+        novelty_block = self._novelty_block_for(variation)
+        hypothesise_prompt = (
+            "Phase 2: Hypothesise\n\n"
+            + (novelty_block + "\n\n" if novelty_block else "")
+            + "Pick one candidate and state a falsifiable hypothesis.\n\n"
+            "Include a data_spec with:\n"
+            "- files: list of data sources to analyze\n"
+            "- analysis: analytical approach\n"
+            "- output: what the output should represent\n\n"
+            "Close with:\n"
+            "  record_phase(phase='hypothesise', hypothesis=..., data_spec=...)"
+        )
+
         return Workflow(
             steps=(
                 # HYPOTHESIS AGENT: Phase 1
@@ -603,20 +627,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     terminator_capabilities=("record_phase",),
                     next_steps=("hypothesise",),
                 ),
-                
+
                 # HYPOTHESIS AGENT: Phase 2
                 WorkflowStep(
                     name="hypothesise",
-                    prompt=(
-                        "Phase 2: Hypothesise\n\n"
-                        "Pick one candidate and state a falsifiable hypothesis.\n\n"
-                        "Include a data_spec with:\n"
-                        "- files: list of data sources to analyze\n"
-                        "- analysis: analytical approach\n"
-                        "- output: what the output should represent\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='hypothesise', hypothesis=..., data_spec=...)"
-                    ),
+                    prompt=hypothesise_prompt,
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -762,23 +777,27 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # Same as survey but skip survey phase
         crossbreed_ctx = episode_context.get("crossbreed_context", {})
         parent_ids = crossbreed_ctx.get("parent_ids", [])
-        
+
         base_workflow = self._survey_workflow(variation, episode_context)
-        
+
+        novelty_block = self._novelty_block_for(variation)
+        crossbreed_prompt = (
+            "Phase 2: Hypothesise (Crossbreed Mode)\n\n"
+            + (novelty_block + "\n\n" if novelty_block else "")
+            + f"Parent experiments: {parent_ids}\n\n"
+            f"{crossbreed_ctx.get('prompt', '')}\n\n"
+            "Propose a hypothesis that combines or builds on these findings.\n\n"
+            "Include a data_spec as before.\n\n"
+            "Close with:\n"
+            "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
+            f"parent_experiments={parent_ids})"
+        )
+
         # Build replacement steps tuple: swap survey for crossbreed hypothesise as entry
         crossbreed_hypothesise = WorkflowStep(
             name="hypothesise",
             is_entry=True,
-            prompt=(
-                "Phase 2: Hypothesise (Crossbreed Mode)\n\n"
-                f"Parent experiments: {parent_ids}\n\n"
-                f"{crossbreed_ctx.get('prompt', '')}\n\n"
-                "Propose a hypothesis that combines or builds on these findings.\n\n"
-                "Include a data_spec as before.\n\n"
-                "Close with:\n"
-                "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
-                f"parent_experiments={parent_ids})"
-            ),
+            prompt=crossbreed_prompt,
             inherit_all_capabilities=False,
             capabilities=(
                 "analysis_shell",
@@ -1659,14 +1678,14 @@ finally:
             print(f"Warning: Failed to save training data: {e}")
         
         # Save to knowledge graph (ONLY experiments that passed BOTH stages)
-        # Stage 1: Must pass predictive capacity test
-        # Stage 2: Must improve BIC (complexity assessment)
-        both_stages_passed = (
-            masking_test_passed and 
-            admitted and 
-            bic_delta is not None and 
-            bic_delta < 0 and
-            stage_completed == 'stage_2_completed'
+        # Stage 1: predictive capacity test; Stage 2: BIC improvement.
+        # See ``_should_persist_to_kg`` for the gate semantics, including
+        # the stage_completed string allowlist.
+        both_stages_passed = self._should_persist_to_kg(
+            masking_test_passed=masking_test_passed,
+            admitted=admitted,
+            bic_delta=bic_delta,
+            stage_completed=stage_completed,
         )
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
@@ -2793,6 +2812,128 @@ finally:
                 if isinstance(rec, dict):
                     out.append(rec)
         return out
+
+    # ``stage_completed`` strings produced by voxel-features-mcp scoring.
+    # "stage_2_completed" was the legacy label; "mae_bic_completed" replaced
+    # it when stage 2 was rewritten to use MAE+BIC. The kg gate must accept
+    # both — without this allowlist, the post-rewrite scoring path silently
+    # blocks every admission (observed mid-run: 30+ successful episodes with
+    # bic_delta < -40 000 yet `experiments.jsonl` frozen at 3 rows).
+    _STAGE_COMPLETED_ALLOWLIST: frozenset[str] = frozenset({
+        "stage_2_completed",
+        "mae_bic_completed",
+    })
+
+    @classmethod
+    def _should_persist_to_kg(
+        cls,
+        *,
+        masking_test_passed: bool,
+        admitted: bool,
+        bic_delta: float | None,
+        stage_completed: str,
+    ) -> bool:
+        """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
+        experiments enter the kg pool.
+
+        All four conditions must hold:
+          - ``masking_test_passed`` — stage 1 predictive-capacity check.
+          - ``admitted`` — stage 2 scorer admitted the layer (bic_delta < 0).
+          - ``bic_delta is not None and bic_delta < 0`` — defense in depth.
+          - ``stage_completed`` in the allowlist — proves stage 2 actually ran
+            (vs. partial / aborted scoring).
+        """
+        if not bool(masking_test_passed):
+            return False
+        if not bool(admitted):
+            return False
+        if bic_delta is None or bic_delta >= 0:
+            return False
+        return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
+
+    def _recent_admitted_hypotheses(
+        self,
+        kg_dir: Path | str,
+        k: int,
+    ) -> list[dict[str, str]]:
+        """Return up to ``k`` most recently admitted hypotheses as
+        ``[{layer_name, hypothesis}, ...]`` in admit order (oldest → newest).
+
+        Reads ``experiments.jsonl`` directly: every row there is admitted by
+        construction (see ``_admit_with_dedup``), so the join through
+        ``admitted_index.json`` is redundant and the file's append order is
+        the canonical admit order. Rows missing a non-blank ``hypothesis``
+        are skipped.
+        """
+        if k <= 0:
+            return []
+        rows = self._read_jsonl_records(Path(kg_dir) / _KG_EXPERIMENTS)
+        out: list[dict[str, str]] = []
+        for row in rows[-k:]:
+            hyp = str(row.get("hypothesis", "")).strip()
+            if not hyp:
+                continue
+            out.append({
+                "layer_name": str(row.get("layer_name") or ""),
+                "hypothesis": hyp,
+            })
+        return out
+
+    @staticmethod
+    def _render_novelty_block(
+        recent: list[dict[str, str]],
+        max_chars: int = 280,
+    ) -> str:
+        """Render the 'avoid variants of these' block, or empty on first
+        episodes.
+
+        Per-entry hypothesis is truncated to ``max_chars`` to bound the
+        per-episode input-token cost (block scales linearly with K). The
+        instruction text is deliberately strong-but-positive: "take a new
+        direction" rather than "anything-but-X", to discourage degenerate
+        anti-imitation hypotheses.
+        """
+        if not recent:
+            return ""
+        lines = [
+            "## Already discovered — DO NOT propose variants of these:",
+        ]
+        for i, entry in enumerate(recent, 1):
+            layer = entry.get("layer_name") or "(unnamed)"
+            hyp = entry.get("hypothesis") or ""
+            if max_chars > 3 and len(hyp) > max_chars:
+                hyp = hyp[: max_chars - 3].rstrip() + "..."
+            lines.append(f"{i}. [{layer}] {hyp}")
+        lines.append("")
+        lines.append(
+            "Your proposal MUST take a genuinely new direction — a different "
+            "geological process, feature family, or spatial scale than any of "
+            "the above. If your draft hypothesis overlaps with any item, "
+            "discard it and pick a different angle from the dataset."
+        )
+        return "\n".join(lines)
+
+    def _novelty_block_for(
+        self,
+        variation: "FeatureHypothesisKazakhstanVariation",
+    ) -> str:
+        """Compute the novelty-nudge prompt block for a given variation.
+
+        Returns empty when the knob is disabled, K=0, or no admissions
+        exist — callers can prepend the result unconditionally.
+        """
+        if not getattr(variation, "novelty_nudge_enabled", False):
+            return ""
+        k = int(getattr(variation, "novelty_recent_k", 0) or 0)
+        if k <= 0:
+            return ""
+        recent = self._recent_admitted_hypotheses(variation.kg_dir, k)
+        if not recent:
+            return ""
+        max_chars = int(
+            getattr(variation, "novelty_max_chars_per_hypothesis", 280) or 280
+        )
+        return self._render_novelty_block(recent, max_chars=max_chars)
 
     @staticmethod
     def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:
