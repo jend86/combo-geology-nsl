@@ -334,37 +334,44 @@ def pearson_correlation(x: np.ndarray, y: np.ndarray) -> float:
 
 def compute_moran_correction(
     layer_values: list[np.ndarray],
-    grid: 'GridSpec'
+    grid: 'GridSpec',
+    *,
+    rng: np.random.Generator | None = None,
 ) -> float:
     """
     Compute spatial autocorrelation correction using Moran's I.
-    
+
     Uses geographic coordinates to weight spatial relationships
     and estimate effective sample size for statistical tests.
-    
+
     Args:
         layer_values: List of flattened layer arrays
         grid: GridSpec containing coordinate information
-        
+        rng: Optional numpy Generator for reproducible voxel sampling.
+            Defaults to ``np.random.default_rng()`` (non-deterministic).
+
     Returns:
         Correction factor: effective_n / total_n
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     if not layer_values:
         return 1.0
-    
+
     n_voxels = len(layer_values[0])
-    
+
     # Create coordinate arrays for all voxel centers
     x_coords, y_coords, z_coords = grid.cell_centers()
-    
+
     # Flatten coordinate grids to match layer values
     x_flat = np.tile(x_coords[:, np.newaxis, np.newaxis], (1, grid.shape[1], grid.shape[2])).flatten()
     y_flat = np.tile(y_coords[np.newaxis, :, np.newaxis], (grid.shape[0], 1, grid.shape[2])).flatten()
     z_flat = np.tile(z_coords[np.newaxis, np.newaxis, :], (grid.shape[0], grid.shape[1], 1)).flatten()
-    
+
     # Build distance matrix (use subset for performance)
     max_sample_size = min(n_voxels, 1000)  # Sample for large grids
-    indices = np.random.choice(n_voxels, max_sample_size, replace=False)
+    indices = rng.choice(n_voxels, max_sample_size, replace=False)
     
     x_sample = x_flat[indices]
     y_sample = y_flat[indices]
@@ -532,22 +539,29 @@ def compute_geological_interpolation(
     layer_values: np.ndarray,
     grid: 'GridSpec',
     shape: tuple[int, int, int],
-    influence_radius_m: float = None
+    influence_radius_m: float = None,
+    *,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Apply geological interpolation using sphere of influence with inverse distance weighting.
-    
+
     OPTIMIZED VERSION: Uses spatial bounds checking to avoid O(n²) complexity.
-    
+
     Args:
         layer_values: Flattened layer array
         grid: GridSpec for spatial coordinate information
-        shape: (nx, ny, nz) voxel grid shape  
+        shape: (nx, ny, nz) voxel grid shape
         influence_radius_m: Influence radius in meters (default: 7x voxel size)
-        
+        rng: Optional numpy Generator for reproducible source selection.
+            Defaults to ``np.random.default_rng()`` (non-deterministic).
+
     Returns:
         Interpolated layer array (same shape as input)
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     if influence_radius_m is None:
         influence_radius_m = get_default_influence_radius(grid)
     
@@ -572,7 +586,7 @@ def compute_geological_interpolation(
     
     # Get source voxels (limited for performance)
     n_sources = min(len(non_zero_indices[0]), max_sources)
-    source_indices = np.random.choice(len(non_zero_indices[0]), n_sources, replace=False)
+    source_indices = rng.choice(len(non_zero_indices[0]), n_sources, replace=False)
     
     # For each source voxel, find nearby empty voxels to interpolate
     targets_processed = 0
@@ -635,69 +649,75 @@ def compute_geological_interpolation(
 # =============================================================================
 
 def create_geological_cv_split(
-    interpolated_layers: list[np.ndarray], 
+    interpolated_layers: list[np.ndarray],
     test_fraction: float = 0.2,
-    min_test_signal_ratio: float = 0.01
+    min_test_signal_ratio: float = 0.01,
+    *,
+    rng: np.random.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Create 80/20 cross-validation split with geological constraints.
-    
+
     Ensures the test set contains adequate geological signal (non-zero values)
     while maintaining random sampling for unbiased evaluation.
-    
+
     Args:
         interpolated_layers: List of interpolated flattened layer arrays
         test_fraction: Fraction of data for testing (default 0.2 = 20%)
         min_test_signal_ratio: Minimum ratio of non-zero values in test set
-        
+        rng: Optional numpy Generator for reproducible splits. Defaults to
+            ``np.random.default_rng(42)`` so that mae_before and mae_after
+            share the same split (preserves the historical seed=42 behaviour
+            without the ``np.random.seed`` global side effect).
+
     Returns:
         Tuple of (train_mask, test_mask) boolean arrays
     """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
     if not interpolated_layers:
         return np.array([]), np.array([])
-        
+
     n_voxels = len(interpolated_layers[0])
     n_test = int(n_voxels * test_fraction)
-    
+
     # Find voxels with geological signal (non-zero in any layer)
     signal_mask = np.zeros(n_voxels, dtype=bool)
     for layer in interpolated_layers:
         signal_mask |= (layer != 0)
-    
+
     signal_indices = np.where(signal_mask)[0]
     non_signal_indices = np.where(~signal_mask)[0]
-    
+
     # Calculate minimum number of signal voxels needed in test set
     min_test_signal = max(1, int(n_test * min_test_signal_ratio))
     min_test_signal = min(min_test_signal, len(signal_indices))
-    
-    # Create test set with guaranteed geological signal
-    np.random.seed(42)  # Reproducible splits
-    
+
     if len(signal_indices) >= min_test_signal:
         # Randomly select signal voxels for test set
-        test_signal_indices = np.random.choice(
-            signal_indices, 
-            size=min_test_signal, 
-            replace=False
+        test_signal_indices = rng.choice(
+            signal_indices,
+            size=min_test_signal,
+            replace=False,
         )
-        
+
         # Fill remaining test slots from all remaining voxels
         remaining_indices = np.setdiff1d(np.arange(n_voxels), test_signal_indices)
         remaining_test_size = n_test - min_test_signal
-        
+
         if remaining_test_size > 0 and len(remaining_indices) > 0:
-            additional_test_indices = np.random.choice(
+            additional_test_indices = rng.choice(
                 remaining_indices,
                 size=min(remaining_test_size, len(remaining_indices)),
-                replace=False
+                replace=False,
             )
             test_indices = np.concatenate([test_signal_indices, additional_test_indices])
         else:
             test_indices = test_signal_indices
     else:
         # Fallback: random selection if insufficient signal
-        test_indices = np.random.choice(n_voxels, size=n_test, replace=False)
+        test_indices = rng.choice(n_voxels, size=n_test, replace=False)
     
     # Create boolean masks
     test_mask = np.zeros(n_voxels, dtype=bool)
@@ -999,6 +1019,77 @@ def compute_geological_bic(
     return float(bic)
 
 
+def _single_layer_null_bic(
+    layer_values: np.ndarray,
+    layer_dtype: str,
+    grid: 'GridSpec',
+    shape: tuple[int, int, int],
+    *,
+    seed: int | None = None,
+) -> dict:
+    """Compute a "predict-by-mean" null-model BIC for a single layer.
+
+    Used as the score_before baseline when the second layer is being
+    evaluated: comparing the two-layer BIC against ``bic=0`` (the historical
+    n_layers==1 sentinel) is an apples-to-oranges baseline that produces
+    spurious deltas. This null model encodes the lone layer with its own
+    mean, so the 2-layer BIC delta measures actual predictive gain.
+
+    Returns a dict with the same shape as ``geological_coherence_score`` so
+    the caller can use it interchangeably.
+    """
+    rng = np.random.default_rng(seed) if seed is not None else None
+    interpolated = compute_geological_interpolation(layer_values, grid, shape, rng=rng)
+    non_zero = interpolated[interpolated != 0]
+    n_eff = int(max(len(non_zero), 10))
+
+    if len(non_zero) < 2 or np.std(non_zero) <= 1e-12:
+        # Degenerate layer (empty, constant, or one point); no meaningful null.
+        return {
+            "system_coherence": 1.0,
+            "spatial_correction": 1.0,
+            "coherence_matrix": np.array([[0.0]]),
+            "bic": 0.0,
+            "total_cv_mse": 0.0,
+            "per_layer_mse": {},
+            "masking_test_passed": True,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "single_layer_null",
+            "stage_completed": "mae_bic_completed",
+            "system_mae": 0.0,
+            "n_effective_samples": n_eff,
+        }
+
+    layer_mean = float(np.nanmean(non_zero))
+    mad = float(np.mean(np.abs(non_zero - layer_mean)))
+    if mad <= 1e-10:
+        log_likelihood = n_eff * 10.0
+    else:
+        log_likelihood = -n_eff * float(np.log(2 * mad)) - n_eff
+
+    moran_rng = np.random.default_rng(seed) if seed is not None else None
+    spatial_correction = compute_moran_correction([layer_values], grid, rng=moran_rng)
+    corrected_log_likelihood = log_likelihood * spatial_correction
+
+    # 1 parameter: the layer's mean
+    bic = -2.0 * corrected_log_likelihood + 1.0 * float(np.log(max(n_eff, 1)))
+
+    return {
+        "system_coherence": float(np.exp(-mad)),
+        "spatial_correction": spatial_correction,
+        "coherence_matrix": np.array([[0.0]]),
+        "bic": float(bic),
+        "total_cv_mse": float(1.0 - np.exp(-mad)),
+        "per_layer_mse": {},
+        "masking_test_passed": True,
+        "masking_test_improvement": 0.0,
+        "masking_test_direction": "single_layer_null",
+        "stage_completed": "mae_bic_completed",
+        "system_mae": mad,
+        "n_effective_samples": n_eff,
+    }
+
+
 def system_mae_to_coherence(
     mae_matrix: np.ndarray
 ) -> float:
@@ -1049,31 +1140,34 @@ def system_mae_to_coherence(
 def compute_pairwise_mae(
     layer_values: list[np.ndarray],
     layer_dtypes: list[str],  # Ignored - all treated as continuous
-    grid: 'GridSpec'
+    grid: 'GridSpec',
+    *,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Compute pairwise MAE values between all layer combinations.
-    
+
     Replaces compute_pairwise_r_squared with unified continuous approach.
     All geological layers (boolean faults, continuous grades) treated as
     continuous variables using cross-validated MAE prediction.
-    
+
     Args:
         layer_values: List of interpolated flattened layer arrays
         layer_dtypes: List of data types (ignored - unified continuous approach)
         grid: GridSpec for spatial information
-        
+        rng: Optional numpy Generator forwarded to ``create_geological_cv_split``.
+
     Returns:
         Symmetric matrix of MAE values (lower = better prediction)
     """
     n_layers = len(layer_values)
     if n_layers == 0:
         return np.array([])
-    
+
     mae_matrix = np.zeros((n_layers, n_layers))
-    
+
     # Create cross-validation split once for all predictions
-    train_mask, test_mask = create_geological_cv_split(layer_values)
+    train_mask, test_mask = create_geological_cv_split(layer_values, rng=rng)
     
     # Validate the split
     split_stats = validate_geological_split(train_mask, test_mask, layer_values)
@@ -1117,10 +1211,12 @@ def compute_pairwise_mae(
 
 
 def create_spatial_mask(
-    shape: tuple[int, int, int], 
+    shape: tuple[int, int, int],
     grid: 'GridSpec',
     mask_fraction: float = 0.2,
-    spatial_clustering: bool = True
+    spatial_clustering: bool = True,
+    *,
+    rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
     Create a spatially-aware mask for validation testing.
@@ -1134,26 +1230,29 @@ def create_spatial_mask(
     Returns:
         Boolean mask array (True = masked/held out, False = training)
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     total_voxels = shape[0] * shape[1] * shape[2]
     n_masked = int(total_voxels * mask_fraction)
-    
+
     if spatial_clustering and n_masked > 0:
         # Create spatially clustered mask regions for realistic geological testing
         mask = np.zeros(shape, dtype=bool)
-        
+
         # Create ~10 cluster centers
         n_clusters = max(1, min(10, n_masked // 100))
         cluster_centers = []
-        
+
         for _ in range(n_clusters):
-            center_i = np.random.randint(0, shape[0])
-            center_j = np.random.randint(0, shape[1]) 
-            center_k = np.random.randint(0, shape[2])
+            center_i = rng.integers(0, shape[0])
+            center_j = rng.integers(0, shape[1])
+            center_k = rng.integers(0, shape[2])
             cluster_centers.append((center_i, center_j, center_k))
-        
+
         # Assign each voxel to nearest cluster and mask some percentage
         masked_count = 0
-        cluster_sizes = np.random.multinomial(n_masked, [1/n_clusters] * n_clusters)
+        cluster_sizes = rng.multinomial(n_masked, [1/n_clusters] * n_clusters)
         
         for cluster_idx, (center_i, center_j, center_k) in enumerate(cluster_centers):
             target_size = cluster_sizes[cluster_idx]
@@ -1179,9 +1278,9 @@ def create_spatial_mask(
             
             # Sample voxels for this cluster
             flat_probs = probabilities.flatten()
-            flat_indices = np.random.choice(
-                total_voxels, size=min(target_size, total_voxels), 
-                replace=False, p=flat_probs
+            flat_indices = rng.choice(
+                total_voxels, size=min(target_size, total_voxels),
+                replace=False, p=flat_probs,
             )
             
             # Convert to 3D indices and mask
@@ -1202,10 +1301,10 @@ def create_spatial_mask(
         # Simple random masking fallback
         mask = np.zeros(total_voxels, dtype=bool)
         if n_masked > 0:
-            masked_indices = np.random.choice(total_voxels, size=n_masked, replace=False)
+            masked_indices = rng.choice(total_voxels, size=n_masked, replace=False)
             mask[masked_indices] = True
         mask = mask.reshape(shape)
-    
+
     return mask
 
 
@@ -1275,8 +1374,16 @@ def evaluate_bidirectional_prediction(
     min_improvement: float = 0.01
 ) -> dict:
     """
+    DEPRECATED — not on the live scoring path.
+
+    Retained for the future Approach B (ground-truth-holdout) successor; see
+    ``NSL2-geology-task/docs/design/scoring-fix-and-replay-2026-05-25.md`` §6.6.
+    The current Stage-1 gate is implemented inside ``evaluate_new_layer`` as a
+    direct MAE-delta check using ``geological_coherence_score``'s ``system_mae``
+    field. Do not call this in new code.
+
     Test if adding a new layer improves prediction in either direction.
-    
+
     Stage 1 of two-stage scoring: bidirectional masked prediction test.
     Tests both:
     - Direction A: Can new layer improve prediction of existing layers?
@@ -1423,7 +1530,9 @@ def geological_coherence_score(
     grid: 'GridSpec',
     shape: tuple[int, int, int],
     enable_masking_test: bool = True,
-    masking_test_threshold: float = 0.01  # MAE improvement threshold
+    masking_test_threshold: float = 0.01,  # MAE improvement threshold
+    *,
+    seed: int | None = None,
 ) -> dict:
     """
     Compute geological coherence score using MAE + Laplace likelihood BIC.
@@ -1501,10 +1610,16 @@ def geological_coherence_score(
             "n_effective_samples": 0,
         }
     
+    # Build a deterministic generator when ``seed`` is supplied so that
+    # ``mae_before`` and ``mae_after`` calls (from evaluate_new_layer) share the
+    # same RNG sequence and the scoring is reproducible for replay. With
+    # ``seed=None`` the legacy non-deterministic behaviour is preserved.
+    rng = np.random.default_rng(seed) if seed is not None else None
+
     # Apply geological interpolation to reduce sparsity
     interpolated_layers = []
     for layer in layer_values:
-        interpolated = compute_geological_interpolation(layer, grid, shape)
+        interpolated = compute_geological_interpolation(layer, grid, shape, rng=rng)
         interpolated_layers.append(interpolated)
     
     # Calculate effective samples based on non-zero values in interpolated data
@@ -1528,14 +1643,18 @@ def geological_coherence_score(
             "n_effective_samples": 0,
         }
     
-    # Compute pairwise MAE matrix using unified continuous approach
-    mae_matrix = compute_pairwise_mae(interpolated_layers, layer_dtypes, grid)
-    
+    # Compute pairwise MAE matrix using unified continuous approach.
+    # When ``seed`` is set, build a fresh rng per call so both
+    # ``mae_before`` and ``mae_after`` see the same CV split.
+    pairwise_rng = np.random.default_rng(seed) if seed is not None else None
+    mae_matrix = compute_pairwise_mae(interpolated_layers, layer_dtypes, grid, rng=pairwise_rng)
+
     # Convert MAE matrix to coherence score for compatibility
     system_coherence = system_mae_to_coherence(mae_matrix)
-    
+
     # Spatial autocorrelation correction using original data
-    spatial_correction = compute_moran_correction(layer_values, grid)
+    moran_rng = np.random.default_rng(seed) if seed is not None else None
+    spatial_correction = compute_moran_correction(layer_values, grid, rng=moran_rng)
     
     # Compute Laplace likelihood BIC from MAE matrix
     bic = compute_geological_bic(
@@ -1822,6 +1941,7 @@ def evaluate_new_layer(
     *,
     ridge_alpha: float = 1.0,
     n_folds: int = 5,
+    seed: int | None = None,
 ) -> dict:
     """
     Evaluate adding a new layer to the store using MAE + Laplace likelihood BIC.
@@ -1891,16 +2011,46 @@ def evaluate_new_layer(
     existing_values = [store.get_layer_values(n).flatten() for n in existing_layers]
     existing_dtypes = [store.get_layer(n).dtype for n in existing_layers]
     
-    # Score WITHOUT new layer (always call to get system_mae / n_effective_samples)
-    score_before = geological_coherence_score(
-        existing_values, existing_dtypes, store.grid, grid_shape
-    )
-    
+    # Resolve the effective seed: explicit > VFM_EPISODE_ID env > default 42.
+    # When the env var is set by the framework (per-episode), each episode
+    # produces a different but reproducible scoring. Without it we fall back
+    # to a fixed seed so the rubber-stamp pre-fix behaviour cannot return
+    # silently (replay needs determinism, not coin flips).
+    effective_seed: int | None
+    if seed is not None:
+        effective_seed = seed
+    else:
+        import os as _os
+        env_eid = _os.environ.get("VFM_EPISODE_ID")
+        if env_eid:
+            # Stable 32-bit hash; avoids Python's randomised hash() seed.
+            import hashlib as _hashlib
+            effective_seed = int(_hashlib.sha256(env_eid.encode()).hexdigest()[:8], 16)
+        else:
+            effective_seed = 42
+
+    # Score WITHOUT new layer (always call to get system_mae / n_effective_samples).
+    # ``seed`` is reused for both before/after so the CV split, Moran sample,
+    # and interpolation sources are identical between the two calls.
+    # When there is exactly one existing layer, geological_coherence_score
+    # returns bic=0 (no pairwise predictions possible). Using zero as the
+    # baseline produces an artefactual bic_delta. Substitute a predict-by-mean
+    # null model so the 2-layer BIC delta measures actual predictive gain.
+    if len(existing_values) == 1:
+        score_before = _single_layer_null_bic(
+            existing_values[0], existing_dtypes[0], store.grid, grid_shape,
+            seed=effective_seed,
+        )
+    else:
+        score_before = geological_coherence_score(
+            existing_values, existing_dtypes, store.grid, grid_shape, seed=effective_seed
+        )
+
     # Score WITH new layer
     all_values = existing_values + [new_values_flat]
     all_dtypes = existing_dtypes + [layer_dtype]
     score_after = geological_coherence_score(
-        all_values, all_dtypes, store.grid, grid_shape
+        all_values, all_dtypes, store.grid, grid_shape, seed=effective_seed
     )
     
     # Raw BIC values

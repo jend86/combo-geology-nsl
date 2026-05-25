@@ -3,7 +3,8 @@
 Exposes tools for:
 - Feature layer CRUD
 - MDL/MI scoring
-- Experiment recording and crossbreeding
+- Spatial point/line operations
+- Sandboxed Python execution
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from mcp.types import Tool, TextContent
 
 from voxel_features.store import VoxelStore
 from voxel_features.spatial import SpatialVoxelStore
-from voxel_features.knowledge_graph import KnowledgeGraph
 from voxel_features.mcp.tools.feature_tools import (
     feature_create, feature_get, feature_list, feature_delete
 )
@@ -27,11 +27,6 @@ from voxel_features.mcp.tools.scoring_tools import (
     scoring_compute_mdl, scoring_mutual_information,
     scoring_marginal_contribution, scoring_evaluate_layer,
     scoring_create_feature_layer
-)
-from voxel_features.mcp.tools.experiment_tools import (
-    experiment_record, experiment_get, experiment_list_admitted,
-    experiment_get_crossbreed_pairs, experiment_export_training,
-    experiment_list_recent
 )
 from voxel_features.mcp.tools.spatial_tools import (
     spatial_add_point, spatial_add_line, spatial_query_region,
@@ -45,7 +40,6 @@ from voxel_features.mcp.tools.execution_tools import (
 
 # Global state (initialized on first use)
 _store: SpatialVoxelStore | None = None
-_kg: KnowledgeGraph | None = None
 
 
 def _get_store() -> SpatialVoxelStore:
@@ -64,15 +58,6 @@ def _get_store() -> SpatialVoxelStore:
         
         _store = SpatialVoxelStore(store_path, grid)
     return _store
-
-
-def _get_kg() -> KnowledgeGraph:
-    """Get or create the knowledge graph."""
-    global _kg
-    if _kg is None:
-        kg_path = Path(os.environ.get("VFM_KG_PATH", "/tmp/voxel-features/knowledge"))
-        _kg = KnowledgeGraph(kg_path)
-    return _kg
 
 
 # Define tools
@@ -189,76 +174,6 @@ TOOLS = [
                 },
             },
             "required": ["name"],
-        },
-    ),
-    # Experiment tools
-    Tool(
-        name="experiment.record",
-        description="Record a completed experiment with hypothesis and results",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "hypothesis": {"type": "string"},
-                "rationale": {"type": "string"},
-                "data_spec": {"type": "object"},
-                "code_executed": {"type": "string"},
-                "result_summary": {"type": "string"},
-                "feature_layer_name": {"type": "string"},
-                "mdl_before": {"type": "number"},
-                "mdl_after": {"type": "number"},
-                "mdl_delta": {"type": "number"},
-                "mutual_info": {"type": "object"},
-                "admitted": {"type": "boolean"},
-                "parent_experiments": {"type": "array", "items": {"type": "string"}},
-                "episode_id": {"type": "string"},
-                "variation_name": {"type": "string"},
-            },
-            "required": ["hypothesis", "rationale", "code_executed", "result_summary"],
-        },
-    ),
-    Tool(
-        name="experiment.get",
-        description="Get an experiment record by ID",
-        inputSchema={
-            "type": "object",
-            "properties": {"experiment_id": {"type": "string"}},
-            "required": ["experiment_id"],
-        },
-    ),
-    Tool(
-        name="experiment.list_admitted",
-        description="List all admitted experiments (for crossbreeding)",
-        inputSchema={"type": "object", "properties": {}},
-    ),
-    Tool(
-        name="experiment.get_crossbreed_pairs",
-        description="Get pairs of experiments for crossbreeding with prompts",
-        inputSchema={
-            "type": "object",
-            "properties": {"max_pairs": {"type": "integer", "default": 5}},
-        },
-    ),
-    Tool(
-        name="experiment.list_recent",
-        description="List recent experiments for hypothesis deduplication",
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "max_experiments": {
-                    "type": "integer",
-                    "description": "Maximum number of recent experiments to return",
-                    "default": 10
-                }
-            },
-        },
-    ),
-    Tool(
-        name="experiment.export_training",
-        description="Export experiments as JSONL training data",
-        inputSchema={
-            "type": "object",
-            "properties": {"output_path": {"type": "string"}},
-            "required": ["output_path"],
         },
     ),
     # Spatial tools
@@ -404,8 +319,7 @@ TOOLS = [
 async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Route tool calls to implementations."""
     store = _get_store()
-    kg = _get_kg()
-    
+
     # Feature tools
     if name == "feature.create":
         return feature_create(store, **arguments)
@@ -427,21 +341,7 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return scoring_evaluate_layer(store, **arguments)
     elif name == "scoring.create_feature_layer":
         return scoring_create_feature_layer(store, **arguments)
-    
-    # Experiment tools
-    elif name == "experiment.record":
-        return experiment_record(kg, **arguments)
-    elif name == "experiment.get":
-        return experiment_get(kg, **arguments)
-    elif name == "experiment.list_admitted":
-        return experiment_list_admitted(kg)
-    elif name == "experiment.get_crossbreed_pairs":
-        return experiment_get_crossbreed_pairs(kg, **arguments)
-    elif name == "experiment.list_recent":
-        return experiment_list_recent(kg, **arguments)
-    elif name == "experiment.export_training":
-        return experiment_export_training(kg, **arguments)
-    
+
     # Spatial tools
     elif name == "spatial.add_point":
         return spatial_add_point(store, **arguments)

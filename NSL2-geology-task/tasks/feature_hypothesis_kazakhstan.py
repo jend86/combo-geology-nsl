@@ -1650,7 +1650,7 @@ finally:
                     'stage_1_direction': masking_test_direction,
                     'stage_completed': stage_completed,
                     'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
-                    'scoring_version': 'two_stage_v1'
+                    'scoring_version': 'two_stage_v2'
                 }
             }
         }
@@ -1719,7 +1719,7 @@ finally:
                     "masking_test_improvement": masking_test_improvement,
                     "masking_test_direction": masking_test_direction,
                     "stage_completed": stage_completed,
-                    "scoring_version": "two_stage_v1",
+                    "scoring_version": "two_stage_v2",
                     "artifact_links": {
                         "layer_file": f"store/teniz_basin/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
                         "spatial_ops": f"store/teniz_basin/scratch/{episode_id}/spatial.db:experiment_{episode_id}" if episode_id else None
@@ -2384,8 +2384,8 @@ finally:
             if masking_test_direction in ("auto_pass", "first_layer"):
                 stage1_reward = 1.0
             else:
-                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 0.1))
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 1.0))
             value = 0.4 * stage1_reward + 0.6 * stage2_reward
 
             return TaskReward(
@@ -2407,7 +2407,7 @@ finally:
             if masking_test_direction in ("auto_pass", "first_layer"):
                 stage1_reward = 1.0
             else:
-                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
             value = 0.3 * stage1_reward
 
             return TaskReward(

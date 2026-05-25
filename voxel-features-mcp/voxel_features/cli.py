@@ -12,7 +12,6 @@ from voxel_features.store import (
     GridSpec,
     COE_FAIRBAIRN_GRID,
 )
-from voxel_features.knowledge_graph import KnowledgeGraph
 from voxel_features import scoring
 
 app = typer.Typer(help="Voxel feature store CLI")
@@ -55,22 +54,6 @@ def mdl(store_path: Path = typer.Argument(..., help="Path to store directory")):
     
     typer.echo(f"MDL: {mdl_bits:.2f} bits")
     typer.echo(f"Layers: {len(store.layer_names)}")
-
-
-@app.command()
-def export_training(
-    kg_path: Path = typer.Argument(..., help="Path to knowledge graph"),
-    output: Path = typer.Argument(..., help="Output JSONL path"),
-):
-    """Export training data from knowledge graph."""
-    kg = KnowledgeGraph(kg_path)
-    count = kg.export_training_data(output)
-    
-    typer.echo(f"Exported {count} records to {output}")
-    
-    stats = kg.stats()
-    typer.echo(f"Total experiments: {stats['total_experiments']}")
-    typer.echo(f"Admission rate: {stats['admission_rate']:.1%}")
 
 
 if __name__ == "__main__":

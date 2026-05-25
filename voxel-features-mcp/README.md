@@ -50,14 +50,13 @@ vfm export-training /path/to/kg /path/to/training.jsonl
 vfm-mcp
 
 # With custom paths
-VFM_STORE_PATH=/path/to/store VFM_KG_PATH=/path/to/kg vfm-mcp
+VFM_STORE_PATH=/path/to/store vfm-mcp
 ```
 
 ### Python API
 
 ```python
 from voxel_features import VoxelStore, GridSpec, compute_mdl, mutual_information
-from voxel_features.knowledge_graph import KnowledgeGraph
 
 # Create store with Coe Fairbairn grid
 from voxel_features.store import COE_FAIRBAIRN_GRID
@@ -71,19 +70,11 @@ store.add_layer("test_feature", values, dtype="float")
 # Compute MDL
 mdl = compute_mdl(store)
 print(f"MDL: {mdl} bits")
-
-# Record an experiment
-from voxel_features.knowledge_graph import KnowledgeGraph, ExperimentRecord
-kg = KnowledgeGraph("/path/to/kg")
-record = ExperimentRecord(
-    hypothesis="Au correlates with Y anomalies",
-    rationale="REE pathfinder association",
-    code_executed="...",
-    result_summary="p < 0.01",
-    admitted=True,
-)
-kg.record(record)
 ```
+
+> Experiment persistence is owned by the task framework (writes a JSONL ledger at
+> `<kg_dir>/experiments.jsonl`); the previous `KnowledgeGraph` Python class was
+> removed in the scoring-fix-and-replay-2026-05-25 cleanup.
 
 ## MCP Tools
 
@@ -104,16 +95,6 @@ kg.record(record)
 | `scoring.mutual_information` | MI between two layers |
 | `scoring.marginal_contribution` | Layer's contribution to compression |
 | `scoring.evaluate_layer` | Evaluate + admit/reject a new layer |
-
-### Experiment Tools
-
-| Tool | Description |
-|------|-------------|
-| `experiment.record` | Record a completed experiment |
-| `experiment.get` | Get experiment by ID |
-| `experiment.list_admitted` | List admitted experiments |
-| `experiment.get_crossbreed_pairs` | Get pairs for crossbreeding |
-| `experiment.export_training` | Export JSONL training data |
 
 ## Grid Specification
 

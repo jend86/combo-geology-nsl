@@ -565,7 +565,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
         # Generate dynamic survey prompt with recent experiments context
-        survey_prompt = self._generate_survey_prompt_with_context()
+        survey_prompt = self._generate_survey_prompt_with_context(variation)
         
         return Workflow(
             steps=(
@@ -1592,7 +1592,7 @@ finally:
                     'stage_1_direction': masking_test_direction,
                     'stage_completed': stage_completed,
                     'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
-                    'scoring_version': 'two_stage_v1'
+                    'scoring_version': 'two_stage_v2'
                 }
             }
         }
@@ -1661,7 +1661,7 @@ finally:
                     "masking_test_improvement": masking_test_improvement,
                     "masking_test_direction": masking_test_direction,
                     "stage_completed": stage_completed,
-                    "scoring_version": "two_stage_v1",
+                    "scoring_version": "two_stage_v2",
                     "artifact_links": {
                         "layer_file": f"store/coe_fairbairn/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
                         "spatial_ops": f"store/coe_fairbairn/scratch/{episode_id}/spatial.db:experiment_{episode_id}" if episode_id else None
@@ -2342,15 +2342,17 @@ finally:
             # Both stages passed - full success
             # Stage 1: real MAE delta (auto_pass layers get full credit, they have no baseline)
             # masking_test_improvement is now actual mae_before - mae_after delta
-            # Scale: 0.02 absolute MAE improvement = max reward (tunable)
+            # Scale: 1e-4 absolute MAE improvement = max reward
+            # (calibrated to observed post-fix admit distribution [8e-06, 1e-04])
             if masking_test_direction in ("auto_pass", "first_layer"):
                 stage1_reward = 1.0  # Insufficient layers for MAE gate; full credit
             else:
-                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
             # Stage 2: per-sample normalized BIC delta
-            # bic_delta is now normalized by n_effective_samples (~[-0.5, 0] for good layers)
-            # Scale: 0.1/sample BIC improvement = max reward (tunable)
-            stage2_reward = min(1.0, max(0.0, -bic_delta / 0.1))
+            # bic_delta is now normalized by n_effective_samples (~[-1.0, 0] for good layers)
+            # Scale: 1.0/sample BIC improvement = max reward
+            # (calibrated to observed post-fix admit distribution [-0.91, -0.03])
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 1.0))
             
             # Weighted combination: Stage 1 (40%) + Stage 2 (60%)
             value = 0.4 * stage1_reward + 0.6 * stage2_reward
@@ -2375,7 +2377,7 @@ finally:
             if masking_test_direction in ("auto_pass", "first_layer"):
                 stage1_reward = 1.0
             else:
-                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
             value = 0.3 * stage1_reward  # Reduced reward for Stage 1 only
             
             return TaskReward(
@@ -2502,8 +2504,17 @@ finally:
                 continue
         return 0
     
-    def _generate_survey_prompt_with_context(self) -> str:
-        """Generate survey prompt with recent experiments context for deduplication."""
+    def _generate_survey_prompt_with_context(
+        self,
+        variation: FeatureHypothesisVariation,
+    ) -> str:
+        """Generate survey prompt with recent admitted experiments for dedup.
+
+        Reads ``experiments.jsonl`` from the variation's ``kg_dir``. Every row
+        there is admitted by construction (see ``_admit_with_dedup``). Pre-fix
+        this branch silently failed because the old KnowledgeGraph class was
+        instantiated with a GridSpec — see scoring-fix-and-replay-2026-05-25.md.
+        """
         base_prompt = (
             "Phase 1: Survey\n\n"
             "Explore the dataset to identify feature opportunities.\n\n"
@@ -2511,50 +2522,33 @@ finally:
             "- Read file headers and schemas\n"
             "- Identify interesting patterns\n\n"
         )
-        
-        # Try to get recent experiments for context
+
         try:
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
-            
-            from voxel_features.knowledge_graph import KnowledgeGraph
-            from voxel_features.store import COE_FAIRBAIRN_GRID
-            
-            kg = KnowledgeGraph(COE_FAIRBAIRN_GRID)
-            all_experiments = kg.list_all()
-            
-            if all_experiments:
-                # Get 5 most recent experiments
-                recent_experiments = sorted(
-                    all_experiments,
-                    key=lambda exp: exp.timestamp,
-                    reverse=True
-                )[:5]
-                
+            kg_dir = Path(variation.kg_dir) if variation.kg_dir else None
+            recent_rows: list[dict[str, Any]] = []
+            if kg_dir is not None and kg_dir.exists():
+                rows = self._read_jsonl_records(kg_dir / _KG_EXPERIMENTS)
+                recent_rows = rows[-5:][::-1]  # last 5 admits, newest first
+
+            if recent_rows:
                 context_prompt = "\n**AVOID REPEATING RECENT EXPERIMENTS:**\n"
                 context_prompt += "Recent hypotheses already tested (don't repeat these patterns):\n"
-                
-                for i, exp in enumerate(recent_experiments, 1):
-                    status = "✅ ADMITTED" if exp.admitted else "❌ REJECTED"
-                    context_prompt += f"{i}. {exp.hypothesis} [{status}]\n"
-                    context_prompt += f"   Result: {exp.result_summary[:100]}...\n"
-                
+                for i, row in enumerate(recent_rows, 1):
+                    hyp = str(row.get("hypothesis", "")).strip() or "(no hypothesis)"
+                    # Every row in experiments.jsonl is admitted by construction
+                    context_prompt += f"{i}. {hyp} [ADMITTED]\n"
                 context_prompt += "\nFocus on NEW geological patterns not covered above.\n\n"
                 base_prompt += context_prompt
-            
         except Exception as e:
             # If we can't get recent experiments, continue with base prompt
             print(f"Warning: Could not load recent experiments context: {e}")
-        
+
         base_prompt += (
             "Find 2-3 promising feature layer candidates.\n\n"
             "Close with:\n"
             "  record_phase(phase='survey', candidates=[...])"
         )
-        
+
         return base_prompt
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
