@@ -1479,7 +1479,9 @@ def geological_coherence_score(
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
             "masking_test_direction": "not_applicable",
-            "stage_completed": "mae_bic_completed"
+            "stage_completed": "mae_bic_completed",
+            "system_mae": 0.0,
+            "n_effective_samples": 0,
         }
     
     if n_layers == 1:
@@ -1492,9 +1494,11 @@ def geological_coherence_score(
             "total_cv_mse": 0.0,
             "per_layer_mse": {},
             "masking_test_passed": True,
-            "masking_test_improvement": 1.0,
+            "masking_test_improvement": 0.0,
             "masking_test_direction": "single_layer",
-            "stage_completed": "mae_bic_completed"
+            "stage_completed": "mae_bic_completed",
+            "system_mae": 0.0,
+            "n_effective_samples": 0,
         }
     
     # Apply geological interpolation to reduce sparsity
@@ -1519,7 +1523,9 @@ def geological_coherence_score(
             "masking_test_passed": False,
             "masking_test_improvement": 0.0,
             "masking_test_direction": "no_data",
-            "stage_completed": "mae_bic_completed"
+            "stage_completed": "mae_bic_completed",
+            "system_mae": float('inf'),
+            "n_effective_samples": 0,
         }
     
     # Compute pairwise MAE matrix using unified continuous approach
@@ -1542,9 +1548,8 @@ def geological_coherence_score(
     # Legacy compatibility mappings
     total_cv_mse = 1.0 - system_coherence * spatial_correction
     
-    # Quality assessment for masking test compatibility
-    system_mae = np.mean(mae_matrix[~np.eye(n_layers, dtype=bool)]) if n_layers > 1 else 0.0
-    mae_improvement = max(0.0, 1.0 - system_mae)  # Higher = better
+    # System-wide MAE (mean of off-diagonal pairwise MAEs)
+    system_mae = float(np.mean(mae_matrix[~np.eye(n_layers, dtype=bool)]))
     
     return {
         "system_coherence": system_coherence,
@@ -1553,10 +1558,12 @@ def geological_coherence_score(
         "bic": bic,
         "total_cv_mse": total_cv_mse,
         "per_layer_mse": {},  # Legacy compatibility
-        "masking_test_passed": True,  # Simplified - MAE handles quality naturally
-        "masking_test_improvement": mae_improvement,
+        "masking_test_passed": True,  # Placeholder; real gate applied in evaluate_new_layer
+        "masking_test_improvement": 0.0,  # Placeholder; real delta computed in evaluate_new_layer
         "masking_test_direction": "unified_continuous",
-        "stage_completed": "mae_bic_completed"
+        "stage_completed": "mae_bic_completed",
+        "system_mae": system_mae,
+        "n_effective_samples": effective_samples,
     }
 
 
@@ -1866,25 +1873,28 @@ def evaluate_new_layer(
             "bic_before": 0.0,
             "bic_after": 0.0,
             "bic_delta": -1.0,
+            "bic_delta_raw": -1.0,
+            "n_effective_samples": 0,
             "cv_mse_before": 0.0,
             "cv_mse_after": 0.0,
             "cv_mse_delta": 0.0,
             "mutual_info": {},
             "admitted": True,
             "predicted_value": 1.0,
+            "masking_test_passed": True,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "first_layer",
+            "stage_completed": "mae_bic_completed",
         }
     
     # Get existing layer values and dtypes
     existing_values = [store.get_layer_values(n).flatten() for n in existing_layers]
     existing_dtypes = [store.get_layer(n).dtype for n in existing_layers]
     
-    # Score WITHOUT new layer
-    if len(existing_values) >= 2:
-        score_before = geological_coherence_score(
-            existing_values, existing_dtypes, store.grid, grid_shape
-        )
-    else:
-        score_before = {"bic": 0.0, "total_cv_mse": 0.0, "per_layer_mse": {}}
+    # Score WITHOUT new layer (always call to get system_mae / n_effective_samples)
+    score_before = geological_coherence_score(
+        existing_values, existing_dtypes, store.grid, grid_shape
+    )
     
     # Score WITH new layer
     all_values = existing_values + [new_values_flat]
@@ -1893,41 +1903,53 @@ def evaluate_new_layer(
         all_values, all_dtypes, store.grid, grid_shape
     )
     
-    # BIC delta (negative = improved)
+    # Raw BIC values
     bic_before = score_before["bic"]
     bic_after = score_after["bic"]
-    bic_delta = bic_after - bic_before
+    bic_delta_raw = bic_after - bic_before
+    
+    # Normalize BIC delta by effective sample count to remove grid-size artifact
+    n_eff = max(score_after.get("n_effective_samples", 1), 1)
+    bic_delta = bic_delta_raw / n_eff  # per-sample BIC delta; range ~[-0.5, 0] for good layers
     
     cv_mse_before = score_before["total_cv_mse"]
     cv_mse_after = score_after["total_cv_mse"]
     cv_mse_delta = cv_mse_after - cv_mse_before
     
-    # Extract Stage 1 fields from score_after first
-    stage1_fields = {
-        "masking_test_passed": score_after.get("masking_test_passed", True),
-        "masking_test_improvement": score_after.get("masking_test_improvement", 0.0),
-        "masking_test_direction": score_after.get("masking_test_direction", "not_applicable"),
-        "stage_completed": score_after.get("stage_completed", "stage_2_completed")
-    }
+    # -----------------------------------------------------------------------
+    # Stage 1: Real MAE gate - does adding this layer reduce system MAE?
+    # Auto-pass when <2 existing layers (no meaningful baseline MAE available)
+    # -----------------------------------------------------------------------
+    mae_before = score_before.get("system_mae", None)
+    mae_after = score_after.get("system_mae", 0.0)
     
-    # Two-stage admission logic:
-    # If Stage 1 failed, layer should be rejected (inf BIC)
-    # If Stage 1 passed with good improvement, use more lenient BIC threshold
-    stage1_passed = stage1_fields.get("masking_test_passed", True)
-    stage1_improvement = stage1_fields.get("masking_test_improvement", 0.0)
-    
-    if not stage1_passed:
-        # Stage 1 failed - definitely reject
-        admitted = False
-    elif stage1_improvement > 0.1:  # Strong Stage 1 performance
-        # High predictive value - admit even with small BIC penalty
-        admitted = bic_delta < 0.1  # Allow small complexity increase
-    elif stage1_improvement > 0.05:  # Moderate Stage 1 performance
-        # Moderate predictive value - standard BIC threshold
-        admitted = bic_delta < 0.05
+    if len(existing_layers) < 2 or mae_before is None:
+        # Not enough layers to compute a meaningful before-MAE; let Stage 2 decide
+        stage1_passed = True
+        mae_improvement = 0.0
     else:
-        # Weak Stage 1 performance - strict BIC threshold
-        admitted = bic_delta < 0
+        mae_improvement = mae_before - mae_after  # positive = system MAE improved
+        stage1_passed = mae_improvement > 0
+    
+    # -----------------------------------------------------------------------
+    # Stage 2: Normalized BIC must improve (negative per-sample delta)
+    # -----------------------------------------------------------------------
+    if not stage1_passed:
+        admitted = False
+        print(f"❌ Layer {layer_name} rejected at Stage 1: MAE worsened by {-mae_improvement:.6f} (mae_before={mae_before:.4f}, mae_after={mae_after:.4f})")
+    else:
+        admitted = bic_delta < 0.0
+        if admitted:
+            print(f"✅ Layer {layer_name} admitted: BIC/sample={bic_delta:.6f}, MAE delta={mae_improvement:.6f}")
+        else:
+            print(f"❌ Layer {layer_name} rejected at Stage 2: BIC/sample={bic_delta:.6f} (not negative)")
+    
+    stage1_fields = {
+        "masking_test_passed": stage1_passed,
+        "masking_test_improvement": mae_improvement,
+        "masking_test_direction": "mae_delta" if len(existing_layers) >= 2 else "auto_pass",
+        "stage_completed": "mae_bic_completed",
+    }
     
     if admitted:
         # Add the layer
@@ -1949,13 +1971,15 @@ def evaluate_new_layer(
     return {
         "bic_before": bic_before,
         "bic_after": bic_after,
-        "bic_delta": bic_delta,
+        "bic_delta": bic_delta,          # normalized per-sample; range ~[-0.5, 0] for good layers
+        "bic_delta_raw": bic_delta_raw,  # raw (grid-size-dependent); diagnostic only
+        "n_effective_samples": n_eff,
         "cv_mse_before": cv_mse_before,
         "cv_mse_after": cv_mse_after,
         "cv_mse_delta": cv_mse_delta,
         "mutual_info": mi_scores,
         "admitted": admitted,
-        # For hypothesis agent training: MAE-based BIC improvement (higher = better)
+        # For hypothesis agent training: positive = improvement (higher = better)
         "predicted_value": -bic_delta,
         # Stage 1 fields from two-stage scoring
         **stage1_fields

@@ -1725,6 +1725,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         """Compute reward based on BIC results for Kazakhstan regional analysis."""
         
         bic_delta = final.bic_delta
+        masking_test_passed = final.masking_test_passed
+        masking_test_improvement = final.masking_test_improvement
+        masking_test_direction = final.masking_test_direction
         admitted = final.admitted
         
         if bic_delta is None:
@@ -1735,12 +1738,16 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 breakdown={"no_feature": True, "region": "kazakhstan"}
             )
         
-        # Regional-scale reward calculation
-        if admitted:
-            # Feature was admitted (improved regional compression)
-            # Scale reward based on BIC improvement for regional features
-            # Regional features may have different BIC scales than deposit-scale
-            reward_value = min(1.0, max(0.0, -bic_delta / 20.0))
+        # Two-stage reward — same scale as Australia (bic_delta is per-sample normalized)
+        if masking_test_passed and admitted:
+            # Stage 1: real MAE delta
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+            # Stage 2: per-sample normalized BIC delta (~[-0.5, 0] for good layers)
+            stage2_reward = min(1.0, max(0.0, -bic_delta / 0.1))
+            reward_value = 0.4 * stage1_reward + 0.6 * stage2_reward
             
             return TaskReward(
                 value=reward_value,
@@ -1749,20 +1756,39 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "bic_delta": bic_delta,
                     "admitted": True,
                     "region": "kazakhstan",
-                    "scale": "basin_regional",
+                    "stage1_reward": stage1_reward,
+                    "stage2_reward": stage2_reward,
                     "reward": reward_value,
                 },
             )
-        else:
-            # Feature was rejected (worse compression)
+        elif masking_test_passed and not admitted:
+            # Stage 1 passed but BIC worsened - small partial reward
+            if masking_test_direction in ("auto_pass", "first_layer"):
+                stage1_reward = 1.0
+            else:
+                stage1_reward = min(1.0, max(0.0, masking_test_improvement / 0.02))
+            reward_value = 0.3 * stage1_reward
             return TaskReward(
-                value=0.05,  # Small reward for attempting
+                value=reward_value,
                 success=False,
                 breakdown={
                     "bic_delta": bic_delta,
                     "admitted": False,
                     "region": "kazakhstan",
-                    "scale": "basin_regional",
+                    "stage1_reward": stage1_reward,
+                    "partial_success": True,
+                },
+            )
+        else:
+            # Stage 1 failed - no improvement to geological understanding
+            return TaskReward(
+                value=0.05,
+                success=False,
+                breakdown={
+                    "bic_delta": bic_delta,
+                    "admitted": False,
+                    "region": "kazakhstan",
+                    "stage_1_failed": True,
                 },
             )
     
