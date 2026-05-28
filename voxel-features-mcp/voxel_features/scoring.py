@@ -129,24 +129,57 @@ def mutual_information(
 ) -> float:
     """
     Compute mutual information between two layers.
-    
+
     I(X;Y) = H(X) + H(Y) - H(X,Y)
-    
+
     Returns bits of shared information.
     """
     values_a = store.get_layer_values(layer_a).flatten()
     values_b = store.get_layer_values(layer_b).flatten()
-    
+
     layer_a_obj = store.get_layer(layer_a)
     layer_b_obj = store.get_layer(layer_b)
-    
+
     h_a = compute_layer_entropy(values_a, layer_a_obj.dtype)
     h_b = compute_layer_entropy(values_b, layer_b_obj.dtype)
     h_ab = _joint_entropy_continuous(values_a, values_b)
-    
+
     # MI = H(A) + H(B) - H(A,B)
     mi = h_a + h_b - h_ab
     return max(0.0, mi)  # MI is non-negative
+
+
+def pairwise_distance(
+    store: VoxelStore,
+    layer_a: str,
+    layer_b: str,
+) -> float:
+    """Orthogonality proxy in [0, 1]: Jaccard distance for boolean, MAE otherwise.
+
+    Crossbreed-queue replacement for mutual_information(): the latter had a
+    unit mismatch (Shannon-bits marginals vs density-scaled joint) that
+    silently returned 0 for every sparse-boolean pair, so the queue lost its
+    orthogonality signal. Jaccard has no entropy/binning footguns and is the
+    right shape for sparse boolean projections (Kazakhstan's typical layer
+    type). Two all-false layers are treated as identical (distance 0).
+    """
+    layer_a_obj = store.get_layer(layer_a)
+    layer_b_obj = store.get_layer(layer_b)
+    values_a = layer_a_obj.values
+    values_b = layer_b_obj.values
+
+    if layer_a_obj.dtype == "boolean" and layer_b_obj.dtype == "boolean":
+        a_bool = values_a.astype(bool)
+        b_bool = values_b.astype(bool)
+        union = int(np.logical_or(a_bool, b_bool).sum())
+        if union == 0:
+            return 0.0
+        intersection = int(np.logical_and(a_bool, b_bool).sum())
+        return 1.0 - float(intersection) / float(union)
+
+    a_flat = np.nan_to_num(values_a.astype(float), nan=0.0).ravel()
+    b_flat = np.nan_to_num(values_b.astype(float), nan=0.0).ravel()
+    return float(np.mean(np.abs(a_flat - b_flat)))
 
 
 # =============================================================================
@@ -2108,16 +2141,22 @@ def evaluate_new_layer(
             values=layer_values,
             dtype=layer_dtype,
         )
-        
-        # Compute MI with existing layers
+
+        # Compute MI with existing layers (legacy; kept for record audit/back-
+        # compat). Crossbreed queue ranking now uses pairwise_distance below.
         mi_scores = {}
+        pairwise_distances = {}
         for other_name in existing_layers:
             mi_scores[other_name] = mutual_information(store, layer_name, other_name)
-        
+            pairwise_distances[other_name] = pairwise_distance(
+                store, layer_name, other_name
+            )
+
         store.update_layer_scores(layer_name, bic_delta, mi_scores)
     else:
         mi_scores = {}
-    
+        pairwise_distances = {}
+
     return {
         "bic_before": bic_before,
         "bic_after": bic_after,
@@ -2128,6 +2167,7 @@ def evaluate_new_layer(
         "cv_mse_after": cv_mse_after,
         "cv_mse_delta": cv_mse_delta,
         "mutual_info": mi_scores,
+        "pairwise_distance": pairwise_distances,
         "admitted": admitted,
         # For hypothesis agent training: positive = improvement (higher = better)
         "predicted_value": -bic_delta,

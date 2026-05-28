@@ -94,20 +94,30 @@ _ANALYSIS_OUT = "/workspace/out"
 # Filenames inside `variation.kg_dir`. Centralised so the task code, tests,
 # and any external tooling (e.g. analytics scripts) reference one source.
 _KG_EXPERIMENTS = "experiments.jsonl"
-_KG_CROSSBREED_INDEX = "crossbreed_index.jsonl"
+_KG_CROSSBREED_INDEX = "crossbreed_index.jsonl"          # legacy MI index — read for back-compat only
+_KG_PAIRWISE_DISTANCE = "pairwise_distance.jsonl"        # new orthogonality index (Jaccard/MAE)
 _KG_ADMITTED_INDEX = "admitted_index.json"
 _KG_BOOTSTRAP_STATE = "bootstrap_state.json"
 _KG_QUEUE = "crossbreed_queue.jsonl"
 _KG_LOCK = "kg.lock"
 
 # Queue selection knobs. The effective score of an entry is
-#   score / (1 + α · attempt_count),   with an extra · β multiplier when the
-# pair is "consummated" (already has ≥1 admitted crossbreed child). α decays
-# repeatedly-tried pairs out of the fast lane; β puts consummated pairs in a
-# slow lane without banning them — LLM hypothesis generation is high-variance
-# and the surrounding feature pool keeps growing, so a second attempt at the
-# same pair is a genuinely different experiment.
+#   score / (1 + α · attempt_count) / Π (1 + γ · uses(parent_i)),
+# with an extra · β multiplier when the pair is "consummated" (already has ≥1
+# admitted crossbreed child). α decays repeatedly-tried *pairs*; γ decays
+# repeatedly-tried *parents* (the lever that breaks the §8 monoculture where
+# 32 fold-pairs share the top slope); β puts consummated pairs in a slow lane
+# without banning them — LLM hypothesis generation is high-variance and the
+# surrounding feature pool keeps growing, so a second attempt at the same
+# pair is a genuinely different experiment.
 _PAIR_ATTEMPT_DECAY = 0.5
+_PARENT_USE_DECAY = 0.01     # γ — chosen conservatively for retroactive
+                             # rollout (see redesign §5.5: with 360 historical
+                             # uses on the fold parent, γ=0.1 gives a divisor
+                             # of 37 and effectively exiles it). 0.01 still
+                             # gives ~4.6× on resume — enough to demote fold
+                             # below fresh non-fold pairs.
+_PAIR_DISTANCE_WEIGHT = 2.0  # λ for the orthogonality term in the score prior
 _CONSUMMATED_DISCOUNT = 0.25
 
 
@@ -1759,6 +1769,12 @@ finally:
                     self._update_crossbreed_index(
                         knowledge_dir, node_id, evaluate.get('mutual_info', {})
                     )
+                    self._update_pairwise_distance_index(
+                        knowledge_dir,
+                        node_id,
+                        feature_layer_name,
+                        evaluate.get('pairwise_distance', {}),
+                    )
 
             except Exception as e:
                 print(f"Warning: Failed to save knowledge graph data: {e}")
@@ -1852,10 +1868,15 @@ finally:
         new_node_id: str,
         new_mutual_info: dict[str, float]
     ) -> None:
-        """Update crossbreed index with mutual information scores for new experiment."""
+        """Update legacy crossbreed MI index for record audit.
+
+        The crossbreed queue no longer consumes this file (see
+        `_update_pairwise_distance_index`); kept so existing telemetry / audit
+        tooling that diff-tracks `crossbreed_index.jsonl` still sees writes.
+        """
         import json
         from datetime import datetime
-        
+
         try:
             experiments_file = knowledge_dir / _KG_EXPERIMENTS
             crossbreed_file = knowledge_dir / _KG_CROSSBREED_INDEX
@@ -1872,24 +1893,24 @@ finally:
                                 existing_experiments.append(exp)
                             except json.JSONDecodeError:
                                 continue
-            
+
             # Calculate mutual information between new experiment and all existing ones
             new_mi_records = []
             for existing_exp in existing_experiments:
                 if existing_exp['node_id'] == new_node_id:
                     continue  # Skip self
-                
+
                 # Get mutual information score between layer names
                 mi_score = 0.0
                 new_layer = new_mutual_info
                 existing_layer = existing_exp.get('mutual_info', {})
-                
+
                 # Look for cross-references in mutual info dictionaries
                 if existing_exp.get('layer_name') in new_layer:
                     mi_score = new_layer[existing_exp['layer_name']]
                 elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
                     mi_score = existing_layer[locals()['layer_name']]
-                
+
                 # Create pair record
                 pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
                 mi_record = {
@@ -1900,15 +1921,81 @@ finally:
                     "calculated_at": datetime.now().isoformat()
                 }
                 new_mi_records.append(mi_record)
-            
+
             # Append new MI records to crossbreed index
             if new_mi_records:
                 with open(crossbreed_file, 'a') as f:
                     for record in new_mi_records:
                         f.write(json.dumps(record) + '\n')
-                        
+
         except Exception as e:
             print(f"Warning: Failed to update crossbreed index: {e}")
+
+    def _update_pairwise_distance_index(
+        self,
+        knowledge_dir: Path,
+        new_node_id: str,
+        new_layer_name: str,
+        new_pairwise_distance: dict[str, float],
+    ) -> None:
+        """Append pairwise-distance records for the new admit's layer.
+
+        Replaces `_update_crossbreed_index` as the source for queue
+        ranking. Pair ids are alphabetically sorted so the symmetric
+        distance is written once per unordered pair (matches
+        `_load_distance_index`'s lookup key). Existing experiments without
+        a layer name match in `new_pairwise_distance` are written at
+        distance=0.0 so the queue treats them neutrally rather than
+        skipping the entry.
+        """
+        from datetime import datetime
+
+        try:
+            experiments_file = knowledge_dir / _KG_EXPERIMENTS
+            distance_file = knowledge_dir / _KG_PAIRWISE_DISTANCE
+
+            existing_experiments: list[dict[str, Any]] = []
+            if experiments_file.exists():
+                with experiments_file.open("r") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            existing_experiments.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+
+            new_records: list[dict[str, Any]] = []
+            for existing_exp in existing_experiments:
+                existing_id = existing_exp.get("node_id")
+                if not isinstance(existing_id, str) or existing_id == new_node_id:
+                    continue
+                existing_layer = existing_exp.get("layer_name") or ""
+                # The evaluate result keyed pairwise_distance by the *other*
+                # layer name in the store at the time it was scored.
+                dist = float(new_pairwise_distance.get(existing_layer, 0.0))
+                pair_id = (
+                    f"{min(new_node_id, existing_id)}_"
+                    f"{max(new_node_id, existing_id)}"
+                )
+                new_records.append({
+                    "pair_id": pair_id,
+                    "node_1": new_node_id,
+                    "node_2": existing_id,
+                    "layer_1": new_layer_name,
+                    "layer_2": existing_layer,
+                    "pairwise_distance": dist,
+                    "calculated_at": datetime.now().isoformat(),
+                })
+
+            if new_records:
+                distance_file.parent.mkdir(parents=True, exist_ok=True)
+                with distance_file.open("a") as fh:
+                    for record in new_records:
+                        fh.write(json.dumps(record) + "\n")
+        except Exception as e:  # noqa: BLE001 — kg writes are best-effort
+            print(f"Warning: Failed to update pairwise distance index: {e}")
     
     def _exec_execution_finalize(
         self,
@@ -3196,17 +3283,24 @@ finally:
         ]
 
     @classmethod
-    def _load_mi_index(cls, kg_dir: Path) -> dict[str, float]:
-        mi: dict[str, float] = {}
-        for rec in cls._read_jsonl_records(kg_dir / _KG_CROSSBREED_INDEX):
+    def _load_distance_index(cls, kg_dir: Path) -> dict[str, float]:
+        """Read pairwise_distance.jsonl into an alphabetically-keyed dict.
+
+        Used by `_enumerate_pairs` to look up orthogonality scores by the
+        unordered pair id `f"{min}_{max}"`. Returns an empty dict if the
+        index file does not yet exist (queue then falls back to distance=0
+        and the score becomes purely log1p(|bic|) sums).
+        """
+        distances: dict[str, float] = {}
+        for rec in cls._read_jsonl_records(kg_dir / _KG_PAIRWISE_DISTANCE):
             pair_id = rec.get("pair_id")
             if not isinstance(pair_id, str):
                 continue
             try:
-                mi[pair_id] = float(rec.get("mutual_information", 0.0))
+                distances[pair_id] = float(rec.get("pairwise_distance", 0.0))
             except (TypeError, ValueError):
                 continue
-        return mi
+        return distances
 
     @staticmethod
     def _ordered_pair_id(a: str, b: str) -> str:
@@ -3215,7 +3309,7 @@ finally:
 
     def _enumerate_pairs(self, kg_dir: Path) -> list[dict[str, Any]]:
         experiments = self._load_successful_experiments(kg_dir)
-        mi_index = self._load_mi_index(kg_dir)
+        distance_index = self._load_distance_index(kg_dir)
         out: list[dict[str, Any]] = []
         for exp_a in experiments:
             for exp_b in experiments:
@@ -3223,14 +3317,25 @@ finally:
                     continue
                 bic_a = abs(float(exp_a.get("bic_delta", 0.0)))
                 bic_b = abs(float(exp_b.get("bic_delta", 0.0)))
-                # MI is symmetric and uses the alphabetically-sorted pair
-                # id (matches `_update_crossbreed_index`).
-                mi_pair_id = f"{min(exp_a['node_id'], exp_b['node_id'])}_{max(exp_a['node_id'], exp_b['node_id'])}"
-                mi = mi_index.get(mi_pair_id, 0.0)
+                # Distance is symmetric and uses the alphabetically-sorted
+                # pair id (matches `_update_pairwise_distance_index`).
+                dist_pair_id = (
+                    f"{min(exp_a['node_id'], exp_b['node_id'])}_"
+                    f"{max(exp_a['node_id'], exp_b['node_id'])}"
+                )
+                distance = distance_index.get(dist_pair_id, 0.0)
+                # log1p shrinks BIC outliers (e.g. the |bic|=6.68 fold parent
+                # that monopolised the queue under linear scoring); the λ·dist
+                # term rewards orthogonal parents. See redesign §2.2 and §6.
+                score = (
+                    math.log1p(bic_a)
+                    + math.log1p(bic_b)
+                    + _PAIR_DISTANCE_WEIGHT * distance
+                )
                 out.append({
                     "pair_id": self._ordered_pair_id(exp_a["node_id"], exp_b["node_id"]),
                     "parents": [exp_a["node_id"], exp_b["node_id"]],
-                    "score": (bic_a + bic_b) - mi,
+                    "score": score,
                     "popped_at": None,
                     "attempt_count": 0,
                 })
@@ -3328,9 +3433,12 @@ finally:
                 return None
 
             consummated = self._consummated_pairs(kg_path)
+            parent_uses = self._parent_use_counts(entries)
             chosen = max(
                 entries,
-                key=lambda entry: self._effective_pair_score(entry, consummated),
+                key=lambda entry: self._effective_pair_score(
+                    entry, consummated, parent_uses
+                ),
             )
 
             chosen["attempt_count"] = int(chosen.get("attempt_count", 0)) + 1
@@ -3365,14 +3473,40 @@ finally:
         return out
 
     @staticmethod
+    def _parent_use_counts(entries: list[dict[str, Any]]) -> dict[str, int]:
+        """Sum each parent's attempt_count across all queue rows it appears in.
+
+        Derived on read from existing queue state — no extra persistent
+        counter. This is the input to `_effective_pair_score`'s per-parent
+        fatigue term (γ), which breaks the §8 monoculture where a single
+        dominant parent (e.g. fold) ends up in 32 of the top-N pairs.
+        """
+        uses: dict[str, int] = {}
+        for entry in entries:
+            attempts = int(entry.get("attempt_count", 0))
+            if attempts == 0:
+                continue
+            for parent in entry.get("parents") or []:
+                if isinstance(parent, str) and parent:
+                    uses[parent] = uses.get(parent, 0) + attempts
+        return uses
+
+    @staticmethod
     def _effective_pair_score(
         entry: dict[str, Any],
         consummated: set[frozenset[str]],
+        parent_uses: dict[str, int] | None = None,
     ) -> float:
         score = float(entry.get("score", 0.0))
         attempts = int(entry.get("attempt_count", 0))
         decayed = score / (1.0 + _PAIR_ATTEMPT_DECAY * attempts)
         parents = entry.get("parents") or []
+        if parent_uses:
+            for parent in parents:
+                if not isinstance(parent, str) or not parent:
+                    continue
+                uses = parent_uses.get(parent, 0)
+                decayed /= 1.0 + _PARENT_USE_DECAY * uses
         if len(parents) == 2 and frozenset(parents) in consummated:
             decayed *= _CONSUMMATED_DISCOUNT
         return decayed
