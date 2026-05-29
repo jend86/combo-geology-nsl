@@ -177,24 +177,52 @@ A layer is admitted if bic_delta < 0.
 
 _DATASET_OVERVIEW = """## Kazakhstan Teniz Basin Dataset Overview
 
-This dataset contains comprehensive geological data for the Teniz Basin region of Kazakhstan:
+This dataset has three corpus classes. A useful survey samples at least one
+source from each — vector geometry alone has been observed to bias hypotheses
+toward fold-axis distance and miss redox, lithology, host-suite, and drill-log
+mechanisms documented in the text and tabular sources.
 
-**USGS Data (English):**
-- Scientific assessment report chunks and figure descriptions
-- Technical reports on sediment-hosted copper systems
+**Vector data (GeoJSON) — /workspace/input/converted_spatial_data/:**
+- copper_prospects.geojson: 113 Point features — sediment-hosted Cu prospects.
+  Properties include Latitude, Longitude, Type, Subtype, Age_Ma, Tonnage_Mt,
+  Cu_pct, Ag_g_t, Co_pct, Agehost, Unit (host suite — e.g. Vladimirov,
+  Kayraktin, Kirey), HostRocks, Mineralogy (e.g. chalcopyrite), Comments.
+- copper_prospects_aoi.geojson: 112 Point features — near-duplicate of the
+  prospects, same property schema (NOT an AOI polygon).
+- anticlines_synclines.geojson: 58 LineString fold-axis traces. Properties:
+  id, Name, Type, Number.
+- assessment_tract.geojson: 1 MultiPolygon — Teniz Basin tract (49,714 km²).
+  Properties include descr, Area_km2, Geology, Age, Dep_type, GT_model,
+  Asmt_depth, N_known, N_expected, DepDensity.
 
-**Russian Survey Data (Smolianova 1984):**
-- 300+ detailed geological text chunks covering stratigraphy, tectonics, magmatism
-- 60+ drill hole logs with lithology and depth data
-- Comprehensive geophysical interpretations and mineral evaluations
+**Tabular data (CSV) — /workspace/input/USGS/:**
+- TZ_ssCu_Prospects.csv: 113 rows × 32 columns. Same fields as the prospects
+  geojson, easier to scan with polars/pandas for value distributions over
+  Mineralogy, Agehost, Unit, Age_Ma.
+- TZ_ssCu_Tract.csv: 1-row tract summary.
 
-**Spatial Data (GeoJSON) — path: /workspace/input/converted_spatial_data/:**
-- converted_spatial_data/copper_prospects.geojson: 113 sediment-hosted copper prospects with coordinates, tonnage, grades
-- converted_spatial_data/anticlines_synclines.geojson: 33 geological fold structures
-- converted_spatial_data/assessment_tract.geojson: Teniz Basin boundary and assessment tract data (49,714 km²)
-- converted_spatial_data/copper_prospects_aoi.geojson: Area of interest boundary
+**Text corpora (English + Russian — REQUIRED for non-structural hypotheses):**
+- USGS/chunks/*.md (7 files): USGS Sandstone Copper assessment.
+  Includes the textbook redox-zoning model
+  (pyrite → chalcopyrite → bornite → chalcocite → hematite; oxidized red beds
+  overlying chemically reduced gray/green/black strata) and deposit subtype
+  taxonomy (reduced facies / sandstone Cu / red bed). The single highest-density
+  source of non-structural mechanisms.
+- USGS/descriptions/*.md (13 files): figure descriptions from the USGS report.
+- 36572_Smolianova_1984/chunks/*.md (328 files): Soviet survey covering
+  stratigraphy, tectonics, magmatism, physical properties, mineral evaluation.
+  Chunk titles are descriptive (e.g. "STRATIGRAPHY — Proterozoic — Karaashevka
+  is predominantly dark green and greenish-gray …").
+- 36572_Smolianova_1984/drill_holes_data/*.description.md (63 files): per-well
+  descriptions of Soviet wireline log sheets — SP (spontaneous polarisation),
+  apparent resistivity (КС), gamma-ray, neutron curves, lithology columns,
+  and per-depth spectral-analysis (Pb/Cu/Zn/Mo/Sn) assays. Direct proxies
+  for redox boundaries and lithology contacts at metre-scale depth.
 
-**Scale Note:** Each voxel covers ~1.75km × 1.75km, suitable for regional geological features like basin structures, regional mineral trends, and large-scale geological formations.
+**Scale note:** Each voxel covers ~1.75 km × 1.75 km × 10 m, suitable for
+regional features. Drill-log signals are sub-voxel and must be aggregated
+(e.g. per-borehole mean assay, depth-of-first-anomaly) before becoming a
+voxel-grid feature.
 """
 
 
@@ -600,11 +628,38 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
 
+        # Novelty + mechanism-summary nudge is injected at survey (not at
+        # hypothesise) so the agent sees the diversity signal *before*
+        # choosing which files to open. The crossbreed workflow has no
+        # survey step and keeps the nudge at hypothesise (see
+        # _crossbreed_workflow).
         novelty_block = self._novelty_block_for(variation)
+        survey_prompt = (
+            "Phase 1: Survey\n\n"
+            + (novelty_block + "\n\n" if novelty_block else "")
+            + "Explore the dataset to identify feature opportunities. You MUST\n"
+            "sample at least one source from each of three corpus classes\n"
+            "before recording your candidates:\n\n"
+            "  - vector   : converted_spatial_data/*.geojson\n"
+            "  - tabular  : USGS/TZ_ssCu_Prospects.csv\n"
+            "  - text     : USGS/chunks/*.md,\n"
+            "               36572_Smolianova_1984/chunks/*.md, or\n"
+            "               36572_Smolianova_1984/drill_holes_data/\n"
+            "               *.description.md\n\n"
+            "Use analysis_shell to read file headers, schemas, value\n"
+            "distributions, and 1-2 representative text snippets (head -N\n"
+            "of a chunk is enough — full reads are wasteful).\n\n"
+            "Find 2-3 promising feature layer candidates.\n\n"
+            "Close with:\n"
+            "  record_phase(phase='survey', candidates=[...],\n"
+            "               corpora_sampled=['vector','tabular','text'])\n"
+            "where corpora_sampled lists the corpus classes you actually\n"
+            "inspected (subset of ['vector','tabular','text'])."
+        )
         hypothesise_prompt = (
             "Phase 2: Hypothesise\n\n"
-            + (novelty_block + "\n\n" if novelty_block else "")
-            + "Pick one candidate and state a falsifiable hypothesis.\n\n"
+            "Pick one candidate from the survey phase and state a falsifiable\n"
+            "hypothesis.\n\n"
             "Include a data_spec with:\n"
             "- files: list of data sources to analyze\n"
             "- analysis: analytical approach\n"
@@ -619,16 +674,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 WorkflowStep(
                     name="survey",
                     is_entry=True,
-                    prompt=(
-                        "Phase 1: Survey\n\n"
-                        "Explore the dataset to identify feature opportunities.\n\n"
-                        "Use analysis_shell to:\n"
-                        "- Read file headers and schemas\n"
-                        "- Identify interesting patterns\n\n"
-                        "Find 2-3 promising feature layer candidates.\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='survey', candidates=[...])"
-                    ),
+                    prompt=survey_prompt,
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -856,6 +902,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "properties": {
                         "phase": {"type": "string"},
                         "candidates": {"type": "array", "items": {"type": "string"}},
+                        "corpora_sampled": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Survey-phase only: subset of "
+                                "['vector','tabular','text'] indicating which "
+                                "corpus classes were actually inspected."
+                            ),
+                        },
                         "hypothesis": {"type": "string"},
                         "data_spec": {"type": "object"},
                         "feature_layer_name": {"type": "string"},
@@ -1265,6 +1320,7 @@ except Exception as user_code_error:
         phase_records = ctx.episode_context.setdefault("phase_records", {})
         phase_records[phase] = {
             "candidates": args.get("candidates"),
+            "corpora_sampled": args.get("corpora_sampled"),
             "hypothesis": args.get("hypothesis"),
             "data_spec": args.get("data_spec"),
             "feature_layer_name": args.get("feature_layer_name"),
@@ -1307,79 +1363,198 @@ except Exception as user_code_error:
         )
     
     def _enhance_data_spec(self, data_spec: dict[str, Any]) -> dict[str, Any]:
-        """Enhance data_spec with Kazakhstan-specific file guidance and correct paths."""
+        """Enhance data_spec with Kazakhstan-specific file guidance and correct paths.
+
+        Property lists and counts here are surfaced directly to the coding
+        agent — they must match the on-disk schemas. Prior versions advertised
+        a lossy subset of ``copper_prospects.geojson`` properties (no
+        Mineralogy / Agehost / Unit / HostRocks), which hid the redox-relevant
+        columns from prompt context and biased hypotheses toward
+        coordinate-only structural framings.
+        """
         enhanced = data_spec.copy()
         files = enhanced.get("files", [])
 
-        # Add the known Kazakhstan GeoJSON files with correct paths
         kazakhstan_geojson_files = [
             {
                 "file": "converted_spatial_data/copper_prospects.geojson",
                 "full_path": "/workspace/input/converted_spatial_data/copper_prospects.geojson",
                 "type": "geojson",
-                "geometry": "points",
-                "properties": ["name", "tonnage", "grade", "coordinates", "deposit_type"],
-                "note": "113 copper prospects with economic data - use geopandas.read_file(full_path)",
+                "geometry": "Point",
                 "count": 113,
-                "description": "Sediment-hosted copper prospects in Teniz Basin",
-            },
-            {
-                "file": "converted_spatial_data/anticlines_synclines.geojson",
-                "full_path": "/workspace/input/converted_spatial_data/anticlines_synclines.geojson",
-                "type": "geojson",
-                "geometry": "linestrings/polygons",
-                "properties": ["structure_type", "geological_age", "fold_axis"],
-                "note": "33 geological fold structures - use geopandas.read_file(full_path)",
-                "count": 33,
-                "description": "Regional anticline and syncline structures",
-            },
-            {
-                "file": "converted_spatial_data/assessment_tract.geojson",
-                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson",
-                "type": "geojson",
-                "geometry": "polygon",
-                "properties": ["area_km2", "tract_name", "assessment_type"],
-                "note": "Teniz Basin boundary (49,714 km²) - use geopandas.read_file(full_path)",
-                "area_km2": 49714,
-                "description": "USGS assessment tract boundary",
+                "properties": [
+                    "Coded_ID", "Tract_name", "Name", "Latitude", "Longitude",
+                    "Type", "Subtype", "Age_Ma", "Comm_major",
+                    "Tonnage_Mt", "Cu_pct", "Ag_g_t", "Co_pct",
+                    "Agehost", "Unit", "HostRocks", "Mineralogy",
+                    "SiteStatus", "SiteStat2", "Comments", "Ref_short",
+                ],
+                "note": (
+                    "113 sediment-hosted Cu prospects. Property fields incl. "
+                    "Unit (host suite — Vladimirov/Kayraktin/Kirey/etc.), "
+                    "Agehost, Mineralogy (e.g. chalcopyrite), and tonnage/grade. "
+                    "Use geopandas.read_file(full_path). Many numeric fields use "
+                    "-9999 as a sentinel for missing values."
+                ),
+                "description": "Sediment-hosted copper prospects (vector + tabular surrogate)",
             },
             {
                 "file": "converted_spatial_data/copper_prospects_aoi.geojson",
                 "full_path": "/workspace/input/converted_spatial_data/copper_prospects_aoi.geojson",
                 "type": "geojson",
-                "geometry": "polygons",
-                "properties": ["area_of_interest", "prospect_density"],
-                "note": "Copper prospect areas of interest - use geopandas.read_file(full_path)",
-                "description": "AOI polygons for copper exploration",
+                "geometry": "Point",
+                "count": 112,
+                "properties": [
+                    "Coded_ID", "Tract_name", "Name", "Latitude", "Longitude",
+                    "Type", "Subtype", "Age_Ma", "Comm_major",
+                    "Tonnage_Mt", "Cu_pct", "Ag_g_t", "Co_pct",
+                    "Agehost", "Unit", "HostRocks", "Mineralogy",
+                ],
+                "note": (
+                    "112 Point features — near-duplicate of copper_prospects, "
+                    "filtered to the AOI. Same property schema (NOT an AOI polygon)."
+                ),
+                "description": "Copper prospects filtered to area of interest",
+            },
+            {
+                "file": "converted_spatial_data/anticlines_synclines.geojson",
+                "full_path": "/workspace/input/converted_spatial_data/anticlines_synclines.geojson",
+                "type": "geojson",
+                "geometry": "LineString",
+                "count": 58,
+                "properties": ["id", "Name", "Type", "Number"],
+                "note": (
+                    "58 LineString fold-axis traces. The Type field distinguishes "
+                    "anticline vs syncline. Use geopandas.read_file(full_path)."
+                ),
+                "description": "Regional anticline and syncline axis traces",
+            },
+            {
+                "file": "converted_spatial_data/assessment_tract.geojson",
+                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson",
+                "type": "geojson",
+                "geometry": "MultiPolygon",
+                "count": 1,
+                "properties": [
+                    "descr", "Area_km2", "Tract_name", "Country", "Commodity",
+                    "Dep_type", "GT_model", "Geology", "Age",
+                    "Asmt_date", "Asmt_depth", "N_known", "N_expected",
+                    "N90", "N50", "N10", "DepDensity",
+                ],
+                "area_km2": 49714,
+                "note": (
+                    "Single MultiPolygon — Teniz Basin assessment tract (49,714 km²). "
+                    "Carries Geology, Age, Dep_type (deposit type), and USGS expected-"
+                    "deposit-count fields (N90/N50/N10/N_expected)."
+                ),
+                "description": "USGS assessment tract boundary + tract-level metadata",
+            },
+        ]
+
+        usgs_tabular_files = [
+            {
+                "file": "USGS/TZ_ssCu_Prospects.csv",
+                "full_path": "/workspace/input/USGS/TZ_ssCu_Prospects.csv",
+                "type": "csv",
+                "count": 113,
+                "columns": [
+                    "X", "Y", "Coded_ID", "Tract_name", "Name", "SiteStatus",
+                    "Latitude", "Longitude", "Type", "Subtype", "Age_Ma",
+                    "Comm_major", "Tonnage_Mt", "Cu_pct", "Ag_g_t",
+                    "Co_pct", "Agehost", "Unit", "HostRocks", "Mineralogy",
+                    "Comments", "Ref_short",
+                ],
+                "note": (
+                    "Tabular twin of copper_prospects.geojson — easier to scan "
+                    "value distributions over Mineralogy / Unit (host suite) / "
+                    "Agehost / Age_Ma with polars or pandas. -9999 = missing."
+                ),
+                "description": "Tabular sediment-hosted Cu prospects",
+            },
+            {
+                "file": "USGS/TZ_ssCu_Tract.csv",
+                "full_path": "/workspace/input/USGS/TZ_ssCu_Tract.csv",
+                "type": "csv",
+                "count": 1,
+                "note": "Single-row tract metadata (twin of assessment_tract properties).",
+                "description": "Tabular tract metadata",
+            },
+        ]
+
+        usgs_text_files = [
+            {
+                "file": "USGS/chunks/",
+                "full_path": "/workspace/input/USGS/chunks/",
+                "type": "text_corpus",
+                "count": 7,
+                "language": "English",
+                "note": (
+                    "7 USGS Sandstone Copper assessment chunks. Highest-density "
+                    "source of NON-STRUCTURAL mechanisms: chunk sir2010-5090_001 "
+                    "contains the textbook redox-zoning model (pyrite → chalcopyrite "
+                    "→ bornite → chalcocite → hematite; oxidized red beds overlying "
+                    "chemically reduced gray/green/black strata) and the deposit "
+                    "subtype taxonomy (reduced facies / sandstone Cu / red bed). "
+                    "Use os.listdir() then open(); each file < 10 KB."
+                ),
+                "description": "USGS technical narrative — redox model, subtypes, controls",
+            },
+            {
+                "file": "USGS/descriptions/",
+                "full_path": "/workspace/input/USGS/descriptions/",
+                "type": "text_corpus",
+                "count": 13,
+                "language": "English",
+                "note": "13 figure-description files from the USGS report.",
+                "description": "USGS figure descriptions",
             },
         ]
 
         russian_survey_files = [
             {
-                "file": "36572_Smolianova_1984",
-                "full_path": "/workspace/input/36572_Smolianova_1984",
-                "type": "directory",
-                "language": "Russian/English",
-                "content": "geological survey texts and drill hole data",
-                "note": "Russian geological survey files - use os.listdir() to explore",
-                "description": "Comprehensive geological survey (Smolianova 1984)",
+                "file": "36572_Smolianova_1984/chunks/",
+                "full_path": "/workspace/input/36572_Smolianova_1984/chunks/",
+                "type": "text_corpus",
+                "count": 328,
+                "language": "English (translated)",
+                "note": (
+                    "328 chunked sections of the Soviet survey (Smolianova 1984): "
+                    "stratigraphy (Proterozoic→Mesozoic), tectonics, magmatism, "
+                    "physical properties (density, magnetic susceptibility), "
+                    "geochemistry, mineral evaluation. Chunk filenames are "
+                    "self-describing (e.g. STRATIGRAPHY_*, METHODS_*, "
+                    "PHYSICAL_PROPERTIES_*). Sample 2-3 representative chunks "
+                    "per topic; full read of all chunks is unnecessary."
+                ),
+                "description": "Soviet geological survey — lithology, stratigraphy, geophysics",
             },
-        ]
-
-        usgs_files = [
             {
-                "file": "USGS",
-                "full_path": "/workspace/input/USGS",
-                "type": "directory",
-                "content": "USGS assessment data and reports",
-                "note": "USGS English-language data - use os.listdir() to explore",
-                "description": "USGS Teniz Basin assessment data",
+                "file": "36572_Smolianova_1984/drill_holes_data/",
+                "full_path": "/workspace/input/36572_Smolianova_1984/drill_holes_data/",
+                "type": "text_corpus",
+                "count": 63,
+                "language": "English (translated from Russian wireline log sheets)",
+                "note": (
+                    "63 *.description.md files — one per Soviet borehole (скв_NNN). "
+                    "Each describes a wireline log sheet: SP (spontaneous polarisation), "
+                    "apparent resistivity (КС), gamma-ray, neutron curves; a lithology "
+                    "column (sandstone/clay/marl interbeds); and per-depth spectral-"
+                    "analysis (Pb/Cu/Zn/Mo/Sn) assays. Direct metre-scale proxies for "
+                    "redox boundaries and lithology contacts. Borehole IDs do not "
+                    "carry coordinates here — would need joining."
+                ),
+                "description": "Per-borehole wireline-log descriptions with assays",
             },
         ]
 
         # Combine known specs, then append any agent-supplied extras the
         # enhancer doesn't already cover.
-        file_specs = list(kazakhstan_geojson_files + russian_survey_files + usgs_files)
+        file_specs = list(
+            kazakhstan_geojson_files
+            + usgs_tabular_files
+            + usgs_text_files
+            + russian_survey_files
+        )
         known_file_keys = {spec["file"] for spec in file_specs}
         for file_path in files:
             if not any(known in file_path for known in known_file_keys):
@@ -1388,10 +1563,15 @@ except Exception as user_code_error:
         enhanced["file_specs"] = file_specs
         enhanced["kazakhstan_data_structure"] = {
             "geojson_files": 4,
+            "csv_files": 2,
+            "usgs_text_chunks": 7,
+            "usgs_figure_descriptions": 13,
+            "smolianova_text_chunks": 328,
+            "drill_hole_descriptions": 63,
             "copper_prospects": 113,
-            "geological_structures": 33,
+            "fold_axis_traces": 58,
             "assessment_area_km2": 49714,
-            "data_languages": ["English", "Russian"],
+            "data_languages": ["English", "Russian (translated)"],
         }
         return enhanced
     
@@ -3005,6 +3185,98 @@ finally:
         )
         return "\n".join(lines)
 
+    # Rule-based keyword buckets for mechanism-family classification. Used
+    # to summarise the recent-admit pool by family in the survey-stage
+    # novelty block so the agent sees *what class of hypothesis dominates*
+    # rather than only individual examples. Keep narrow and high-precision:
+    # the summary line is advisory, not a hard gate, and false positives
+    # turn the diversity nudge into noise. Order matters — first-match wins
+    # so that, e.g., "fold proximity at basin margin" is tagged structural
+    # rather than basin_geometry (the fold is the verb).
+    _MECHANISM_BUCKETS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("structural", (
+            "fold", "anticlin", "synclin", "limb", "hinge",
+            "axial", "plunge", "fault", "fracture", "shear", "lineament",
+        )),
+        # drillhole sits ahead of geochemical / lithological because
+        # wireline-log signals (SP curve, gamma, assays-by-depth) are
+        # almost always paired with redox or lithology terms in the same
+        # sentence — we want the drill-hole-derived family tag to win on
+        # overlap.
+        ("drillhole", (
+            "borehole", "drill hole", "drillhole", "wireline", "well log",
+            "sp curve", "resistivity log", "per-borehole", "per borehole",
+        )),
+        ("geochemical", (
+            "redox", "oxid", "reduc", "pyrite", "chalcopyrite", "bornite",
+            "chalcocite", "hematite", "sulfide", "sulphide", "red bed",
+            "red-bed", "bleach", "assay", "ppm", "spectral analysis",
+            "mineralogy", "geochem",
+        )),
+        ("lithological", (
+            "sandstone", "mudstone", "siltstone", "conglomerate", "shale",
+            "limestone", "dolomite", "marl", "lithology", "host rock",
+            "host suite", "vladimirov", "kayraktin", "kirey", "dzhaksykon",
+            "facies", "stratigraph", "unconform",
+        )),
+        ("hydrologic", (
+            "permeab", "porosity", "fluid", "brine", "aquifer", "groundwater",
+            "reservoir", "flux channel", "conduit",
+        )),
+        ("basin_geometry", (
+            "basin margin", "basin boundary", "tract boundary", "depocenter",
+            "depocentre", "margin proxim", "distance to basin",
+            "assessment tract", "aoi",
+        )),
+    )
+
+    @staticmethod
+    def _classify_mechanism(text: str) -> str:
+        """Return a single mechanism-family tag for one hypothesis string.
+
+        First-match wins per ``_MECHANISM_BUCKETS`` ordering — see the
+        comment there. ``"other"`` if no bucket matches.
+        """
+        t = (text or "").lower()
+        if not t:
+            return "other"
+        for name, keywords in FeatureHypothesisKazakhstanTask._MECHANISM_BUCKETS:
+            for kw in keywords:
+                if kw in t:
+                    return name
+        return "other"
+
+    @staticmethod
+    def _render_mechanism_summary(recent: list[dict[str, str]]) -> str:
+        """Render a one-line "Recent admissions concentrate on ..." nudge.
+
+        Counts mechanism-family tags across ``recent`` and surfaces the top
+        1-2 by share. Empty string when ``recent`` is empty or every entry
+        is ``other`` (no actionable summary).
+        """
+        if not recent:
+            return ""
+        counts: dict[str, int] = {}
+        for entry in recent:
+            tag = FeatureHypothesisKazakhstanTask._classify_mechanism(
+                entry.get("hypothesis") or ""
+            )
+            counts[tag] = counts.get(tag, 0) + 1
+        ranked = sorted(
+            ((c, n) for c, n in counts.items() if c != "other"),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )
+        if not ranked:
+            return ""
+        total = sum(counts.values())
+        top = ranked[: 2 if len(ranked) > 1 else 1]
+        parts = [
+            f"{name.replace('_', ' ')} ({n}/{total})" for name, n in top
+        ]
+        joined = " and ".join(parts) if len(parts) == 2 else parts[0]
+        return f"Recent admissions concentrate on: {joined}."
+
     def _novelty_block_for(
         self,
         variation: "FeatureHypothesisKazakhstanVariation",
@@ -3012,7 +3284,9 @@ finally:
         """Compute the novelty-nudge prompt block for a given variation.
 
         Returns empty when the knob is disabled, K=0, or no admissions
-        exist — callers can prepend the result unconditionally.
+        exist — callers can prepend the result unconditionally. Block now
+        appends a one-line mechanism-family summary so the agent sees
+        *which classes* dominate the pool, not just individual examples.
         """
         if not getattr(variation, "novelty_nudge_enabled", False):
             return ""
@@ -3025,7 +3299,11 @@ finally:
         max_chars = int(
             getattr(variation, "novelty_max_chars_per_hypothesis", 280) or 280
         )
-        return self._render_novelty_block(recent, max_chars=max_chars)
+        block = self._render_novelty_block(recent, max_chars=max_chars)
+        summary = self._render_mechanism_summary(recent)
+        if summary:
+            block = block + "\n\n" + summary
+        return block
 
     @staticmethod
     def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:

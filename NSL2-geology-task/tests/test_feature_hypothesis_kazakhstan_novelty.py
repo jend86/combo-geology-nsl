@@ -1,13 +1,17 @@
 """Novelty-nudge tests for FeatureHypothesisKazakhstanTask.
 
-Spec: Approach B of
-``docs/design/kazakhstan-variance-and-throughput-2026-05-24.md``.
-
-The agent was observed converging on 3 unique fingerprints across 245
-episodes. The nudge surfaces the last K admitted hypotheses in the
-proposer prompt as a "do not propose variants of these" block, attacking
-the diversity collapse at the prompt layer (orthogonal to the dedup gate,
-which only catches lexical duplicates after the fact).
+Spec:
+  - Approach B of
+    ``docs/design/kazakhstan-variance-and-throughput-2026-05-24.md``
+    (original novelty block at the proposer turn).
+  - Approach A of
+    ``docs/design/survey-diversity-and-data-surfacing-2026-05-29.md``
+    moved the injection point in ``_survey_workflow`` from the
+    *hypothesise* step to the *survey* step (so the agent sees the
+    diversity signal before choosing which files to open) and added a
+    one-line mechanism-family summary computed from the recent-admit
+    pool. The crossbreed workflow has no survey step and keeps the
+    nudge at hypothesise.
 
 These tests pin the contract:
 
@@ -17,9 +21,12 @@ These tests pin the contract:
   - ``_render_novelty_block`` produces an empty string on first episodes
     (no admits) and otherwise an enumerated, length-capped list with an
     explicit "avoid" instruction.
-  - Both ``_survey_workflow`` and ``_crossbreed_workflow`` route the
-    block into the hypothesise step prompt when admissions exist, and
-    skip it cleanly when the variation knob is off.
+  - ``_classify_mechanism`` + ``_render_mechanism_summary`` produce a
+    one-line summary of the dominant mechanism family in the recent
+    admit pool, with sensible degenerate-case handling.
+  - ``_survey_workflow`` routes the block into the *survey* step prompt
+    (NOT hypothesise) when admissions exist; ``_crossbreed_workflow``
+    routes it into hypothesise (its entry step).
 """
 
 from __future__ import annotations
@@ -66,13 +73,21 @@ def _seed_experiments(kg_dir: Path, rows: list[dict]) -> None:
             fh.write(json.dumps(row) + "\n")
 
 
-def _hypothesise_prompt(workflow) -> str:
+def _step_prompt(workflow, name: str) -> str:
     for step in workflow.steps:
-        if step.name == "hypothesise":
+        if step.name == name:
             return step.prompt
     raise AssertionError(
-        "workflow missing hypothesise step: " + repr([s.name for s in workflow.steps])
+        f"workflow missing {name!r} step: " + repr([s.name for s in workflow.steps])
     )
+
+
+def _hypothesise_prompt(workflow) -> str:
+    return _step_prompt(workflow, "hypothesise")
+
+
+def _survey_prompt(workflow) -> str:
+    return _step_prompt(workflow, "survey")
 
 
 class TestRecentAdmittedHypotheses:
@@ -154,8 +169,108 @@ class TestRenderNoveltyBlock:
         assert "avoid" in lowered or "different" in lowered or "new" in lowered
 
 
+class TestClassifyMechanism:
+    def test_fold_terms_route_to_structural(self) -> None:
+        for txt in [
+            "Distance to fold axis predicts copper",
+            "Anticline limbs concentrate mineralization",
+            "Strike-slip faults control fluid flow",
+        ]:
+            assert (
+                FeatureHypothesisKazakhstanTask._classify_mechanism(txt)
+                == "structural"
+            )
+
+    def test_redox_terms_route_to_geochemical(self) -> None:
+        for txt in [
+            "Redox boundary between red beds and reduced strata",
+            "Pyrite-to-hematite zoning at the host contact",
+            "Spectral analysis assays at depth",
+        ]:
+            assert (
+                FeatureHypothesisKazakhstanTask._classify_mechanism(txt)
+                == "geochemical"
+            )
+
+    def test_lithological_terms(self) -> None:
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism(
+                "Vladimirov suite sandstone facies host most prospects"
+            )
+            == "lithological"
+        )
+
+    def test_basin_geometry_terms(self) -> None:
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism(
+                "Distance to basin margin correlates with prospect density"
+            )
+            == "basin_geometry"
+        )
+
+    def test_drillhole_terms(self) -> None:
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism(
+                "Per-borehole SP curve polarity flips at lithology contacts"
+            )
+            == "drillhole"
+        )
+
+    def test_unknown_returns_other(self) -> None:
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism(
+                "Generic text with no domain keywords"
+            )
+            == "other"
+        )
+
+    def test_empty_returns_other(self) -> None:
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism("") == "other"
+        )
+
+    def test_first_match_wins_when_multiple_buckets_overlap(self) -> None:
+        # "fold" is in structural; the rest of the sentence has basin terms.
+        # First-match-wins per _MECHANISM_BUCKETS ordering: structural.
+        assert (
+            FeatureHypothesisKazakhstanTask._classify_mechanism(
+                "Fold proximity at basin margin"
+            )
+            == "structural"
+        )
+
+
+class TestRenderMechanismSummary:
+    def test_empty_recent_returns_empty(self) -> None:
+        assert FeatureHypothesisKazakhstanTask._render_mechanism_summary([]) == ""
+
+    def test_all_other_returns_empty(self) -> None:
+        recent = [
+            {"layer_name": "L", "hypothesis": "Generic content with no terms"}
+        ]
+        assert (
+            FeatureHypothesisKazakhstanTask._render_mechanism_summary(recent) == ""
+        )
+
+    def test_includes_dominant_family(self) -> None:
+        recent = [
+            {"layer_name": "L1", "hypothesis": "Anticline distance"},
+            {"layer_name": "L2", "hypothesis": "Fold-axis proximity"},
+            {"layer_name": "L3", "hypothesis": "Distance to basin margin"},
+        ]
+        summary = FeatureHypothesisKazakhstanTask._render_mechanism_summary(recent)
+        assert summary
+        assert "structural" in summary
+        # Cardinality (2/3) surfaced so the agent can gauge severity.
+        assert "(2/3)" in summary
+        # Fact-only summary (no directive examples) — softened after
+        # 2026-05-29 fresh run showed agents parroting the "redox/lithology"
+        # examples verbatim. Keep only the family-share fact.
+        assert summary.startswith("Recent admissions concentrate on:")
+
+
 class TestNoveltyInjectionInWorkflow:
-    def test_survey_hypothesise_includes_block_when_admissions_exist(
+    def test_survey_step_includes_block_when_admissions_exist(
         self, tmp_path: Path
     ) -> None:
         task = _task(tmp_path)
@@ -169,22 +284,48 @@ class TestNoveltyInjectionInWorkflow:
             },
         ])
         workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _hypothesise_prompt(workflow)
-        assert "fold_proximity" in prompt
-        assert "Copper prospects cluster near fold axes." in prompt
+        # Block appears at SURVEY now, not hypothesise (per Approach A
+        # 2026-05-29).
+        survey = _survey_prompt(workflow)
+        assert "fold_proximity" in survey
+        assert "Copper prospects cluster near fold axes." in survey
+        # And does NOT leak into the hypothesise step.
+        hypothesise = _hypothesise_prompt(workflow)
+        assert "Already discovered" not in hypothesise
+        assert "Copper prospects cluster near fold axes." not in hypothesise
 
-    def test_survey_hypothesise_omits_block_when_no_admissions(
+    def test_survey_step_omits_block_when_no_admissions(
         self, tmp_path: Path
     ) -> None:
         task = _task(tmp_path)
         variation = _variation(tmp_path)
         # No experiments.jsonl seeded.
         workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _hypothesise_prompt(workflow)
+        prompt = _survey_prompt(workflow)
         # The block header marker is the canonical novelty-block signal.
         assert "Already discovered" not in prompt
 
+    def test_survey_step_includes_mechanism_summary(self, tmp_path: Path) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        _seed_experiments(kg_dir, [
+            {
+                "node_id": f"exp{i}",
+                "hypothesis": "Anticline-axis proximity predicts copper.",
+                "layer_name": f"fold_{i}",
+            }
+            for i in range(3)
+        ])
+        workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
+        prompt = _survey_prompt(workflow)
+        assert "structural" in prompt
+        # Fact-only summary header (softened 2026-05-29 to drop directive
+        # shape-priming examples).
+        assert "Recent admissions concentrate on:" in prompt
+
     def test_crossbreed_hypothesise_includes_block(self, tmp_path: Path) -> None:
+        # Crossbreed has no survey step, so the block stays at hypothesise.
         task = _task(tmp_path)
         variation = _variation(tmp_path)
         kg_dir = Path(variation.kg_dir)
@@ -215,9 +356,12 @@ class TestNoveltyInjectionInWorkflow:
             {"node_id": "x", "hypothesis": "should not appear", "layer_name": "L"},
         ])
         workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _hypothesise_prompt(workflow)
-        assert "should not appear" not in prompt
-        assert "Already discovered" not in prompt
+        survey = _survey_prompt(workflow)
+        hypothesise = _hypothesise_prompt(workflow)
+        assert "should not appear" not in survey
+        assert "should not appear" not in hypothesise
+        assert "Already discovered" not in survey
+        assert "Already discovered" not in hypothesise
 
     def test_recent_k_zero_omits_block(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
@@ -227,5 +371,5 @@ class TestNoveltyInjectionInWorkflow:
             {"node_id": "x", "hypothesis": "h", "layer_name": "L"},
         ])
         workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _hypothesise_prompt(workflow)
+        prompt = _survey_prompt(workflow)
         assert "Already discovered" not in prompt
