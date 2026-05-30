@@ -105,14 +105,13 @@ _KG_LOCK = "kg.lock"
 #   score / (1 + α · attempt_count) / Π (1 + γ · uses(parent_i)),
 # with an extra · β multiplier when the pair is "consummated" (already has ≥1
 # admitted crossbreed child). α decays repeatedly-tried *pairs*; γ decays
-# repeatedly-tried *parents* (the lever that breaks the §8 monoculture where
+# repeatedly-tried *parents* (the lever that breaks monoculture where
 # 32 fold-pairs share the top slope); β puts consummated pairs in a slow lane
 # without banning them — LLM hypothesis generation is high-variance and the
 # surrounding feature pool keeps growing, so a second attempt at the same
 # pair is a genuinely different experiment.
 _PAIR_ATTEMPT_DECAY = 0.5
-_PARENT_USE_DECAY = 0.01     # γ — chosen conservatively for retroactive
-                             # rollout (see redesign §5.5: with 360 historical
+_PARENT_USE_DECAY = 0.01     # γ — chosen conservatively: with 360 historical
                              # uses on the fold parent, γ=0.1 gives a divisor
                              # of 37 and effectively exiles it). 0.01 still
                              # gives ~4.6× on resume — enough to demote fold
@@ -254,8 +253,6 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     # prompt as a "do not propose variants of these" block. Counters the
     # diversity collapse pattern (e.g. 3 unique fingerprints across 245
     # episodes) at the prompt layer, complementing the lexical dedup gate.
-    # See docs/design/kazakhstan-variance-and-throughput-2026-05-24.md
-    # (Approach B).
     novelty_nudge_enabled: bool = True
     novelty_recent_k: int = 8
     # Per-entry cap so the block stays bounded under long hypotheses; the
@@ -303,15 +300,16 @@ class FeatureHypothesisKazakhstanState:
 
 
 # ---------------------------------------------------------------------------
-# BIC-result appendix pattern — injected by _exec_submit_rewrite, must be
-# stripped from T4 completions before export.
+# BIC-result appendix pattern injected by _exec_submit_rewrite; outcome
+# narrative completions should not train on this harness-added suffix.
 # ---------------------------------------------------------------------------
 _BIC_RESULT_RE = re.compile(
     r"\s*Result:\s*-?\d+(?:\.\d+)?\s+BIC delta\.\s*(?:Admitted|Not admitted)\.",
     re.IGNORECASE,
 )
 
-# Stop-words for the novelty heuristic (T2 routing).
+# Stop-words for the novelty heuristic that decides whether to emit a row
+# asking for a new hypothesis from dataset context alone.
 _STOP_WORDS: frozenset[str] = frozenset(
     {
         "a", "an", "the", "and", "or", "of", "in", "to", "for", "with",
@@ -319,6 +317,11 @@ _STOP_WORDS: frozenset[str] = frozenset(
         "at", "as", "on", "from", "can", "will", "may", "has", "have",
     }
 )
+
+PAIR_KIND_PARENT_HYPOTHESIS = "parent_hypothesis"
+PAIR_KIND_DATASET_HYPOTHESIS = "dataset_hypothesis"
+PAIR_KIND_ANALYSIS_PLAN = "analysis_plan"
+PAIR_KIND_OUTCOME_NARRATIVE = "outcome_narrative"
 
 
 def _content_words(text: str) -> set[str]:
@@ -344,31 +347,24 @@ def _is_novel_vs_parents(hypothesis: str, parent_hypotheses: list[str]) -> bool:
 
 
 class ExperimentReasoningRows:
-    """SFT transform: synthesize T1/T2/T3/T4 prompt-completion pairs from
-    training-successful geology episodes.
+    """Synthesize prompt-completion rows from successful geology episodes.
 
-    Each training-successful episode produces up to 4 rows:
+    Each successful episode may produce these row kinds:
 
-    - **T1** (compose): parent-findings prompt → child hypothesis + rationale.
+    - ``parent_hypothesis``: parent findings -> child hypothesis and rationale.
       Skipped when parent context is not recoverable.
-    - **T2** (de-novo survey): dataset-overview prompt → hypothesis + rationale.
-      Only emitted when the hypothesis is >50% novel vs. parent vocabulary.
-    - **T3** (test-design): hypothesis + available-files prompt → data_spec plan.
-    - **T4** (adjudicate / narrative): hypothesis + context prompt → narrative.
-      Tagged ``record_meta.faithfulness = "post_hoc"``.  BIC appendix is
-      stripped from the completion.
+    - ``dataset_hypothesis``: dataset context -> new hypothesis and rationale.
+      Only emitted when the hypothesis has enough vocabulary not seen in parent
+      hypotheses.
+    - ``analysis_plan``: hypothesis and available files -> data_spec plan.
+    - ``outcome_narrative``: hypothesis and built feature -> explanatory
+      narrative. These rows are tagged ``faithfulness = "post_hoc"`` because
+      they are reconstructed after evaluation, and the harness-added BIC result
+      appendix is stripped from the completion.
 
-    Leakage guards
-    --------------
-    - ΔBIC float, sign ("admitted", "not admitted") never appear in any prompt.
-    - T4 ``raw_response`` has the ``"Result: … BIC delta. …"`` suffix stripped.
-
-    Curation (L2)
-    -------------
-    - Collapse exact prompt/completion duplicates, keeping the row from the
-      strongest ``|bic_delta|`` episode.
-    - Family balance caps dominant hypothesis families. T2 exploration rows are
-      preserved even when the rest of an over-cap family is dropped.
+    Prompts never include the BIC delta value or admitted/not-admitted outcome.
+    Curation collapses exact prompt/completion duplicates and caps dominant
+    hypothesis families while preserving dataset-context hypothesis rows.
     """
 
     def __init__(
@@ -417,11 +413,11 @@ class ExperimentReasoningRows:
             rows = self._synthesize_rows(episode, record)
             raw.append((episode, rows, record.get("bic_delta")))
 
-        # Phase 2: L2 curation — dedup + family balance.
+        # Curate rows by exact pair de-duplication and family balance.
         curated = self._curate(raw)
 
-        # Phase 3: pack into EpisodeTrainingRows, preserving empty groups for
-        # failed episodes so the caller sees the same episode count.
+        # Preserve empty groups for failed episodes so the caller sees the same
+        # episode count.
         out: list[EpisodeTrainingRows] = []
         for episode, rows, _bic in curated:
             out.append(
@@ -779,7 +775,7 @@ class ExperimentReasoningRows:
                 self._make_row(
                     episode=episode,
                     source_row=source_rows.get("hypothesise", {}),
-                    row_suffix="t1",
+                    row_suffix=PAIR_KIND_PARENT_HYPOTHESIS,
                     prompt=(
                         "Prior experiment findings:\n"
                         f"{parent_context}\n\n"
@@ -787,7 +783,7 @@ class ExperimentReasoningRows:
                         "contrasts with these findings."
                     ),
                     raw_response=hypothesis_target,
-                    pair_kind="T1",
+                    pair_kind=PAIR_KIND_PARENT_HYPOTHESIS,
                     hypothesis=hypothesis,
                     provenance=provenance,
                     extra_meta={"parent_ids": record.get("parent_ids", [])},
@@ -800,14 +796,14 @@ class ExperimentReasoningRows:
                 self._make_row(
                     episode=episode,
                     source_row=source_rows.get("survey", {}),
-                    row_suffix="t2",
+                    row_suffix=PAIR_KIND_DATASET_HYPOTHESIS,
                     prompt=(
                         "Dataset context:\n"
                         f"{survey_context}\n\n"
                         "Task: Propose a de-novo geological hypothesis from the available data."
                     ),
                     raw_response=hypothesis_target,
-                    pair_kind="T2",
+                    pair_kind=PAIR_KIND_DATASET_HYPOTHESIS,
                     hypothesis=hypothesis,
                     provenance=provenance,
                     extra_meta={"novelty_routed": True},
@@ -821,14 +817,14 @@ class ExperimentReasoningRows:
                 self._make_row(
                     episode=episode,
                     source_row=source_rows.get("hypothesise", {}),
-                    row_suffix="t3",
+                    row_suffix=PAIR_KIND_ANALYSIS_PLAN,
                     prompt=(
                         f"Hypothesis: {hypothesis}\n\n"
                         f"Available files: {', '.join(files) if files else 'see dataset context'}\n\n"
                         "Task: Design the analysis plan for testing the hypothesis."
                     ),
                     raw_response=self._format_data_spec(data_spec),
-                    pair_kind="T3",
+                    pair_kind=PAIR_KIND_ANALYSIS_PLAN,
                     hypothesis=hypothesis,
                     provenance=provenance,
                     extra_meta={},
@@ -842,7 +838,7 @@ class ExperimentReasoningRows:
                 self._make_row(
                     episode=episode,
                     source_row=source_rows.get("rewrite", {}),
-                    row_suffix="t4",
+                    row_suffix=PAIR_KIND_OUTCOME_NARRATIVE,
                     prompt=(
                         f"Hypothesis: {hypothesis}\n\n"
                         + (f"Feature built: {feature}\n\n" if feature else "")
@@ -850,7 +846,7 @@ class ExperimentReasoningRows:
                         "geological model compression. Do not cite any BIC number."
                     ),
                     raw_response=narrative,
-                    pair_kind="T4",
+                    pair_kind=PAIR_KIND_OUTCOME_NARRATIVE,
                     hypothesis=hypothesis,
                     provenance=provenance,
                     extra_meta={
@@ -979,7 +975,7 @@ class ExperimentReasoningRows:
     ) -> list[tuple[Any, list[dict[str, Any]], float | None]]:
         """Deduplicate exact pairs, then cap dominant hypothesis families.
 
-        T2 rows are always preserved even at the family cap.
+        Dataset-context hypothesis rows are always preserved at the family cap.
         """
         best_by_pair: dict[str, tuple[int, int, float, dict[str, Any]]] = {}
         for episode_index, (_episode, rows, bic) in enumerate(raw):
@@ -1004,7 +1000,12 @@ class ExperimentReasoningRows:
             hypothesis = self._extract_hypothesis_from_rows(rows) or episode.episode_id
             family = self._hypothesis_head(hypothesis)
             if family_counts.get(family, 0) >= self._max_per_family:
-                rows = [row for row in rows if row.get("record_meta", {}).get("pair_kind") == "T2"]
+                rows = [
+                    row
+                    for row in rows
+                    if row.get("record_meta", {}).get("pair_kind")
+                    == PAIR_KIND_DATASET_HYPOTHESIS
+                ]
             else:
                 family_counts[family] = family_counts.get(family, 0) + 1
             result.append((episode, rows, bic))
@@ -1017,14 +1018,14 @@ class ExperimentReasoningRows:
         return hashlib.sha256(f"{prompt}\n---\n{response}".encode("utf-8")).hexdigest()
 
     def _extract_hypothesis_from_rows(self, rows: list[dict[str, Any]]) -> str:
-        """Extract the hypothesis string from a T3 row's prompt (most reliable)."""
+        """Extract the hypothesis string from the analysis-plan row metadata."""
         for row in rows:
-            if row.get("record_meta", {}).get("pair_kind") == "T3":
+            if row.get("record_meta", {}).get("pair_kind") == PAIR_KIND_ANALYSIS_PLAN:
                 meta = row.get("record_meta", {})
                 if isinstance(meta, dict) and isinstance(meta.get("hypothesis"), str):
                     return meta["hypothesis"].strip()
                 prompt: str = row.get("prompt", "")
-                # T3 prompt starts with "Hypothesis: <hypothesis>\n\n"
+                # Analysis-plan prompts start with "Hypothesis: <hypothesis>".
                 m = re.match(r"Hypothesis:\s*(.+?)(?:\n|$)", prompt)
                 if m:
                     return m.group(1).strip()
@@ -3125,8 +3126,7 @@ finally:
 
             # Per-episode scratch with the admitted pool as read-only
             # overlay — isolates this slot's in-flight mutations from
-            # every other slot's. See
-            # docs/design/feature_hypothesis_voxel_store_isolation.md.
+            # every other slot's admitted writes.
             scratch_dir = Path(store_dir) / "scratch" / episode_id
             admitted_dir = Path(store_dir) / "admitted"
             admitted_dir.mkdir(parents=True, exist_ok=True)
@@ -4091,8 +4091,8 @@ finally:
         fingerprint is fresh. Duplicates leave the scratch file in place
         (the cleanup hook reclaims it after ``finalize_episode``).
 
-        Duplicates leave the episode's reward intact — the design intent
-        is "duplicates count as successes but do not flood the pool".
+        Duplicates leave the episode's reward intact: duplicates count as
+        successes but do not flood the admitted pool.
         """
         kg_path = Path(kg_dir)
         fp = self._fingerprint(parents, hypothesis)
@@ -4356,7 +4356,7 @@ finally:
                 distance = distance_index.get(dist_pair_id, 0.0)
                 # log1p shrinks BIC outliers (e.g. the |bic|=6.68 fold parent
                 # that monopolised the queue under linear scoring); the λ·dist
-                # term rewards orthogonal parents. See redesign §2.2 and §6.
+                # term rewards orthogonal parents.
                 score = (
                     math.log1p(bic_a)
                     + math.log1p(bic_b)

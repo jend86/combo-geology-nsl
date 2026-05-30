@@ -1,10 +1,4 @@
-"""TDD tests: ExperimentReasoningRows — synthesizes 3-4 SFT training pairs per
-training-successful episode (T1 compose, T2 survey, T3 test-design, T4 adjudicate).
-
-These tests are written BEFORE the implementation and are expected to FAIL with
-ImportError / AttributeError until ExperimentReasoningRows is added to
-tasks.feature_hypothesis_kazakhstan.
-"""
+"""Tests for synthesized geology reasoning prompt-completion rows."""
 
 from __future__ import annotations
 
@@ -15,7 +9,13 @@ from typing import Any
 import pytest
 
 from src.training_data.transforms import EpisodeTrainingRows, validate_training_row_groups
-from tasks.feature_hypothesis_kazakhstan import ExperimentReasoningRows
+from tasks.feature_hypothesis_kazakhstan import (
+    PAIR_KIND_ANALYSIS_PLAN,
+    PAIR_KIND_DATASET_HYPOTHESIS,
+    PAIR_KIND_OUTCOME_NARRATIVE,
+    PAIR_KIND_PARENT_HYPOTHESIS,
+    ExperimentReasoningRows,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +71,7 @@ def _episode(
     """Build a minimal EpisodeTrainingRows that resembles a real geology episode.
 
     The episode carries phase_records and success state in record_meta of the
-    first row — ExperimentReasoningRows must read these to synthesize pairs.
+    first row; ExperimentReasoningRows must read these to synthesize pairs.
     """
     if phase_records is None:
         phase_records = _default_phase_records()
@@ -133,7 +133,7 @@ def _episode(
     # but also needs episode-level context.  We attach it as extra attributes
     # in a way that the transform can discover (via episode_context dict or a
     # dedicated field).  We use a separate attribute "episode_context" on the
-    # EpisodeTrainingRows for now — the implementation must define the contract.
+    # EpisodeTrainingRows for now; the implementation must define the contract.
     group = EpisodeTrainingRows(
         episode_id=episode_id,
         episode_index=0,
@@ -188,7 +188,7 @@ def _run_transform(episodes: list[EpisodeTrainingRows]) -> list[EpisodeTrainingR
 
 class TestMaskingLeakage:
     def test_no_query_contains_bic_or_admitted(self) -> None:
-        """No synthesized row's prompt field may contain a ΔBIC float, the word
+        """No synthesized row's prompt field may contain a BIC delta, the word
         'admitted', or 'not admitted' (case-insensitive)."""
         episode = _episode()
         result = _run_transform([episode])
@@ -204,44 +204,48 @@ class TestMaskingLeakage:
                     f"row {row['row_id']} prompt contains 'admitted': {prompt!r}"
                 )
 
-    def test_t4_strips_exact_bic_result_appendix_by_default(self) -> None:
-        """By default, the T4 completion (raw_response) must NOT contain the
+    def test_outcome_narrative_strips_exact_bic_result_appendix(self) -> None:
+        """Outcome narrative completions must NOT contain the
         'Result: <bic> BIC delta.' appendix that _exec_submit_rewrite injects."""
         episode = _episode()
         result = _run_transform([episode])
 
-        t4_rows = [
+        narrative_rows = [
             row
             for group in result
             for row in group.rows
-            if row.get("record_meta", {}).get("pair_kind") == "T4"
+            if row.get("record_meta", {}).get("pair_kind")
+            == PAIR_KIND_OUTCOME_NARRATIVE
         ]
-        assert t4_rows, "expected at least one T4 row"
-        for row in t4_rows:
+        assert narrative_rows, "expected at least one outcome narrative row"
+        for row in narrative_rows:
             raw_response: str = row["raw_response"]
             assert _RESULT_APPENDIX.search(raw_response) is None, (
-                f"T4 row {row['row_id']} still contains BIC result appendix: {raw_response!r}"
+                f"row {row['row_id']} still contains BIC result appendix: {raw_response!r}"
             )
 
     def test_compose_child_not_in_parent_query(self) -> None:
-        """T1 (compose) row: the prompt (parent findings) must not contain the
-        child hypothesis verbatim — prompt represents the *parent* context."""
+        """Parent-hypothesis prompts must not contain the child hypothesis.
+
+        They represent parent context and should not leak the target answer.
+        """
         episode = _episode()
         result = _run_transform([episode])
 
-        t1_rows = [
+        parent_rows = [
             row
             for group in result
             for row in group.rows
-            if row.get("record_meta", {}).get("pair_kind") == "T1"
+            if row.get("record_meta", {}).get("pair_kind")
+            == PAIR_KIND_PARENT_HYPOTHESIS
         ]
-        assert t1_rows, "expected at least one T1 row"
+        assert parent_rows, "expected at least one parent-hypothesis row"
         child_hypothesis = (
             "acoustic impedance contrast predicts reservoir quality"
         )
-        for row in t1_rows:
+        for row in parent_rows:
             assert child_hypothesis not in row["prompt"], (
-                f"T1 prompt contains the child hypothesis verbatim; "
+                f"parent-hypothesis prompt contains the child hypothesis verbatim; "
                 f"it should only contain parent context. row_id={row['row_id']!r}"
             )
 
@@ -286,31 +290,36 @@ class TestScope:
 
 
 class TestProvenanceMetadata:
-    def test_t4_tagged_post_hoc(self) -> None:
-        """Every T4 row must have record_meta['faithfulness'] == 'post_hoc'."""
+    def test_outcome_narrative_tagged_post_hoc(self) -> None:
+        """Outcome narratives are marked as reconstructed after evaluation."""
         episode = _episode()
         result = _run_transform([episode])
 
-        t4_rows = [
+        narrative_rows = [
             row
             for group in result
             for row in group.rows
-            if row.get("record_meta", {}).get("pair_kind") == "T4"
+            if row.get("record_meta", {}).get("pair_kind")
+            == PAIR_KIND_OUTCOME_NARRATIVE
         ]
-        assert t4_rows, "expected at least one T4 row"
-        for row in t4_rows:
+        assert narrative_rows, "expected at least one outcome narrative row"
+        for row in narrative_rows:
             assert row["record_meta"].get("faithfulness") == "post_hoc", (
-                f"T4 row {row['row_id']} missing faithfulness=post_hoc: "
+                f"outcome narrative row {row['row_id']} missing faithfulness=post_hoc: "
                 f"{row['record_meta']!r}"
             )
 
     def test_synthesized_rows_carry_pair_kind(self) -> None:
-        """Every synthesized row must have record_meta['pair_kind'] in
-        ('T1', 'T2', 'T3', 'T4')."""
+        """Every synthesized row must have a known descriptive pair_kind."""
         episode = _episode()
         result = _run_transform([episode])
 
-        valid_kinds = {"T1", "T2", "T3", "T4"}
+        valid_kinds = {
+            PAIR_KIND_PARENT_HYPOTHESIS,
+            PAIR_KIND_DATASET_HYPOTHESIS,
+            PAIR_KIND_ANALYSIS_PLAN,
+            PAIR_KIND_OUTCOME_NARRATIVE,
+        }
         for group in result:
             for row in group.rows:
                 kind = row.get("record_meta", {}).get("pair_kind")
@@ -319,9 +328,9 @@ class TestProvenanceMetadata:
                     f"expected one of {valid_kinds}"
                 )
 
-    def test_missing_parent_skips_t1(self) -> None:
+    def test_missing_parent_skips_parent_hypothesis_row(self) -> None:
         """If the episode has no recoverable parent experiment context, the
-        transform must silently skip T1 rather than crash or emit a broken row."""
+        transform must skip the parent-hypothesis row."""
         no_parent_phase = _default_phase_records()
         no_parent_phase["hypothesise"]["parent_experiments"] = []  # empty parent list
 
@@ -329,17 +338,19 @@ class TestProvenanceMetadata:
             episode_id="ep-no-parent",
             phase_records=no_parent_phase,
         )
-        # Must not raise; T1 rows simply absent.
+        # Must not raise; parent-hypothesis rows are simply absent.
         result = _run_transform([episode])
 
-        t1_rows = [
+        parent_rows = [
             row
             for group in result
             for row in group.rows
-            if row.get("record_meta", {}).get("pair_kind") == "T1"
+            if row.get("record_meta", {}).get("pair_kind")
+            == PAIR_KIND_PARENT_HYPOTHESIS
         ]
-        assert len(t1_rows) == 0, (
-            f"Expected no T1 rows when parent context is missing, got {len(t1_rows)}"
+        assert len(parent_rows) == 0, (
+            "Expected no parent-hypothesis rows when parent context is missing, "
+            f"got {len(parent_rows)}"
         )
 
 
@@ -351,8 +362,8 @@ class TestProvenanceMetadata:
 class TestYield:
     def test_rows_per_episode_in_range(self) -> None:
         """Default config must yield 3–4 rows per training-successful episode."""
-        # Episode with a parent experiment present (enables T1) and standard
-        # phase records (enables T2, T3, T4).
+        # Parent context plus standard phase records should enable the full set
+        # of synthesized row kinds.
         episode = _episode(episode_id="ep-yield")
         result = _run_transform([episode])
 
@@ -439,5 +450,7 @@ class TestCuration:
         )
 
         capped = [group for group in result if group.episode_id == "ep-family-b"][0]
-        assert capped.rows, "T2 exploration seed should survive the family cap"
-        assert {row["record_meta"]["pair_kind"] for row in capped.rows} == {"T2"}
+        assert capped.rows, "dataset-hypothesis seed should survive the family cap"
+        assert {row["record_meta"]["pair_kind"] for row in capped.rows} == {
+            PAIR_KIND_DATASET_HYPOTHESIS
+        }
