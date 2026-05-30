@@ -14,3 +14,10 @@ __pycache__/
 *.py[cod]
 .venv/
 *.pyc
+
+# File-rotation runtime state (per-kg episode source-assignment counts)
+**/file_rotation_state.json
+
+# Logs
+*.log
+test_kazakhstan_output.log

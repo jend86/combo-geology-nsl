@@ -218,10 +218,12 @@ class TestFeatureHypothesisProposerRows:
 
     def test_kazakhstan_variant_drops_code(self) -> None:
         transform = FeatureHypothesisKazakhstanProposerRows()
-        groups = [_group(["survey", "hypothesise", "code", "translate", "rewrite"])]
+        # Kazakhstan merges survey+hypothesise into a single `explore` step.
+        groups = [_group(["explore", "code", "translate", "rewrite"])]
         result = transform.transform_export_rows(context=None, episodes=groups)
         kept = [r["workflow_step"] for r in result[0].rows]
         assert "code" not in kept
+        assert kept == ["explore", "translate", "rewrite"]
 
 
 # ---------------------------------------------------------------------------

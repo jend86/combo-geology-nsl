@@ -75,8 +75,10 @@ def test_populate_stamps_parents_from_queue(tmp_path: Path) -> None:
     variation = _variation(tmp_path)
     kg_dir = Path(variation.kg_dir)
     store_dir = Path(variation.store_dir)
-    _seed_experiments(kg_dir, ["alpha", "beta"])
-    _seed_features_index(store_dir, n=2)
+    # Need >= 5 admitted experiments to clear the crossbreed floor.
+    seeded = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    _seed_experiments(kg_dir, seeded)
+    _seed_features_index(store_dir, n=len(seeded))
 
     outcome = task.populate([], variation)
 
@@ -84,7 +86,8 @@ def test_populate_stamps_parents_from_queue(tmp_path: Path) -> None:
     parents = outcome.episode_context["crossbreed_context"]["parent_ids"]
     assert isinstance(parents, list)
     assert len(parents) == 2
-    assert set(parents) == {"alpha", "beta"}
+    assert len(set(parents)) == 2  # an ordered pair of distinct parents
+    assert set(parents) <= set(seeded)
 
 
 def test_concurrent_populates_get_distinct_parent_pairs(tmp_path: Path) -> None:
@@ -94,8 +97,10 @@ def test_concurrent_populates_get_distinct_parent_pairs(tmp_path: Path) -> None:
     variation = _variation(tmp_path)
     kg_dir = Path(variation.kg_dir)
     store_dir = Path(variation.store_dir)
-    _seed_experiments(kg_dir, ["alpha", "beta"])
-    _seed_features_index(store_dir, n=2)
+    # Need >= 5 admitted experiments to clear the crossbreed floor.
+    seeded = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    _seed_experiments(kg_dir, seeded)
+    _seed_features_index(store_dir, n=len(seeded))
 
     first = task.populate([], variation).episode_context["crossbreed_context"]["parent_ids"]
     second = task.populate([], variation).episode_context["crossbreed_context"]["parent_ids"]

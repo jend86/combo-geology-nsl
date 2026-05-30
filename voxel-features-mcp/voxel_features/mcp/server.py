@@ -33,8 +33,11 @@ from voxel_features.mcp.tools.spatial_tools import (
     spatial_get_operations_log, spatial_coord_to_voxel
 )
 from voxel_features.mcp.tools.execution_tools import (
-    execution_submit, execution_status, execution_results, 
+    execution_submit, execution_status, execution_results,
     execution_cancel, execution_reset_session
+)
+from voxel_features.mcp.tools.search_tools import (
+    web_search_geological, geonames_lookup
 )
 
 
@@ -313,6 +316,41 @@ TOOLS = [
             },
         },
     ),
+
+    # Search tools
+    Tool(
+        name="search.web_geological",
+        description="Search for geological location information using web search",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query (e.g., 'Vladimirovskoye geological formation')"
+                },
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
+        name="search.geonames_lookup",
+        description="Look up geographical coordinates using OpenStreetMap",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "place_name": {
+                    "type": "string",
+                    "description": "Name to search for (e.g., 'Vladimirovskoye', 'M42-I')"
+                },
+                "region": {
+                    "type": "string",
+                    "description": "Geographic region to constrain search",
+                    "default": "Kazakhstan"
+                },
+            },
+            "required": ["place_name"],
+        },
+    ),
 ]
 
 
@@ -365,7 +403,13 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return execution_cancel(**arguments)
     elif name == "execution.reset_session":
         return execution_reset_session(**arguments)
-    
+
+    # Search tools
+    elif name == "search.web_geological":
+        return web_search_geological(**arguments)
+    elif name == "search.geonames_lookup":
+        return geonames_lookup(**arguments)
+
     else:
         return {"success": False, "error": f"Unknown tool: {name}"}
 

@@ -180,6 +180,54 @@ _DATASET_OVERVIEW = """## Coe Fairbairn Dataset Overview
 """
 
 
+# Ordered list of distinct source files/groups for round-robin episode
+# assignment. Each survey episode is assigned the least-explored entry so
+# agents derive hypotheses from different sources rather than fixating on
+# whatever the context history primes them toward.
+_COE_FAIRBAIRN_SOURCE_FILES = [
+    {
+        "key": "drillhole",
+        "path": "amalgamated_csvs/geochemDrillhole.csv",
+        "description": (
+            "3D drillhole assay data — 80+ element columns (Au, Cu, Pb, Zn, …), "
+            "longitude, latitude, maxdepth_drill. Primary source for subsurface geochemistry."
+        ),
+    },
+    {
+        "key": "surface",
+        "path": "amalgamated_csvs/geochemSurface.csv",
+        "description": (
+            "Surface geochemistry samples — element assays at surface coordinates. "
+            "Useful for mapping near-surface anomalies and gossans."
+        ),
+    },
+    {
+        "key": "tenements",
+        "path": "amalgamated_csvs/ (tenement / lease boundary CSVs)",
+        "description": (
+            "Mining tenement boundaries, lease history, and tenure data. "
+            "Spatial polygons and metadata for the exploration area."
+        ),
+    },
+    {
+        "key": "description_maps",
+        "path": "description.md files",
+        "description": (
+            "Detailed natural-language descriptions of geological maps — "
+            "lithology, structure, alteration zones, interpreted contacts."
+        ),
+    },
+    {
+        "key": "wamex_reports",
+        "path": "WAMEX/ (OCR'd exploration report JSON chunks)",
+        "description": (
+            "Scanned WAMEX exploration reports chunked as JSON. "
+            "Contains historical assay tables, geological logs, and interpretations."
+        ),
+    },
+]
+
+
 @dataclass
 class FeatureHypothesisVariation(Variation):
     """Variation configuration for feature hypothesis task."""
@@ -450,6 +498,14 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                 crossbreed_ctx = self._get_crossbreed_context(variation)
             episode_context["crossbreed_context"] = crossbreed_ctx
 
+        # For survey episodes, assign a least-explored source file (file
+        # rotation) so coverage spreads evenly across the dataset rather than
+        # letting the agent fixate on context-primed concepts.
+        if workflow_kind == "survey":
+            rotation = self._pick_assigned_source(variation.kg_dir, _COE_FAIRBAIRN_SOURCE_FILES)
+            episode_context["assigned_source"] = rotation["source"]
+            episode_context["source_coverage"] = rotation["all_counts"]
+
         # Survey (= bootstrap): block here until a slot permit is free so
         # the early generation runs at lower concurrency. The framework
         # still allocates `parallel_episodes` slots; we choke them at the
@@ -574,8 +630,9 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
-        # Generate dynamic survey prompt with recent experiments context
-        survey_prompt = self._generate_survey_prompt_with_context(variation)
+        # Generate dynamic survey prompt with file-rotation assignment +
+        # recent experiments context.
+        survey_prompt = self._generate_survey_prompt_with_context(variation, episode_context)
         
         return Workflow(
             steps=(
@@ -2589,17 +2646,46 @@ finally:
     def _generate_survey_prompt_with_context(
         self,
         variation: FeatureHypothesisVariation,
+        episode_context: dict[str, Any] | None = None,
     ) -> str:
-        """Generate survey prompt with recent admitted experiments for dedup.
+        """Generate survey prompt with file-rotation assignment, a neutral
+        coverage map, and recent admitted experiments for dedup.
 
         Reads ``experiments.jsonl`` from the variation's ``kg_dir``. Every row
         there is admitted by construction (see ``_admit_with_dedup``). Pre-fix
         this branch silently failed because the old KnowledgeGraph class was
         instantiated with a GridSpec — see scoring-fix-and-replay-2026-05-25.md.
         """
+        episode_context = episode_context or {}
+        assigned = episode_context.get("assigned_source", {})
+        coverage = episode_context.get("source_coverage", {})
+
+        # File-rotation assignment + neutral coverage map (counts only, no
+        # hypothesis text, so the agent is never primed with past concepts).
+        if assigned:
+            coverage_lines = []
+            for src in _COE_FAIRBAIRN_SOURCE_FILES:
+                count = coverage.get(src["key"], 0)
+                marker = "  ← assigned this episode" if src["key"] == assigned.get("key") else ""
+                coverage_lines.append(f"  {src['path']}: {count} episode(s){marker}")
+            coverage_block = "\n".join(coverage_lines)
+            assignment_block = (
+                f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
+                f"  Path   : {assigned['path']}\n"
+                f"  Details: {assigned['description']}\n\n"
+                "You MUST derive your hypothesis candidate from this file.\n"
+                "Open and examine the assigned file first with analysis_shell.\n\n"
+                "SOURCE COVERAGE (episodes completed per file — situational awareness only):\n"
+                + coverage_block
+                + "\n\n"
+            )
+        else:
+            assignment_block = ""
+
         base_prompt = (
             "Phase 1: Survey\n\n"
-            "Explore the dataset to identify feature opportunities.\n\n"
+            + assignment_block
+            + "Explore the dataset to identify feature opportunities.\n\n"
             "Use analysis_shell to:\n"
             "- Read file headers and schemas\n"
             "- Identify interesting patterns\n\n"
@@ -2651,10 +2737,45 @@ finally:
                                 admitted_count += 1
                         except json.JSONDecodeError:
                             continue
-            return admitted_count >= 2
+            # Floor raised 2 → 5 so the full source-rotation list is explored
+            # at least once before crossbreeding begins (file-rotation tuning).
+            return admitted_count >= 5
         except Exception:
             return False
-    
+
+    def _pick_assigned_source(
+        self,
+        kg_dir: str,
+        source_files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Pick the least-explored source file and update the rotation state.
+
+        Reads ``{kg_dir}/file_rotation_state.json``, increments the count for
+        the chosen source, and writes back. Ties are broken by list order so
+        the assignment is stable and deterministic.
+        """
+        state_path = Path(kg_dir) / "file_rotation_state.json"
+        counts: dict[str, int] = {}
+        if state_path.exists():
+            try:
+                with open(state_path) as f:
+                    counts = json.load(f).get("counts", {})
+            except Exception:
+                counts = {}
+
+        # Least-explored source wins; list order breaks ties
+        assigned = min(source_files, key=lambda s: counts.get(s["key"], 0))
+        counts[assigned["key"]] = counts.get(assigned["key"], 0) + 1
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"counts": counts}, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Could not write file_rotation_state.json: {exc}")
+
+        return {"source": assigned, "all_counts": counts}
+
     def _get_crossbreed_context(
         self,
         variation: FeatureHypothesisVariation,

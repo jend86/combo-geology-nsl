@@ -129,48 +129,11 @@ _KAZAKHSTAN_TENIZ_GRID = {
 }
 
 
-_SYSTEM_PROMPT = """You are in mineral exploration mode for Kazakhstan geological analysis.
+_SYSTEM_PROMPT = """You are analyzing Kazakhstan mineral prospects.
 
-Your goal is to identify informative feature layers that would improve compression
-of a voxel-based world model. You are rewarded when adding a feature layer improves BIC on a ridge regression of the overall world model.
+Grid: lon 66.5–71.5°E, lat 49.5–52.5°N, depth 0–80m (200×200×8 voxels, ~1.75km/voxel).
 
-## Grid
-
-The voxel grid covers the Teniz Basin region of Kazakhstan:
-- Longitude: 66.5° to 71.5°E
-- Latitude: 49.5° to 52.5°N
-- Depth: 0 to 80m
-- Resolution: 200 × 200 × 8 voxels (~1.75km × 1.75km × 10m per voxel)
-
-## Scoring
-
-The workflow converts geographic analysis results into 3D feature layers through spatial operations:
-1. **Analysis phase** identifies geological patterns in coordinate data
-2. **Translation phase** converts findings to spatial commands (spatial_add_point, spatial_add_line)  
-3. **Automatic voxel mapping** projects geographic coordinates onto the 200×200×8 grid
-4. **BIC evaluation** tests if the new spatial feature improves joint prediction
-
-Feature layers are evaluated by:
-- BIC - n*ln(MSE) + k*ln(n) (joint ridge regression across all layers)
-
-A layer is admitted if bic_delta < 0.
-
-## Capabilities
-
-**Phase 1-3 (Hypothesis & Analysis):**
-- analysis_shell: Execute Python code in a sandbox with polars/duckdb/scipy
-- hypothesis_create: Register a falsifiable hypothesis
-- execution_submit/status/results/finalize: Async code execution with budget control
-
-**Phase 4 (Spatial Translation):**
-- spatial_add_point: Add point features at geographic coordinates with radius of effect
-- spatial_add_line: Add linear features (faults, veins) between two 3D points
-- spatial_query_region: Query existing spatial features in a geographic region
-- spatial_coord_to_voxel: Convert geographic coordinates to voxel indices
-- spatial_get_operations_log: Get history of spatial operations
-
-**Phase 5 (Rewrite):**
-- record_phase: Record workflow phase completion
+A feature layer is admitted if bic_delta < 0.
 """
 
 
@@ -223,6 +186,181 @@ regional features. Drill-log signals are sub-voxel and must be aggregated
 (e.g. per-borehole mean assay, depth-of-first-anomaly) before becoming a
 voxel-grid feature.
 """
+
+
+# Ordered list of distinct source files/groups for round-robin episode assignment.
+# Each episode is assigned the least-explored entry so agents are forced to
+# derive hypotheses from different data sources rather than free-roaming and
+# fixating on whatever the context history primes them toward.
+#
+# Entries with a "glob_pattern" field (str or list[str]) point to a directory;
+# the agent is shown a code snippet to enumerate only that section's files.
+# Entries without "glob_pattern" are read as a single file or plain directory.
+_KAZAKHSTAN_SOURCE_FILES = [
+    # --- Spatial GeoJSON ---
+    {
+        "key": "copper_prospects_aoi",
+        "path": "converted_spatial_data/copper_prospects_aoi.geojson",
+        "description": (
+            "112 sediment-hosted copper prospect points (area-of-interest subset) — "
+            "coordinates, tonnage (Tonnage_Mt), Cu% grade (Cu_pct), Ag content, "
+            "deposit classification."
+        ),
+    },
+    {
+        "key": "anticlines_synclines",
+        "path": "converted_spatial_data/anticlines_synclines.geojson",
+        "description": (
+            "58 geological fold structures (anticlines and synclines) — fold axes, "
+            "structure names, geological ages."
+        ),
+    },
+    # --- Smolianova 1984 Russian survey — section-level ---
+    {
+        "key": "smolianova_geological_study",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*II_GEOLOGICAL-GEOPHYSICAL*.md",
+        "description": (
+            "Smolianova 1984 Ch. II — geological-geophysical survey (~10 chunks): "
+            "regional setting, survey methods, geophysical interpretation."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_early",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": ["*Proterozoic*.md", "*Cambrian*.md", "*Ordovician*.md"],
+        "description": (
+            "Smolianova 1984 Ch. V — early stratigraphy (~20 chunks): "
+            "Proterozoic, Cambrian, Ordovician sequences and basement lithology."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_devonian",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Devonian*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Devonian stratigraphy (~16 chunks): "
+            "sedimentary sequences, redbeds, lithology descriptions."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_carboniferous_lower",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Lower*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Lower Carboniferous (~31 chunks): "
+            "key copper-hosting sedimentary sequences and diagenetic features."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_carboniferous_middle",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Middle*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Middle Carboniferous (~10 chunks): "
+            "stratigraphy, lithology, and depositional environment."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_carboniferous_upper",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Upper*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Upper Carboniferous (~15 chunks): "
+            "stratigraphy, lithology, and lateral facies variation."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_permian",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*STRATIGRAPHY_Permian*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Permian stratigraphy (~27 chunks): "
+            "red-bed sequences, evaporites, post-orogenic basin evolution."
+        ),
+    },
+    {
+        "key": "smolianova_magmatic",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*MAGMATIC_FORMATIONS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VI — Magmatic formations (~49 chunks): "
+            "igneous intrusions, volcanic sequences, geochemistry."
+        ),
+    },
+    {
+        "key": "smolianova_tectonics",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*TECTONICS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VII — Tectonics (~8 chunks): "
+            "structural geology, fault systems, basin architecture, fold belts."
+        ),
+    },
+    {
+        "key": "smolianova_useful_minerals",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*USEFUL_MINERALS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VIII — Useful minerals (~21 chunks): "
+            "economic mineralogy, Cu/Ag occurrences, mineral paragenesis."
+        ),
+    },
+    {
+        "key": "smolianova_prognosis",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*REGULARITIES_AND_PROGNOSIS*.md",
+        "description": (
+            "Smolianova 1984 Ch. IX — Ore-forming regularities and prognosis (~8 chunks): "
+            "spatial controls on mineralisation, exploration targeting criteria."
+        ),
+    },
+    {
+        "key": "smolianova_geological_work",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*GEOLOGICAL_WORK_IN_APPENDICES*.md",
+        "description": (
+            "Smolianova 1984 Ch. XI — Geological work in appendices (~14 chunks): "
+            "detailed analytical results, laboratory data, supporting studies."
+        ),
+    },
+    {
+        "key": "smolianova_textual_appendix",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*TEXTUAL_APPENDIX*.md",
+        "description": (
+            "Smolianova 1984 Textual appendix (~74 chunks): mineral deposits catalogue "
+            "with deposit name, location, type, tonnage, and grade data."
+        ),
+    },
+    {
+        "key": "smolianova_nrs_review",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*NRS_REVIEW*.md",
+        "description": (
+            "Smolianova 1984 — NRS review & commission appendix (~9 chunks): "
+            "expert commentary on survey conclusions and recommended follow-up."
+        ),
+    },
+    {
+        "key": "smolianova_drill_holes",
+        "path": "36572_Smolianova_1984/drill_holes_data/",
+        "description": (
+            "Smolianova 1984 — 60+ borehole logs: lithology descriptions, depth "
+            "intervals, core recovery, mineralisation intercepts."
+        ),
+    },
+    # --- USGS sandstone copper assessment ---
+    {
+        "key": "usgs_report",
+        "path": "USGS/chunks/",
+        "description": (
+            "USGS sandstone copper assessment (~7 chunks): English-language report, "
+            "quantitative resource estimates, deposit model methodology, figure "
+            "descriptions (13 figures)."
+        ),
+    },
+]
 
 
 @dataclass
@@ -465,6 +603,7 @@ class ExperimentReasoningRows:
         episode_context = self._episode_context(episode, source_payload)
         rows = list(getattr(episode, "rows", []))
         meta_record = self._first_meta_record(rows)
+        transcript_phase_records = self._phase_records_from_tool_outputs(rows)
 
         phase_records = self._first_dict(
             meta_record.get("phase_records"),
@@ -472,6 +611,7 @@ class ExperimentReasoningRows:
             meta_record.get("experiment_record", {}).get("phase_records")
             if isinstance(meta_record.get("experiment_record"), dict)
             else None,
+            transcript_phase_records,
         )
         terminal_record = self._first_dict(
             meta_record.get("terminal_record"),
@@ -494,7 +634,7 @@ class ExperimentReasoningRows:
 
         hypothesise_row = self._row_for_step(rows, "hypothesise")
         survey_row = self._row_for_step(rows, "survey")
-        rewrite_row = self._row_for_step(rows, "rewrite")
+        rewrite_row = self._rewrite_output_row(rows)
 
         hypothesis, hypothesis_source = self._first_text_with_source(
             (hypothesise.get("hypothesis"), "phase_records"),
@@ -613,7 +753,7 @@ class ExperimentReasoningRows:
     @staticmethod
     def _first_dict(*values: Any) -> dict[str, Any]:
         for value in values:
-            if isinstance(value, dict):
+            if isinstance(value, dict) and value:
                 return value
         return {}
 
@@ -625,9 +765,86 @@ class ExperimentReasoningRows:
         return {}
 
     @staticmethod
+    def _rewrite_output_row(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        for row in rows:
+            if row.get("workflow_step") == "rewrite" and ExperimentReasoningRows._row_text(
+                row,
+                "raw_response",
+            ):
+                return row
+        return ExperimentReasoningRows._row_for_step(rows, "rewrite")
+
+    @staticmethod
     def _row_text(row: dict[str, Any], field: str) -> str:
         value = row.get(field) if isinstance(row, dict) else None
         return value.strip() if isinstance(value, str) else ""
+
+    @classmethod
+    def _phase_records_from_tool_outputs(cls, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        phase_records: dict[str, Any] = {}
+        for row in rows:
+            prompt = cls._row_text(row, "prompt")
+            if "[tool]" not in prompt:
+                continue
+            for output in cls._iter_tool_outputs(prompt):
+                if "hypothesis" in output or "data_spec" in output or "parent_experiments" in output:
+                    phase_records.setdefault("hypothesise", {}).update(
+                        {
+                            key: output[key]
+                            for key in ("hypothesis", "data_spec", "parent_experiments")
+                            if key in output
+                        }
+                    )
+                if any(key in output for key in ("code_executed", "result_summary", "artifact_files")):
+                    phase_records.setdefault("code", {}).update(
+                        {
+                            key: output[key]
+                            for key in (
+                                "code_executed",
+                                "result_summary",
+                                "artifact_directory",
+                                "artifact_files",
+                            )
+                            if key in output
+                        }
+                    )
+                feature_layer_name = output.get("feature_layer_name")
+                if isinstance(feature_layer_name, str) and feature_layer_name.strip():
+                    phase_records.setdefault("translate", {})["feature_layer_name"] = (
+                        feature_layer_name.strip()
+                    )
+                if any(key in output for key in ("bic_delta", "admitted", "mutual_info")):
+                    phase_records.setdefault("evaluate", {}).update(
+                        {
+                            key: output[key]
+                            for key in ("bic_delta", "admitted", "mutual_info")
+                            if key in output
+                        }
+                    )
+        return phase_records
+
+    @staticmethod
+    def _iter_tool_outputs(text: str) -> Iterator[dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        marker = "[tool]\n"
+        cursor = 0
+        while True:
+            marker_index = text.find(marker, cursor)
+            if marker_index < 0:
+                return
+            start = marker_index + len(marker)
+            chunk = text[start:].lstrip()
+            try:
+                payload, end = decoder.raw_decode(chunk)
+            except ValueError:
+                cursor = start
+                continue
+            cursor = start + end
+            if not isinstance(payload, dict):
+                continue
+            output = payload.get("output")
+            if isinstance(output, dict):
+                yield output
 
     @staticmethod
     def _parse_hypothesis(row: dict[str, Any]) -> str:
@@ -1043,8 +1260,7 @@ class FeatureHypothesisKazakhstanProposerRows:
     """
 
     DEFAULT_INCLUDED_WORKFLOW_STEPS: tuple[str, ...] = (
-        "survey",
-        "hypothesise",
+        "explore",
         "translate",
         "rewrite",
     )
@@ -1234,6 +1450,17 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 crossbreed_ctx = self._get_crossbreed_context(variation)
             episode_context["crossbreed_context"] = crossbreed_ctx
 
+        # For survey episodes, assign a least-explored source file (file
+        # rotation) and pre-read a compact sample so the agent grounds in real
+        # data immediately rather than fixating on context-primed concepts.
+        if workflow_kind == "survey":
+            rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
+            episode_context["assigned_source"] = rotation["source"]
+            episode_context["source_coverage"] = rotation["all_counts"]
+            episode_context["source_sample"] = self._read_source_sample(
+                rotation["source"], variation.dataset_dir
+            )
+
         # Survey (= bootstrap): block here until a slot permit is free so
         # the early generation runs at lower concurrency. The framework
         # still allocates `parallel_episodes` slots; we choke them at the
@@ -1358,66 +1585,26 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
 
-        # Novelty + mechanism-summary nudge is injected at survey (not at
-        # hypothesise) so the agent sees the diversity signal *before*
-        # choosing which files to open. Both the survey and crossbreed
-        # workflows run this survey step, so the nudge lives here for both
-        # (see _crossbreed_workflow, which reuses this step verbatim).
-        novelty_block = self._novelty_block_for(variation)
-        survey_prompt = (
-            "Phase 1: Survey\n\n"
-            + (novelty_block + "\n\n" if novelty_block else "")
-            + "Explore the dataset to identify feature opportunities. You MUST\n"
-            "sample at least one source from each of three corpus classes\n"
-            "before recording your candidates:\n\n"
-            "  - vector   : converted_spatial_data/*.geojson\n"
-            "  - tabular  : USGS/TZ_ssCu_Prospects.csv\n"
-            "  - text     : USGS/chunks/*.md,\n"
-            "               36572_Smolianova_1984/chunks/*.md, or\n"
-            "               36572_Smolianova_1984/drill_holes_data/\n"
-            "               *.description.md\n\n"
-            "Use analysis_shell to read file headers, schemas, value\n"
-            "distributions, and 1-2 representative text snippets (head -N\n"
-            "of a chunk is enough — full reads are wasteful).\n\n"
-            "Find 2-3 promising feature layer candidates.\n\n"
-            "Close with:\n"
-            "  record_phase(phase='survey', candidates=[...],\n"
-            "               corpora_sampled=['vector','tabular','text'])\n"
-            "where corpora_sampled lists the corpus classes you actually\n"
-            "inspected (subset of ['vector','tabular','text'])."
-        )
-        hypothesise_prompt = (
-            "Phase 2: Hypothesise\n\n"
-            "Pick one candidate from the survey phase and state a falsifiable\n"
-            "hypothesis.\n\n"
-            "Include a data_spec with:\n"
-            "- files: list of data sources to analyze\n"
-            "- analysis: analytical approach\n"
-            "- output: what the output should represent\n\n"
-            "Close with:\n"
-            "  record_phase(phase='hypothesise', hypothesis=..., data_spec=...)"
-        )
+        # Survey and Hypothesise are merged into a single `explore` step that
+        # terminates on record_phase(phase='hypothesise'). The explore body
+        # (file-rotation assignment + pre-read sample) is built by
+        # _generate_explore_prompt. Both the survey and crossbreed workflows
+        # run an explore step (see _crossbreed_workflow, which swaps only the
+        # prompt — grounding is preserved either way).
+        #
+        # NOTE: the novelty nudge (self._novelty_block_for) is intentionally NOT
+        # injected (deprecated 2026-05-31). File rotation now supplies diversity.
+        # The novelty machinery is left in place but UNUSED pending a later
+        # decision on whether to delete it — see _novelty_block_for.
+        explore_prompt = self._generate_explore_prompt(episode_context)
 
         return Workflow(
             steps=(
-                # HYPOTHESIS AGENT: Phase 1
+                # EXPLORE + HYPOTHESISE AGENT: Phase 1 (survey + hypothesise merged)
                 WorkflowStep(
-                    name="survey",
+                    name="explore",
                     is_entry=True,
-                    prompt=survey_prompt,
-                    inherit_all_capabilities=False,
-                    capabilities=(
-                        "analysis_shell",
-                        "record_phase",
-                    ),
-                    terminator_capabilities=("record_phase",),
-                    next_steps=("hypothesise",),
-                ),
-
-                # HYPOTHESIS AGENT: Phase 2
-                WorkflowStep(
-                    name="hypothesise",
-                    prompt=hypothesise_prompt,
+                    prompt=explore_prompt,
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -1426,7 +1613,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     terminator_capabilities=("record_phase",),
                     next_steps=("code",),
                 ),
-                
+
                 # CODING AGENT: Phase 3 (isolated, stateless)
                 WorkflowStep(
                     name="code",
@@ -1442,14 +1629,16 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Performs statistical analysis, correlation, classification\n"
                         "   - Creates filtered DataFrames, computed arrays, summary statistics\n"
                         "   - Tests geological relationships and patterns\n"
-                        "   - Stores results in variables (these become artifacts automatically)\n"
+                        "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
+                        "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
                         "   execution_status(execution_id='...')  # Check status/progress\n"
                         "   execution_status(execution_id='...')  # Keep checking until 'completed'\n\n"
-                        "5. Get results and validate artifacts:\n"
-                        "   execution_results(execution_id='...')  # Get artifacts + output\n\n"
+                        "5. Get results and confirm artifacts exist:\n"
+                        "   execution_results(execution_id='...')  # MUST show artifact_files non-empty\n"
+                        "   If artifact_files is empty: fix your code to save files, then resubmit.\n\n"
                         "6. Finalize successful execution:\n"
                         "   execution_finalize(execution_id='...', success=True, summary='Brief summary of results')\n\n"
                         "**RETRY STRATEGY**:\n"
@@ -1488,18 +1677,26 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
-                        "   **For drill hole data with coordinates:**\n"
+                        "   **For prospect/drill data with coordinates:**\n"
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
-                        "   **For geological structures (faults, veins):**\n"
+                        "   **For geological structures (faults, anticlines, basins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
-                        "   **For statistical results without coordinates:**\n"
-                        "   - Use geological knowledge: 'near Emily Well' → find well coordinates\n"
-                        "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
-                        "3. -Create exactly ONE coherent feature layer:\n"
+                        "   **For text-based locations without coordinates:**\n"
+                        "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
+                        "   2. Use search tools with 3-call budget:\n"
+                        "      • search_web_geological('Vladimirovskoye geological formation')\n"
+                        "      • search_geonames_lookup('M42-I', 'Kazakhstan')\n"
+                        "   3. If search yields coordinates → use them\n"
+                        "   4. If search fails or is ambiguous → BE CREATIVE and make geological sense:\n"
+                        "      • 'southeastern' → bottom-right 25% of grid (lat<50.75°, lon>69.0°)\n"
+                        "      • 'northern edge' → top 12.5% (lat>51.75°)\n"
+                        "      • 'central basin' → around 69°E, 51°N\n"
+                        "      • When in doubt, distribute spatially and document your reasoning\n"
+                        "3. Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
-                        " - Values must be floats or booleans: 'clay' → has_clay=True\n", 
-                        "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
-                        "            spatial_add_line(name='mineralization_potential', ...) \n"
+                        "   - Values must be floats or booleans: 'copper_potential' → 0.75\n"
+                        "   - Example: spatial_add_point(name='sediment_copper_potential', ...) \n"
+                        "            spatial_add_line(name='sediment_copper_potential', ...) \n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
                         "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
                         "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
@@ -1508,18 +1705,20 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   2. spatial_add_line(name='name', ...)\n"
                         "   3. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
-                        "Focus on geological intelligence, not array mathematics!"
+                        "Focus on regional geological intelligence for Kazakhstan basin analysis!"
                     ),
                     context_mode="isolated",
                     inherit_all_capabilities=False,
                     capabilities=(
                         "get_experiment_summary",
                         "spatial_add_point",
-                        "spatial_add_line", 
+                        "spatial_add_line",
                         "spatial_query_region",
                         "spatial_coord_to_voxel",
                         "spatial_get_operations_log",
                         "scoring_create_feature_layer",
+                        "search_web_geological",
+                        "search_geonames_lookup",
                     ),
                     terminator_capabilities=("scoring_create_feature_layer",),
                     next_steps=("rewrite",),
@@ -1558,15 +1757,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         variation: FeatureHypothesisKazakhstanVariation,
         episode_context: dict[str, Any],
     ) -> Workflow:
-        """Crossbreed workflow: same Survey → Hypothesise → Code → Translate →
-        Rewrite chain as the standard workflow, but the hypothesise step combines
-        parent experiments instead of picking a fresh survey candidate.
+        """Crossbreed workflow: same Explore → Code → Translate → Rewrite chain
+        as the standard workflow, but the entry `explore` step combines parent
+        experiments instead of picking a fresh survey candidate.
 
-        The survey step is retained (and stays the entry) so crossbreed episodes
-        still ground themselves in the source files before hypothesising — survey
-        is supposed to happen even in crossbreed mode. Only the hypothesise step's
-        prompt differs; the novelty nudge stays on the survey step (built by
-        _survey_workflow), so it is NOT re-injected here.
+        Per the merge decision, crossbreed episodes STILL ground themselves in
+        the data: we keep an `explore`-named entry step (so the agent runs
+        analysis_shell before hypothesising) rather than jumping straight to a
+        bare hypothesise prompt. Only the explore step's prompt differs; the
+        rest of the chain is reused verbatim from _survey_workflow.
         """
 
         crossbreed_ctx = episode_context.get("crossbreed_context", {})
@@ -1574,24 +1773,29 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         base_workflow = self._survey_workflow(variation, episode_context)
 
+        # Novelty nudge intentionally NOT injected here either (deprecated
+        # 2026-05-31); the dormant machinery stays in place pending a later
+        # decision — see _novelty_block_for.
         crossbreed_prompt = (
-            "Phase 2: Hypothesise (Crossbreed Mode)\n\n"
+            "Phase 1: Explore + Hypothesise (Crossbreed Mode)\n\n"
             f"Parent experiments: {parent_ids}\n\n"
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
-            "You have just surveyed the dataset. Building on the parent findings\n"
-            "above together with what you observed in the data, propose a\n"
-            "hypothesis that combines or extends them.\n\n"
+            "First, use analysis_shell to ground yourself in the dataset — open a\n"
+            "few relevant sources and confirm what the data actually shows.\n"
+            "Then, building on the parent findings above together with what you\n"
+            "observed, propose ONE hypothesis that combines or extends them.\n\n"
             "Include a data_spec as before.\n\n"
             "Close with:\n"
             "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
             f"parent_experiments={parent_ids})"
         )
 
-        # Keep the full Survey → … → Rewrite chain; only swap the hypothesise
-        # step's prompt for the crossbreed variant. Survey remains is_entry, so
-        # the crossbreed hypothesise step is a normal (non-entry) successor.
-        crossbreed_hypothesise = WorkflowStep(
-            name="hypothesise",
+        # Keep the full Explore → … → Rewrite chain; only swap the entry
+        # `explore` step's prompt for the crossbreed variant. It stays is_entry
+        # and keeps analysis_shell so grounding still happens in crossbreed mode.
+        crossbreed_explore = WorkflowStep(
+            name="explore",
+            is_entry=True,
             prompt=crossbreed_prompt,
             inherit_all_capabilities=False,
             capabilities=(
@@ -1602,7 +1806,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             next_steps=("code",),
         )
         new_steps = tuple(
-            crossbreed_hypothesise if s.name == "hypothesise" else s
+            crossbreed_explore if s.name == "explore" else s
             for s in base_workflow.steps
         )
         return Workflow(steps=new_steps)
@@ -1865,8 +2069,41 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "required": ["name"],
                 },
             ),
+            Capability(
+                name="search_web_geological",
+                description="Search for geological location information using web search.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (e.g., 'Vladimirovskoye geological formation')"
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            Capability(
+                name="search_geonames_lookup",
+                description="Look up geographical coordinates using OpenStreetMap.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "place_name": {
+                            "type": "string",
+                            "description": "Name to search for (e.g., 'Vladimirovskoye', 'M42-I')"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Geographic region to constrain search",
+                            "default": "Kazakhstan"
+                        },
+                    },
+                    "required": ["place_name"],
+                },
+            ),
         ]
-    
+
     def execute_capability(
         self,
         invocation: CapabilityInvocation,
@@ -1905,6 +2142,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             return self._exec_spatial_capability(containers, args, ctx, name)
         elif name == "scoring_create_feature_layer":
             return self._exec_scoring_capability(containers, args, ctx, name)
+        elif name.startswith("search_"):
+            return self._exec_search_capability(containers, args, ctx, name)
         else:
             return CapabilityResult(name, success=False, error=f"Unknown capability: {name}")
     
@@ -2090,9 +2329,12 @@ except Exception as user_code_error:
         
         output = phase_records[phase].copy()
         
-        # Auto-enhance data_spec for coding phase
+        # Auto-enhance data_spec for coding phase, prepending the episode's
+        # assigned source (file rotation) so the code agent always sees it.
         if phase == "hypothesise" and "data_spec" in output:
-            output["data_spec"] = self._enhance_data_spec(output["data_spec"])
+            output["data_spec"] = self._enhance_data_spec(
+                output["data_spec"], ctx.episode_context
+            )
         
         return CapabilityResult(
             "phase_get",
@@ -2100,7 +2342,9 @@ except Exception as user_code_error:
             success=True,
         )
     
-    def _enhance_data_spec(self, data_spec: dict[str, Any]) -> dict[str, Any]:
+    def _enhance_data_spec(
+        self, data_spec: dict[str, Any], episode_context: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Enhance data_spec with Kazakhstan-specific file guidance and correct paths.
 
         Property lists and counts here are surfaced directly to the coding
@@ -2297,6 +2541,32 @@ except Exception as user_code_error:
         for file_path in files:
             if not any(known in file_path for known in known_file_keys):
                 file_specs.append({"file": file_path, "type": "unknown", "note": "Additional file - check format"})
+
+        # Prepend the episode's assigned source (file rotation) so the code
+        # agent always sees it first, even if the explore agent's record_phase
+        # listed different files.
+        assigned = (episode_context or {}).get("assigned_source", {})
+        if assigned:
+            apath = assigned.get("path", "")
+            aglob = assigned.get("glob_pattern")
+            if aglob:
+                patterns = [aglob] if isinstance(aglob, str) else aglob
+                for p in patterns:
+                    resolved = f"/workspace/input/{apath}/{p}"
+                    if not any(resolved in str(s.get("file", "")) for s in file_specs):
+                        file_specs.insert(0, {
+                            "file": resolved,
+                            "type": "md_chunks",
+                            "note": f"Assigned section — {assigned.get('key', '')}: use glob to enumerate",
+                        })
+            elif apath:
+                resolved = f"/workspace/input/{apath}"
+                if not any(resolved in str(s.get("file", "")) for s in file_specs):
+                    file_specs.insert(0, {
+                        "file": resolved,
+                        "full_path": resolved,
+                        "note": f"Assigned source — {assigned.get('key', '')}",
+                    })
 
         enhanced["file_specs"] = file_specs
         enhanced["kazakhstan_data_structure"] = {
@@ -3003,7 +3273,56 @@ finally:
             
         except Exception as e:
             return CapabilityResult("execution_finalize", success=False, error=str(e))
-    
+
+    def _exec_search_capability(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+        capability_name: str,
+    ) -> CapabilityResult:
+        """Execute a geological location search capability (web / geonames).
+
+        Imports the search tools from the same voxel-features-mcp package the
+        other _exec_* capabilities use, so the runtime import path stays
+        consistent. Network errors surface as a non-fatal failed result.
+        """
+        try:
+            import sys
+            from pathlib import Path
+            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
+            if vfm_path not in sys.path:
+                sys.path.append(vfm_path)
+
+            from voxel_features.mcp.tools.search_tools import (
+                web_search_geological,
+                geonames_lookup,
+            )
+
+            if capability_name == "search_web_geological":
+                result = web_search_geological(**args)
+            elif capability_name == "search_geonames_lookup":
+                result = geonames_lookup(**args)
+            else:
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error=f"Unknown search capability: {capability_name}",
+                )
+
+            return CapabilityResult(
+                capability_name,
+                output=result,
+                success=result.get("success", False),
+                error=result.get("error"),
+            )
+        except Exception as e:
+            return CapabilityResult(
+                capability_name,
+                success=False,
+                error=f"Search capability execution failed: {str(e)}",
+            )
+
     def _exec_execution_capability(
         self,
         containers: list[Container],
@@ -3585,10 +3904,226 @@ finally:
                                 admitted_count += 1
                         except json.JSONDecodeError:
                             continue
-            return admitted_count >= 2
+            # Floor raised 2 → 5 so the full source-rotation list is explored
+            # at least once before crossbreeding begins (file-rotation tuning).
+            return admitted_count >= 5
         except Exception:
             return False
-    
+
+    def _pick_assigned_source(
+        self,
+        kg_dir: str,
+        source_files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Pick the least-explored source file and update the rotation state.
+
+        Reads ``{kg_dir}/file_rotation_state.json``, increments the count for
+        the chosen source, and writes back.  Ties are broken by list order so
+        the assignment is stable and deterministic.
+        """
+        state_path = Path(kg_dir) / "file_rotation_state.json"
+        counts: dict[str, int] = {}
+        if state_path.exists():
+            try:
+                with open(state_path) as f:
+                    counts = json.load(f).get("counts", {})
+            except Exception:
+                counts = {}
+
+        # Least-explored source wins; list order breaks ties
+        assigned = min(source_files, key=lambda s: counts.get(s["key"], 0))
+        counts[assigned["key"]] = counts.get(assigned["key"], 0) + 1
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"counts": counts}, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Could not write file_rotation_state.json: {exc}")
+
+        return {"source": assigned, "all_counts": counts}
+
+    def _read_source_sample(
+        self,
+        assigned: dict[str, Any],
+        dataset_dir: str,
+    ) -> str:
+        """Read a compact sample from the assigned source for injection into the explore prompt.
+
+        Returns a formatted string block capped at ~2500 chars total.
+        Silently returns an empty string on any read error or missing path.
+
+        Sampling strategy by entry type:
+        - glob_pattern (md chunks): pick first, middle, last file; read ~800 chars each.
+        - GeoJSON: property schema + first 3 features (properties only, no geometry).
+        - CSV: header row + first 5 data rows.
+        - Directory: list up to 10 files + read first 2 files ~800 chars each.
+        """
+        import csv as csv_mod
+        import glob as glob_mod
+        import json as json_mod
+
+        base = Path(dataset_dir)
+        path = assigned.get("path", "")
+        glob_pattern = assigned.get("glob_pattern")
+        full_path = base / path
+
+        MAX_PER_FILE = 800
+        MAX_TOTAL = 2500
+        parts: list[str] = []
+
+        try:
+            if glob_pattern:
+                # Section-level markdown chunks — pick first, middle, last
+                patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
+                files: list[str] = []
+                for p in patterns:
+                    files.extend(glob_mod.glob(str(base / path / p)))
+                files = sorted(set(files))
+                if not files:
+                    return ""
+                indices = sorted({0, len(files) // 2, len(files) - 1})
+                selected = [files[i] for i in indices]
+                for fpath in selected:
+                    try:
+                        text = Path(fpath).read_text(encoding="utf-8", errors="replace")
+                        snippet = text[:MAX_PER_FILE]
+                        if len(text) > MAX_PER_FILE:
+                            snippet += "\n[…truncated]"
+                        parts.append(f"--- {Path(fpath).name} ---\n{snippet}")
+                    except Exception:
+                        pass
+
+            elif path.endswith(".geojson"):
+                # GeoJSON: schema + first 3 features (properties only, no geometry)
+                with open(full_path, encoding="utf-8") as fh:
+                    data = json_mod.load(fh)
+                features = data.get("features", [])
+                if features:
+                    keys = list(features[0].get("properties", {}).keys())
+                    parts.append(f"Property columns: {keys}")
+                    for feat in features[:3]:
+                        props = feat.get("properties", {})
+                        geom_type = feat.get("geometry", {}).get("type", "?")
+                        row = json_mod.dumps(props)
+                        parts.append(f"  [{geom_type}] {row[:280]}")
+
+            elif path.lower().endswith(".csv"):
+                # CSV: header row + first 5 data rows (always include header)
+                with open(full_path, encoding="utf-8", errors="replace") as fh:
+                    reader = csv_mod.reader(fh)
+                    rows: list[str] = []
+                    for i, row in enumerate(reader):
+                        rows.append(",".join(str(c) for c in row[:15]))
+                        if i >= 5:
+                            break
+                parts.append("\n".join(rows))
+
+            elif full_path.is_dir():
+                # Directory: list files + read first 2
+                all_files = sorted(p for p in full_path.iterdir() if p.is_file())
+                file_list = [fp.name for fp in all_files[:10]]
+                parts.append("Files: " + ", ".join(file_list))
+                for fp in all_files[:2]:
+                    try:
+                        text = fp.read_text(encoding="utf-8", errors="replace")
+                        snippet = text[:MAX_PER_FILE]
+                        if len(text) > MAX_PER_FILE:
+                            snippet += "\n[…truncated]"
+                        parts.append(f"--- {fp.name} ---\n{snippet}")
+                    except Exception:
+                        pass
+
+            else:
+                # Single file fallback
+                if full_path.is_file():
+                    text = full_path.read_text(encoding="utf-8", errors="replace")
+                    parts.append(text[:MAX_PER_FILE])
+
+        except Exception:
+            return ""
+
+        combined = "\n\n".join(parts)
+        if len(combined) > MAX_TOTAL:
+            combined = combined[:MAX_TOTAL] + "\n[…truncated]"
+        return combined
+
+    def _generate_explore_prompt(self, episode_context: dict[str, Any]) -> str:
+        """Generate the combined explore+hypothesise prompt for the survey workflow.
+
+        Each episode is anchored to a specific source selected at populate() time.
+        Sample content is pre-read and injected so the agent sees real data immediately.
+        """
+        assigned = episode_context.get("assigned_source", {})
+
+        # --- Assignment + file access block ---
+        if assigned:
+            glob_pattern = assigned.get("glob_pattern")
+            if glob_pattern:
+                patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
+                glob_lines = "\n".join(
+                    f"    files += glob.glob(os.path.join(dataset_dir, '{assigned['path']}', '{p}'))"
+                    for p in patterns
+                )
+                assignment_block = (
+                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
+                    f"  Section: {assigned['key']}\n"
+                    f"  Details: {assigned['description']}\n\n"
+                    f"To list the files in this section, run in analysis_shell:\n"
+                    f"```python\n"
+                    f"import glob, os\n"
+                    f"dataset_dir = '/workspace/input'\n"
+                    f"files = []\n"
+                    f"{glob_lines}\n"
+                    f"files = sorted(files)\n"
+                    f"print(f'Found {{len(files)}} files:')\n"
+                    f"for f in files: print(f)\n"
+                    f"```\n"
+                )
+            else:
+                assignment_block = (
+                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
+                    f"  Path   : /workspace/input/{assigned['path']}\n"
+                    f"  Details: {assigned['description']}\n"
+                )
+        else:
+            assignment_block = (
+                "Explore the Kazakhstan Teniz Basin dataset to identify a regional feature opportunity.\n"
+            )
+
+        # --- Sample content block ---
+        sample = episode_context.get("source_sample", "")
+        if sample:
+            sample_block = (
+                "\nSAMPLE CONTENT FROM YOUR ASSIGNED SOURCE\n"
+                "─────────────────────────────────────────\n"
+                + sample
+                + "\n"
+            )
+        else:
+            sample_block = ""
+
+        prompt = (
+            "Phase 1: Explore and Hypothesise\n\n"
+            + assignment_block
+            + sample_block
+            + "\n"
+            "Use analysis_shell to read and explore your assigned source.\n"
+            "When you have identified a promising geological pattern, record ONE falsifiable hypothesis:\n\n"
+            "  record_phase(\n"
+            "      phase='hypothesise',\n"
+            "      hypothesis='...',\n"
+            "      data_spec={\n"
+            "          'files': ['/workspace/input/{your_assigned_path}', ...],\n"
+            "          'analysis': '...',\n"
+            "          'output': '...'\n"
+            "      }\n"
+            "  )\n\n"
+            "Your hypothesis MUST be grounded in what you found in the assigned source above.\n"
+            "Do NOT introduce topics not present in the assigned source."
+        )
+        return prompt
+
     def _get_crossbreed_context(
         self,
         variation: FeatureHypothesisKazakhstanVariation,
@@ -4034,6 +4569,14 @@ finally:
         variation: "FeatureHypothesisKazakhstanVariation",
     ) -> str:
         """Compute the novelty-nudge prompt block for a given variation.
+
+        ⚠️ DORMANT / UNUSED as of 2026-05-31. The novelty nudge is no longer
+        injected into any workflow prompt (file rotation now supplies episode
+        diversity). This method and its helpers (_recent_admitted_hypotheses,
+        _render_novelty_block, _classify_mechanism, _render_mechanism_summary)
+        plus the ``novelty_*`` knobs on the Variation are retained but unwired,
+        pending a decision on whether to remove them. Do not re-wire without
+        that decision.
 
         Returns empty when the knob is disabled, K=0, or no admissions
         exist — callers can prepend the result unconditionally. Block now

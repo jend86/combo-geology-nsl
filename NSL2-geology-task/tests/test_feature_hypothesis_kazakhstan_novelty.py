@@ -82,12 +82,10 @@ def _step_prompt(workflow, name: str) -> str:
     )
 
 
-def _hypothesise_prompt(workflow) -> str:
-    return _step_prompt(workflow, "hypothesise")
-
-
-def _survey_prompt(workflow) -> str:
-    return _step_prompt(workflow, "survey")
+def _explore_prompt(workflow) -> str:
+    # Survey + hypothesise are merged into a single `explore` step; the novelty
+    # block is prepended there.
+    return _step_prompt(workflow, "explore")
 
 
 class TestRecentAdmittedHypotheses:
@@ -269,10 +267,14 @@ class TestRenderMechanismSummary:
         assert summary.startswith("Recent admissions concentrate on:")
 
 
-class TestNoveltyInjectionInWorkflow:
-    def test_survey_step_includes_block_when_admissions_exist(
-        self, tmp_path: Path
-    ) -> None:
+class TestNoveltyNudgeNotInjected:
+    """The novelty nudge was deprecated 2026-05-31. Its machinery (tested above)
+    is retained but no longer injected into any workflow prompt. These guards
+    ensure it stays dormant; remove them only when the unused-code decision is
+    made (see _novelty_block_for's docstring).
+    """
+
+    def test_explore_prompt_has_no_novelty_block(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         variation = _variation(tmp_path)
         kg_dir = Path(variation.kg_dir)
@@ -284,52 +286,12 @@ class TestNoveltyInjectionInWorkflow:
             },
         ])
         workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        # Block appears at SURVEY now, not hypothesise (per Approach A
-        # 2026-05-29).
-        survey = _survey_prompt(workflow)
-        assert "fold_proximity" in survey
-        assert "Copper prospects cluster near fold axes." in survey
-        # And does NOT leak into the hypothesise step.
-        hypothesise = _hypothesise_prompt(workflow)
-        assert "Already discovered" not in hypothesise
-        assert "Copper prospects cluster near fold axes." not in hypothesise
+        explore = _explore_prompt(workflow)
+        assert "Already discovered" not in explore
+        assert "Copper prospects cluster near fold axes." not in explore
+        assert "Recent admissions concentrate on:" not in explore
 
-    def test_survey_step_omits_block_when_no_admissions(
-        self, tmp_path: Path
-    ) -> None:
-        task = _task(tmp_path)
-        variation = _variation(tmp_path)
-        # No experiments.jsonl seeded.
-        workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _survey_prompt(workflow)
-        # The block header marker is the canonical novelty-block signal.
-        assert "Already discovered" not in prompt
-
-    def test_survey_step_includes_mechanism_summary(self, tmp_path: Path) -> None:
-        task = _task(tmp_path)
-        variation = _variation(tmp_path)
-        kg_dir = Path(variation.kg_dir)
-        _seed_experiments(kg_dir, [
-            {
-                "node_id": f"exp{i}",
-                "hypothesis": "Anticline-axis proximity predicts copper.",
-                "layer_name": f"fold_{i}",
-            }
-            for i in range(3)
-        ])
-        workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _survey_prompt(workflow)
-        assert "structural" in prompt
-        # Fact-only summary header (softened 2026-05-29 to drop directive
-        # shape-priming examples).
-        assert "Recent admissions concentrate on:" in prompt
-
-    def test_crossbreed_block_lives_on_survey_not_hypothesise(
-        self, tmp_path: Path
-    ) -> None:
-        # Crossbreed now runs the survey step too, so the novelty block is
-        # injected at survey (matching the standard workflow) and must NOT be
-        # duplicated onto the crossbreed hypothesise prompt.
+    def test_crossbreed_prompt_has_no_novelty_block(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         variation = _variation(tmp_path)
         kg_dir = Path(variation.kg_dir)
@@ -348,36 +310,8 @@ class TestNoveltyInjectionInWorkflow:
             },
         }
         workflow = task._crossbreed_workflow(variation, ctx)
-        survey = _survey_prompt(workflow)
-        assert "fold_proximity" in survey
-        assert "Fold-axis proximity correlates with copper." in survey
-        # Not duplicated onto the crossbreed hypothesise step.
-        hypothesise = _hypothesise_prompt(workflow)
-        assert "fold_proximity" not in hypothesise
-        assert "Fold-axis proximity correlates with copper." not in hypothesise
-
-    def test_disabled_via_knob(self, tmp_path: Path) -> None:
-        task = _task(tmp_path)
-        variation = _variation(tmp_path, novelty_nudge_enabled=False)
-        kg_dir = Path(variation.kg_dir)
-        _seed_experiments(kg_dir, [
-            {"node_id": "x", "hypothesis": "should not appear", "layer_name": "L"},
-        ])
-        workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        survey = _survey_prompt(workflow)
-        hypothesise = _hypothesise_prompt(workflow)
-        assert "should not appear" not in survey
-        assert "should not appear" not in hypothesise
-        assert "Already discovered" not in survey
-        assert "Already discovered" not in hypothesise
-
-    def test_recent_k_zero_omits_block(self, tmp_path: Path) -> None:
-        task = _task(tmp_path)
-        variation = _variation(tmp_path, novelty_recent_k=0)
-        kg_dir = Path(variation.kg_dir)
-        _seed_experiments(kg_dir, [
-            {"node_id": "x", "hypothesis": "h", "layer_name": "L"},
-        ])
-        workflow = task._survey_workflow(variation, {"workflow_kind": "survey"})
-        prompt = _survey_prompt(workflow)
-        assert "Already discovered" not in prompt
+        explore = _explore_prompt(workflow)
+        assert "Already discovered" not in explore
+        assert "Fold-axis proximity correlates with copper." not in explore
+        # The crossbreed context itself is still present on the explore entry.
+        assert "Crossbreed Mode" in explore

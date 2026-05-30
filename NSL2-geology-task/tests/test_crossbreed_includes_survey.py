@@ -1,11 +1,15 @@
-"""Crossbreed episodes must still run the Phase-1 survey step.
+"""Crossbreed episodes must still ground in data before hypothesising.
 
 Regression guard for the bug where ``_crossbreed_workflow`` dropped the
-``survey`` step entirely (filtered it out and promoted ``hypothesise`` to the
-entry). That silently disabled the data-grounding survey for every crossbreed
-episode — i.e. once the feature pool had crossbreed pairs, NO episode read the
-source files during a survey phase. Survey is supposed to happen even in
-crossbreed mode.
+data-grounding entry step (promoting a bare ``hypothesise`` prompt to the
+entry). That silently disabled data grounding for every crossbreed episode —
+i.e. once the feature pool had crossbreed pairs, NO episode read the source
+files before hypothesising.
+
+After the file-rotation pulldown the survey and hypothesise steps are merged
+into a single ``explore`` step. Crossbreed mode keeps an ``explore``-named
+entry (with ``analysis_shell``) so grounding still happens; only the prompt is
+swapped for the crossbreed variant.
 """
 
 from pathlib import Path
@@ -52,45 +56,42 @@ def _step(workflow, name):
     )
 
 
-class TestCrossbreedIncludesSurvey:
-    def test_survey_step_present(self, tmp_path: Path) -> None:
+class TestCrossbreedGroundsViaExplore:
+    def test_explore_step_present(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
-        assert "survey" in {s.name for s in wf.steps}
+        assert "explore" in {s.name for s in wf.steps}
+        # The merge means there is no longer a separate hypothesise step.
+        assert "hypothesise" not in {s.name for s in wf.steps}
 
-    def test_survey_is_the_entry_step(self, tmp_path: Path) -> None:
+    def test_explore_is_the_entry_step(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
         # entry_step raises if there are multiple is_entry steps.
         assert wf.entry_step is not None
-        assert wf.entry_step.name == "survey"
+        assert wf.entry_step.name == "explore"
 
-    def test_survey_precedes_crossbreed_hypothesise(self, tmp_path: Path) -> None:
+    def test_explore_precedes_code(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
-        survey = _step(wf, "survey")
-        hyp = _step(wf, "hypothesise")
-        assert survey.next_steps == ("hypothesise",)
-        assert hyp is not None
-        assert hyp.is_entry is False
+        explore = _step(wf, "explore")
+        assert explore.next_steps == ("code",)
 
-    def test_survey_keeps_corpora_sampling_mandate(self, tmp_path: Path) -> None:
-        # The whole point of survey: force the agent to open the data files
-        # across all three corpus classes before hypothesising.
+    def test_explore_keeps_grounding_capability(self, tmp_path: Path) -> None:
+        # The whole point: force the agent to open the data files (analysis_shell)
+        # before hypothesising, even in crossbreed mode.
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
-        survey = _step(wf, "survey")
-        assert "analysis_shell" in survey.capabilities
-        assert "sample at least one source" in survey.prompt
-        for corpus in ("vector", "tabular", "text"):
-            assert corpus in survey.prompt
+        explore = _step(wf, "explore")
+        assert "analysis_shell" in explore.capabilities
+        assert "ground yourself in the dataset" in explore.prompt
 
-    def test_hypothesise_remains_crossbreed(self, tmp_path: Path) -> None:
+    def test_explore_remains_crossbreed(self, tmp_path: Path) -> None:
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
-        hyp = _step(wf, "hypothesise")
-        assert "Crossbreed Mode" in hyp.prompt
-        assert "pA" in hyp.prompt and "pB" in hyp.prompt
+        explore = _step(wf, "explore")
+        assert "Crossbreed Mode" in explore.prompt
+        assert "pA" in explore.prompt and "pB" in explore.prompt
 
     def test_workflow_validates(self, tmp_path: Path) -> None:
         # Exactly one entry, no fan-in, all steps reachable.
@@ -105,4 +106,4 @@ class TestCrossbreedIncludesSurvey:
         task = _task(tmp_path)
         wf = task._crossbreed_workflow(_variation(tmp_path), _crossbreed_ctx())
         names = [s.name for s in wf.topological_order()]
-        assert names == ["survey", "hypothesise", "code", "translate", "rewrite"]
+        assert names == ["explore", "code", "translate", "rewrite"]
