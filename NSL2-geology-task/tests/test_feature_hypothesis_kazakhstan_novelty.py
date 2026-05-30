@@ -324,8 +324,12 @@ class TestNoveltyInjectionInWorkflow:
         # shape-priming examples).
         assert "Recent admissions concentrate on:" in prompt
 
-    def test_crossbreed_hypothesise_includes_block(self, tmp_path: Path) -> None:
-        # Crossbreed has no survey step, so the block stays at hypothesise.
+    def test_crossbreed_block_lives_on_survey_not_hypothesise(
+        self, tmp_path: Path
+    ) -> None:
+        # Crossbreed now runs the survey step too, so the novelty block is
+        # injected at survey (matching the standard workflow) and must NOT be
+        # duplicated onto the crossbreed hypothesise prompt.
         task = _task(tmp_path)
         variation = _variation(tmp_path)
         kg_dir = Path(variation.kg_dir)
@@ -344,9 +348,13 @@ class TestNoveltyInjectionInWorkflow:
             },
         }
         workflow = task._crossbreed_workflow(variation, ctx)
-        prompt = _hypothesise_prompt(workflow)
-        assert "fold_proximity" in prompt
-        assert "Fold-axis proximity correlates with copper." in prompt
+        survey = _survey_prompt(workflow)
+        assert "fold_proximity" in survey
+        assert "Fold-axis proximity correlates with copper." in survey
+        # Not duplicated onto the crossbreed hypothesise step.
+        hypothesise = _hypothesise_prompt(workflow)
+        assert "fold_proximity" not in hypothesise
+        assert "Fold-axis proximity correlates with copper." not in hypothesise
 
     def test_disabled_via_knob(self, tmp_path: Path) -> None:
         task = _task(tmp_path)

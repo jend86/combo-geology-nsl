@@ -630,9 +630,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         # Novelty + mechanism-summary nudge is injected at survey (not at
         # hypothesise) so the agent sees the diversity signal *before*
-        # choosing which files to open. The crossbreed workflow has no
-        # survey step and keeps the nudge at hypothesise (see
-        # _crossbreed_workflow).
+        # choosing which files to open. Both the survey and crossbreed
+        # workflows run this survey step, so the nudge lives here for both
+        # (see _crossbreed_workflow, which reuses this step verbatim).
         novelty_block = self._novelty_block_for(variation)
         survey_prompt = (
             "Phase 1: Survey\n\n"
@@ -828,31 +828,40 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         variation: FeatureHypothesisKazakhstanVariation,
         episode_context: dict[str, Any],
     ) -> Workflow:
-        """Crossbreed workflow: starts with crossbreed prompt instead of survey."""
-        
-        # Same as survey but skip survey phase
+        """Crossbreed workflow: same Survey → Hypothesise → Code → Translate →
+        Rewrite chain as the standard workflow, but the hypothesise step combines
+        parent experiments instead of picking a fresh survey candidate.
+
+        The survey step is retained (and stays the entry) so crossbreed episodes
+        still ground themselves in the source files before hypothesising — survey
+        is supposed to happen even in crossbreed mode. Only the hypothesise step's
+        prompt differs; the novelty nudge stays on the survey step (built by
+        _survey_workflow), so it is NOT re-injected here.
+        """
+
         crossbreed_ctx = episode_context.get("crossbreed_context", {})
         parent_ids = crossbreed_ctx.get("parent_ids", [])
 
         base_workflow = self._survey_workflow(variation, episode_context)
 
-        novelty_block = self._novelty_block_for(variation)
         crossbreed_prompt = (
             "Phase 2: Hypothesise (Crossbreed Mode)\n\n"
-            + (novelty_block + "\n\n" if novelty_block else "")
-            + f"Parent experiments: {parent_ids}\n\n"
+            f"Parent experiments: {parent_ids}\n\n"
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
-            "Propose a hypothesis that combines or builds on these findings.\n\n"
+            "You have just surveyed the dataset. Building on the parent findings\n"
+            "above together with what you observed in the data, propose a\n"
+            "hypothesis that combines or extends them.\n\n"
             "Include a data_spec as before.\n\n"
             "Close with:\n"
             "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
             f"parent_experiments={parent_ids})"
         )
 
-        # Build replacement steps tuple: swap survey for crossbreed hypothesise as entry
+        # Keep the full Survey → … → Rewrite chain; only swap the hypothesise
+        # step's prompt for the crossbreed variant. Survey remains is_entry, so
+        # the crossbreed hypothesise step is a normal (non-entry) successor.
         crossbreed_hypothesise = WorkflowStep(
             name="hypothesise",
-            is_entry=True,
             prompt=crossbreed_prompt,
             inherit_all_capabilities=False,
             capabilities=(
@@ -865,7 +874,6 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         new_steps = tuple(
             crossbreed_hypothesise if s.name == "hypothesise" else s
             for s in base_workflow.steps
-            if s.name != "survey"
         )
         return Workflow(steps=new_steps)
     
