@@ -147,6 +147,54 @@ _DATASET_OVERVIEW = """## Coe Fairbairn Dataset Overview
 """
 
 
+# Ordered list of distinct source files/groups for round-robin episode assignment.
+# Each episode is assigned the least-explored entry so agents are forced to
+# derive hypotheses from different data sources rather than free-roaming and
+# fixating on whatever the context history primes them toward.
+_COE_FAIRBAIRN_SOURCE_FILES = [
+    {
+        "key": "drillhole",
+        "path": "amalgamated_csvs/geochemDrillhole.csv",
+        "description": (
+            "3D drillhole assay data — 80+ element columns (Au, Cu, Pb, Zn, …), "
+            "longitude, latitude, maxdepth_drill. Primary source for subsurface geochemistry."
+        ),
+    },
+    {
+        "key": "surface",
+        "path": "amalgamated_csvs/geochemSurface.csv",
+        "description": (
+            "Surface geochemistry samples — element assays at surface coordinates. "
+            "Useful for mapping near-surface anomalies and gossans."
+        ),
+    },
+    {
+        "key": "tenements",
+        "path": "amalgamated_csvs/ (tenement / lease boundary CSVs)",
+        "description": (
+            "Mining tenement boundaries, lease history, and tenure data. "
+            "Spatial polygons and metadata for the exploration area."
+        ),
+    },
+    {
+        "key": "description_maps",
+        "path": "description.md files",
+        "description": (
+            "Detailed natural-language descriptions of geological maps — "
+            "lithology, structure, alteration zones, interpreted contacts."
+        ),
+    },
+    {
+        "key": "wamex_reports",
+        "path": "WAMEX/ (OCR'd exploration report JSON chunks)",
+        "description": (
+            "Scanned WAMEX exploration reports chunked as JSON. "
+            "Contains historical assay tables, geological logs, and interpretations."
+        ),
+    },
+]
+
+
 @dataclass
 class FeatureHypothesisVariation(Variation):
     """Variation configuration for feature hypothesis task."""
@@ -310,6 +358,15 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
         if workflow_kind == "crossbreed":
             episode_context["crossbreed_context"] = self._get_crossbreed_context(variation)
         
+        # For survey episodes, assign a specific source file to explore.
+        # Picks the least-explored source so coverage spreads evenly across
+        # the dataset rather than letting the agent fixate on whatever the
+        # context history happens to prime it toward.
+        if workflow_kind == "survey":
+            rotation = self._pick_assigned_source(variation.kg_dir, _COE_FAIRBAIRN_SOURCE_FILES)
+            episode_context["assigned_source"] = rotation["source"]
+            episode_context["source_coverage"] = rotation["all_counts"]
+        
         results = [
             PopulationResult(
                 container_id=getattr(container, "id", ""),
@@ -409,8 +466,8 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
-        # Generate dynamic survey prompt with recent experiments context
-        survey_prompt = self._generate_survey_prompt_with_context()
+        # Generate dynamic survey prompt with file assignment for this episode
+        survey_prompt = self._generate_survey_prompt_with_context(episode_context)
         
         return Workflow(
             steps=(
@@ -2159,8 +2216,88 @@ finally:
         except Exception:
             return 0
     
-    def _generate_survey_prompt_with_context(self) -> str:
-        """Generate survey prompt with recent experiments context for deduplication."""
+    def _generate_survey_prompt_with_context(self, episode_context: dict[str, Any]) -> str:
+        """Generate survey prompt with file assignment and coverage map.
+
+        Each episode is anchored to a specific source file selected at populate()
+        time.  The prompt shows a neutral file-coverage map (counts only, no
+        hypothesis text) so the agent is never primed with past concepts.
+        """
+        assigned = episode_context.get("assigned_source", {})
+        coverage = episode_context.get("source_coverage", {})
+
+        # --- Build the coverage map (file names + counts, no concept words) ---
+        coverage_lines = []
+        for src in _COE_FAIRBAIRN_SOURCE_FILES:
+            count = coverage.get(src["key"], 0)
+            marker = "  ← assigned this episode" if src["key"] == assigned.get("key") else ""
+            coverage_lines.append(f"  {src['path']}: {count} episode(s){marker}")
+        coverage_block = "\n".join(coverage_lines)
+
+        # --- Mandatory assignment block ---
+        if assigned:
+            assignment_block = (
+                f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
+                f"  Path   : {assigned['path']}\n"
+                f"  Details: {assigned['description']}\n\n"
+                f"You MUST derive your hypothesis candidate from this file.\n"
+                f"Do not freely browse other files during the survey phase.\n"
+                f"Open and examine the assigned file first with analysis_shell.\n"
+            )
+        else:
+            assignment_block = (
+                "Explore the dataset to identify feature opportunities.\n"
+            )
+
+        prompt = (
+            "Phase 1: Survey\n\n"
+            + assignment_block
+            + "\n"
+            "SOURCE COVERAGE (episodes completed per file — for situational awareness only):\n"
+            + coverage_block
+            + "\n\n"
+            "Use analysis_shell to read and explore your assigned file, then identify\n"
+            "ONE promising feature layer candidate grounded in what you find there.\n\n"
+            "Close with:\n"
+            "  record_phase(phase='survey', candidates=[...])"
+        )
+        return prompt
+
+    def _pick_assigned_source(
+        self,
+        kg_dir: str,
+        source_files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Pick the least-explored source file and update the rotation state.
+
+        Reads ``{kg_dir}/file_rotation_state.json``, increments the count for
+        the chosen source, and writes back.  Ties are broken by list order so
+        the assignment is stable and deterministic.
+        """
+        state_path = Path(kg_dir) / "file_rotation_state.json"
+        counts: dict[str, int] = {}
+        if state_path.exists():
+            try:
+                with open(state_path) as f:
+                    counts = json.load(f).get("counts", {})
+            except Exception:
+                counts = {}
+
+        # Least-explored source wins; list order breaks ties
+        assigned = min(source_files, key=lambda s: counts.get(s["key"], 0))
+        counts[assigned["key"]] = counts.get(assigned["key"], 0) + 1
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"counts": counts}, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Could not write file_rotation_state.json: {exc}")
+
+        return {"source": assigned, "all_counts": counts}
+
+    def _old_generate_survey_prompt_with_context(self) -> str:
+        """RETIRED — kept for reference only. Replaced by _generate_survey_prompt_with_context(episode_context)."""
         base_prompt = (
             "Phase 1: Survey\n\n"
             "Explore the dataset to identify feature opportunities.\n\n"
@@ -2232,7 +2369,7 @@ finally:
                                 admitted_count += 1
                         except json.JSONDecodeError:
                             continue
-            return admitted_count >= 2
+            return admitted_count >= 5
         except Exception:
             return False
     

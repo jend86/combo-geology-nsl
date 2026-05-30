@@ -160,6 +160,64 @@ This dataset contains comprehensive geological data for the Teniz Basin region o
 """
 
 
+# Ordered list of distinct source files/groups for round-robin episode assignment.
+# Each episode is assigned the least-explored entry so agents are forced to
+# derive hypotheses from different data sources rather than free-roaming and
+# fixating on whatever the context history primes them toward.
+_KAZAKHSTAN_SOURCE_FILES = [
+    {
+        "key": "copper_prospects",
+        "path": "converted_spatial_data/copper_prospects.geojson",
+        "description": (
+            "113 sediment-hosted copper prospect points — coordinates, tonnage, "
+            "Cu% grade, Ag content, deposit classification. Economic focus."
+        ),
+    },
+    {
+        "key": "anticlines_synclines",
+        "path": "converted_spatial_data/anticlines_synclines.geojson",
+        "description": (
+            "33 geological fold structures (anticlines and synclines) — line features "
+            "showing fold axes, structure names, geological ages."
+        ),
+    },
+    {
+        "key": "assessment_tract",
+        "path": "converted_spatial_data/assessment_tract.geojson",
+        "description": (
+            "Teniz Basin boundary polygon (49,714 km²) — USGS assessment tract extent "
+            "and area-of-interest metadata."
+        ),
+    },
+    {
+        "key": "copper_prospects_aoi",
+        "path": "converted_spatial_data/copper_prospects_aoi.geojson",
+        "description": (
+            "Copper prospects clipped to the area of interest — same attributes as "
+            "copper_prospects but spatially filtered for focused sub-basin analysis."
+        ),
+    },
+    {
+        "key": "smolianova_survey",
+        "path": "36572_Smolianova_1984/",
+        "description": (
+            "Russian geological survey (1984): 329 text chunks covering stratigraphy, "
+            "tectonics, magmatic formations, useful minerals, geophysics; "
+            "60+ drill hole logs (drill_holes_data/); geophysical section descriptions."
+        ),
+    },
+    {
+        "key": "usgs_assessment",
+        "path": "USGS/",
+        "description": (
+            "USGS sandstone copper assessment: English-language report chunks, "
+            "figure descriptions (13 figures), quantitative resource estimates, "
+            "deposit model methodology."
+        ),
+    },
+]
+
+
 @dataclass
 class FeatureHypothesisKazakhstanVariation(Variation):
     """Variation configuration for Kazakhstan feature hypothesis task."""
@@ -323,6 +381,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if workflow_kind == "crossbreed":
             episode_context["crossbreed_context"] = self._get_crossbreed_context(variation)
         
+        # For survey episodes, assign a specific source file to explore.
+        # Picks the least-explored source so coverage spreads evenly across
+        # the dataset rather than letting the agent fixate on whatever the
+        # context history happens to prime it toward.
+        if workflow_kind == "survey":
+            rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
+            episode_context["assigned_source"] = rotation["source"]
+            episode_context["source_coverage"] = rotation["all_counts"]
+        
         results = [
             PopulationResult(
                 container_id=getattr(container, "id", ""),
@@ -422,8 +489,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
-        # Generate dynamic survey prompt with recent experiments context
-        survey_prompt = self._generate_survey_prompt_with_context()
+        # Generate dynamic survey prompt with file assignment for this episode
+        survey_prompt = self._generate_survey_prompt_with_context(episode_context)
         
         return Workflow(
             steps=(
@@ -1821,32 +1888,86 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         except Exception:
             return 0
     
-    def _generate_survey_prompt_with_context(self) -> str:
-        """Generate survey prompt with recent Kazakhstan experiments context."""
-        base_prompt = (
+    def _generate_survey_prompt_with_context(self, episode_context: dict[str, Any]) -> str:
+        """Generate survey prompt with file assignment and coverage map.
+
+        Each episode is anchored to a specific source file selected at populate()
+        time.  The prompt shows a neutral file-coverage map (counts only, no
+        hypothesis text) so the agent is never primed with past concepts.
+        """
+        assigned = episode_context.get("assigned_source", {})
+        coverage = episode_context.get("source_coverage", {})
+
+        # --- Build the coverage map (file names + counts, no concept words) ---
+        coverage_lines = []
+        for src in _KAZAKHSTAN_SOURCE_FILES:
+            count = coverage.get(src["key"], 0)
+            marker = "  ← assigned this episode" if src["key"] == assigned.get("key") else ""
+            coverage_lines.append(f"  {src['path']}: {count} episode(s){marker}")
+        coverage_block = "\n".join(coverage_lines)
+
+        # --- Mandatory assignment block ---
+        if assigned:
+            assignment_block = (
+                f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
+                f"  Path   : {assigned['path']}\n"
+                f"  Details: {assigned['description']}\n\n"
+                f"You MUST derive your hypothesis candidate from this file.\n"
+                f"Do not freely browse other files during the survey phase.\n"
+                f"Open and examine the assigned file first with analysis_shell.\n"
+            )
+        else:
+            assignment_block = (
+                "Explore the Kazakhstan Teniz Basin dataset to identify regional feature opportunities.\n"
+            )
+
+        prompt = (
             "Phase 1: Survey\n\n"
-            "Explore the Kazakhstan Teniz Basin dataset to identify regional feature opportunities.\n\n"
-            "Use analysis_shell to:\n"
-            "- Read file headers and schemas\n"
-            "- Identify interesting regional patterns\n"
-            "- Focus on basin-scale geological features\n\n"
-        )
-        
-        # For Kazakhstan, we'll start simple without experiment history
-        # This can be enhanced later with Kazakhstan-specific experiment tracking
-        
-        base_prompt += (
-            "Find 2-3 promising regional feature layer candidates.\n\n"
-            "Focus on:\n"
-            "- Sediment-hosted copper systems\n"
-            "- Basin-scale structural geology\n"
-            "- Regional geological trends\n\n"
+            + assignment_block
+            + "\n"
+            "SOURCE COVERAGE (episodes completed per file — for situational awareness only):\n"
+            + coverage_block
+            + "\n\n"
+            "Use analysis_shell to read and explore your assigned file, then identify\n"
+            "ONE promising feature layer candidate grounded in what you find there.\n\n"
             "Close with:\n"
             "  record_phase(phase='survey', candidates=[...])"
         )
-        
-        return base_prompt
-    
+        return prompt
+
+    def _pick_assigned_source(
+        self,
+        kg_dir: str,
+        source_files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Pick the least-explored source file and update the rotation state.
+
+        Reads ``{kg_dir}/file_rotation_state.json``, increments the count for
+        the chosen source, and writes back.  Ties are broken by list order so
+        the assignment is stable and deterministic.
+        """
+        state_path = Path(kg_dir) / "file_rotation_state.json"
+        counts: dict[str, int] = {}
+        if state_path.exists():
+            try:
+                with open(state_path) as f:
+                    counts = json.load(f).get("counts", {})
+            except Exception:
+                counts = {}
+
+        # Least-explored source wins; list order breaks ties
+        assigned = min(source_files, key=lambda s: counts.get(s["key"], 0))
+        counts[assigned["key"]] = counts.get(assigned["key"], 0) + 1
+
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(state_path, "w") as f:
+                json.dump({"counts": counts}, f, indent=2)
+        except Exception as exc:
+            logger.warning(f"Could not write file_rotation_state.json: {exc}")
+
+        return {"source": assigned, "all_counts": counts}
+
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> bool:
         """Check if there are crossbreed pairs available for Kazakhstan."""
         experiments_file = Path(variation.kg_dir) / "experiments.jsonl"
@@ -1865,7 +1986,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                                 admitted_count += 1
                         except json.JSONDecodeError:
                             continue
-            return admitted_count >= 2
+            return admitted_count >= 5
         except Exception:
             return False
     

@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Data / model artefacts (can be large)
+data/
+*.pkl
+*.pt
+*.safetensors
+*.bin
+*.gguf
+
+# Logs
+*.log
+test_kazakhstan_output.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

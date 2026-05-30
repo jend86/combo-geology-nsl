@@ -67,7 +67,7 @@ echo ""
 echo "🗺️  Step 4: Test Kazakhstan grid mapping"
 echo "----------------------------------------"
 echo "Running grid validation test..."
-python3 test_kazakhstan_grid.py
+uv run python test_kazakhstan_grid.py
 if [ $? -eq 0 ]; then
     echo "✅ Kazakhstan grid mapping validated"
 else
