@@ -13,3 +13,4 @@ NSL2-geology-task/uv.lock
 __pycache__/
 *.py[cod]
 .venv/
+*.pyc

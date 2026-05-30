@@ -1,0 +1,148 @@
+# Feature hypothesis task for Kazakhstan Teniz Basin via AIQ harness,
+# driven by Gemma 4 31B AWQ on 2× RTX 4090 (PP=2, no NVLink).
+#
+# Sibling of config-feature-hypothesis-aiq.toml (Coe Fairbairn, OpenRouter)
+# and ~/nsl2/config/config-feature-hypothesis-aiq-gemma4.toml (Coe Fairbairn,
+# vLLM Gemma 4). The vLLM block and harness profile mirror the gemma4
+# reference; the [task] / [task.config] paths point at the Kazakhstan task
+# and the Kazkhstan_data dataset sibling at the repo root.
+#
+# Pre-flight checklist:
+#   1. Confirm Kazkhstan_data is at ../../Kazkhstan_data (sibling of NSL2-geology-task/).
+#   2. Build Kazakhstan docker compose:
+#        docker compose -f docker/feature-hypothesis-kazakhstan-compose/docker-compose.yml build
+#   3. Build harness image:
+#        uv run python scripts/build_harness_images.py \
+#          --config config/config-feature-hypothesis-kazakhstan-vllm.toml
+#   4. Run via nix develop (CUDA libs):
+#        nix develop -c uv run python scripts/run_episode.py \
+#          config/config-feature-hypothesis-kazakhstan-vllm.toml
+#
+# Verification targets for this run:
+#   - dedup gate: `data/kazakhstan/feature-hypothesis/knowledge/teniz_basin/admitted_index.json`
+#     fingerprints accumulate; experiments.jsonl avoids duplicates.
+#   - bootstrap permit: `bootstrap_state.json` shows slots ramping from
+#     half-capacity (~4) to full (parallel_episodes=8) over bootstrap_window_size.
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+timeout = 300
+
+[vllm]
+# Two RTX 4090s without NVLink — PP=2 splits Gemma 4 31B AWQ layers
+# half/half so each card holds ~8.5 GB weights and leaves headroom for
+# activations + KV. TP=2 bottlenecks on PCIe all-reduce; DP=2 OOMs.
+startup_timeout = 2400
+tensor_parallel_size = 1
+pipeline_parallel_size = 2
+kv_cache_dtype = "fp8"
+enable_chunked_prefill = true
+enable_prefix_caching = true
+max_model_len = 65536
+# Global under PP — 8 concurrent AIQ agents (parallel_episodes=8) with
+# headroom for streaming overlap. Bumped to 10 to give the scheduler
+# slack: when one slot's prefill stalls, another can pre-empt without
+# the engine queueing.
+max_num_seqs = 10
+# Chunk size for chunked prefill. 16 384 doubles the prefill burst, which
+# is the dominant cost at the observed 84:1 input:output ratio. KV
+# reservation grows with max_model_len × max_num_seqs (unchanged); this
+# knob only governs prefill batching.
+max_num_batched_tokens = 16384
+cudagraph_mode = "piecewise"
+extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
+enable_auto_tool_choice = true
+tool_call_parser = "gemma4"
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 8 AIQ slots, vLLM max_num_seqs=10 leaves the engine with two extra
+# slots of streaming headroom so a stalled prefill on one agent doesn't
+# starve the rest. Bootstrap permit still chokes survey at cap=4, then
+# crossbreed runs the full 8.
+parallel_episodes = 8
+target_training_rows = 4500
+max_episodes = 10000
+# Framework cap on survey-phase episodes before transitioning out of
+# bootstrap. Independent of, and complementary to, the per-episode
+# bootstrap_concurrency_cap permit gating in the task (defaults to 4,
+# ramping to parallel_episodes over bootstrap_window_size=8).
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+# Resume from prior generation_0 checkpoint when present. Verifies the
+# checkpoint plumbing end-to-end and lets us survive transient GPU
+# disconnects (which kill the framework process mid-run).
+resume_from_checkpoint = true
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[training]
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
+wandb_project = "feature-hypothesis-kazakhstan"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+# Temporarily capped to 1 to stay in gen0 only (no finetuning) — restore to 12 when ready to advance.
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "regional-analysis", "bic-scoring", "gemma4", "dedup-gate", "bootstrap-ramp"]
