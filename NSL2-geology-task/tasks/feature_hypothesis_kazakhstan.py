@@ -624,6 +624,10 @@ class ExperimentReasoningRows:
             terminal_record.get("graph_node") if isinstance(terminal_record, dict) else None,
             meta_record.get("graph_node"),
         )
+        crossbreed_context = self._first_dict(
+            episode_context.get("crossbreed_context"),
+            meta_record.get("crossbreed_context"),
+        )
 
         hypothesise = self._first_dict(phase_records.get("hypothesise"))
         code = self._first_dict(phase_records.get("code"))
@@ -632,8 +636,9 @@ class ExperimentReasoningRows:
         outcome = self._first_dict(graph_node.get("outcome"))
         task_breakdown = self._first_dict(source_payload.get("task_breakdown"))
 
-        hypothesise_row = self._row_for_step(rows, "hypothesise")
-        survey_row = self._row_for_step(rows, "survey")
+        explore_row = self._row_for_step(rows, "explore")
+        hypothesise_row = self._row_for_step(rows, "hypothesise") or explore_row
+        survey_row = self._row_for_step(rows, "survey") or explore_row
         rewrite_row = self._rewrite_output_row(rows)
 
         hypothesis, hypothesis_source = self._first_text_with_source(
@@ -653,11 +658,14 @@ class ExperimentReasoningRows:
         parent_ids = self._string_list(hypothesise.get("parent_experiments"))
         if not parent_ids:
             parent_ids = self._string_list(meta_record.get("parent_experiments"))
+        if not parent_ids:
+            parent_ids = self._string_list(crossbreed_context.get("parent_ids"))
         parent_context, parents_source = self._parent_context(
             episode_context,
             hypothesise,
             hypothesise_row,
             hypothesis,
+            crossbreed_context,
         )
         parent_hypotheses = self._parent_hypotheses(hypothesise, parent_context)
         bic_delta, outcome_source = self._first_float_with_source(
@@ -677,6 +685,14 @@ class ExperimentReasoningRows:
             ),
         )
         narrative_clean, outcome_appended = self._strip_outcome_appendix(narrative)
+        survey_context = self._survey_context(survey_row)
+        if survey_row is explore_row and parent_ids:
+            survey_context = (
+                "Kazakhstan Teniz Basin dataset context: vector prospect points, "
+                "fold-axis traces, tract geometry, tabular prospect and tract "
+                "data, USGS sandstone-copper report chunks, Smolianova survey "
+                "chunks, and drill-hole descriptions."
+            )
 
         return {
             "training_success": bool(episode_context.get("success", True)),
@@ -686,7 +702,7 @@ class ExperimentReasoningRows:
             "parent_ids": parent_ids,
             "parent_context": parent_context,
             "parent_hypotheses": parent_hypotheses,
-            "survey_context": self._survey_context(survey_row),
+            "survey_context": survey_context,
             "hypothesise_response": self._row_text(hypothesise_row, "raw_response"),
             "feature_layer_name": str(
                 translate.get("feature_layer_name")
@@ -704,6 +720,7 @@ class ExperimentReasoningRows:
             "source_rows": {
                 "survey": survey_row,
                 "hypothesise": hypothesise_row,
+                "explore": explore_row,
                 "rewrite": rewrite_row,
             },
             "provenance": {
@@ -903,6 +920,7 @@ class ExperimentReasoningRows:
         hypothesise: dict[str, Any],
         hypothesise_row: dict[str, Any],
         child_hypothesis: str,
+        crossbreed_context: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         parent_context = hypothesise.get("parent_context")
         if isinstance(parent_context, list) and parent_context:
@@ -911,13 +929,13 @@ class ExperimentReasoningRows:
             if sanitized:
                 return sanitized, "phase_records"
 
-        crossbreed_context = episode_context.get("crossbreed_context")
+        crossbreed_context = crossbreed_context or episode_context.get("crossbreed_context")
         if isinstance(crossbreed_context, dict):
             prompt = crossbreed_context.get("prompt")
             if isinstance(prompt, str):
                 sanitized = self._sanitize_prompt_context(prompt, child_hypothesis)
                 if sanitized:
-                    return sanitized, "episode_context"
+                    return sanitized, "crossbreed_context"
 
         prompt = self._row_text(hypothesise_row, "prompt")
         if prompt and re.search(r"parent|prior experiment|experiment\s+\d", prompt, re.IGNORECASE):
@@ -972,6 +990,8 @@ class ExperimentReasoningRows:
     def _survey_context(survey_row: dict[str, Any]) -> str:
         prompt = ExperimentReasoningRows._row_text(survey_row, "prompt")
         response = ExperimentReasoningRows._row_text(survey_row, "raw_response")
+        if survey_row.get("workflow_step") == "explore":
+            return prompt or _DATASET_OVERVIEW
         if prompt and response:
             return f"{prompt}\n\nSurvey notes:\n{response}"
         return prompt or response or _DATASET_OVERVIEW

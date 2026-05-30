@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ def _base_row(
     *,
     episode_id: str = "ep-0",
     row_index: int = 0,
-    workflow_step: str = "survey",
+    workflow_step: str = "explore",
     actor_role: str | None = None,
     prompt: str | None = None,
     raw_response: str | None = None,
@@ -70,32 +71,52 @@ def _episode(
 ) -> EpisodeTrainingRows:
     """Build a minimal EpisodeTrainingRows that resembles a real geology episode.
 
-    The episode carries phase_records and success state in record_meta of the
-    first row; ExperimentReasoningRows must read these to synthesize pairs.
+    The episode carries phase_records and success state in episode_context;
+    ExperimentReasoningRows must read these to synthesize pairs.
     """
     if phase_records is None:
         phase_records = _default_phase_records()
+
+    parent_ids = phase_records.get("hypothesise", {}).get("parent_experiments", [])
+    has_parents = bool(parent_ids)
+    explore_prompt = "dataset facts: depth columns, lithology columns ..."
+    crossbreed_context: dict[str, Any] = {}
+    if has_parents:
+        parent_prompt = (
+            'Experiment 1: "porosity correlates with depth"\n'
+            'Experiment 2: "seismic boundaries mark reservoir quality"\n'
+            "Given these parent findings, ground yourself in the data and "
+            "propose a combined hypothesis."
+        )
+        explore_prompt = (
+            "Phase 1: Explore + Hypothesise (Crossbreed Mode)\n\n"
+            f"{parent_prompt}"
+        )
+        crossbreed_context = {
+            "parent_ids": parent_ids,
+            "prompt": parent_prompt,
+        }
 
     rows = [
         _base_row(
             episode_id=episode_id,
             row_index=0,
-            workflow_step="survey",
-            prompt="dataset facts: depth columns, lithology columns ...",
-            raw_response="Survey complete. Identified 12 candidate features.",
+            workflow_step="explore",
+            prompt=explore_prompt,
+            raw_response=(
+                "Hypothesis: acoustic impedance contrast predicts reservoir quality.\n"
+                "Reasoning: impedance contrasts at formation boundaries indicate ...\n"
+                "DataSpec: {files: ['seismic.csv'], transform: 'log_ratio'}"
+            ),
             success=success,
             episode_score=episode_score,
         ),
         _base_row(
             episode_id=episode_id,
             row_index=1,
-            workflow_step="hypothesise",
-            prompt="parent findings: prior experiments show porosity correlates with depth",
-            raw_response=(
-                "Hypothesis: acoustic impedance contrast predicts reservoir quality.\n"
-                "Reasoning: impedance contrasts at formation boundaries indicate ...\n"
-                "DataSpec: {files: ['seismic.csv'], transform: 'log_ratio'}"
-            ),
+            workflow_step="code",
+            prompt="phase_get(phase='hypothesise') returned seismic.csv and well_logs.csv",
+            raw_response="execution finalized with artifacts",
             success=success,
             episode_score=episode_score,
         ),
@@ -147,7 +168,10 @@ def _episode(
         "success": success,
         "duplicate_rejected": duplicate_rejected,
         "phase_records": phase_records,
+        "workflow_kind": "crossbreed" if has_parents else "survey",
     }
+    if crossbreed_context:
+        group.episode_context["crossbreed_context"] = crossbreed_context  # type: ignore[attr-defined]
     return group
 
 
@@ -290,6 +314,35 @@ class TestScope:
 
 
 class TestProvenanceMetadata:
+    def test_collapsed_explore_step_backfills_hypothesise_material(self) -> None:
+        """Kazakhstan now has one explore row, not separate survey/hypothesise rows."""
+        episode = _episode(episode_id="ep-explore-only")
+        assert {row["workflow_step"] for row in episode.rows} >= {
+            "explore",
+            "code",
+            "translate",
+            "rewrite",
+        }
+        assert "survey" not in {row["workflow_step"] for row in episode.rows}
+        assert "hypothesise" not in {row["workflow_step"] for row in episode.rows}
+
+        result = _run_transform([episode])
+
+        pair_kinds = {row["record_meta"]["pair_kind"] for row in result[0].rows}
+        assert PAIR_KIND_PARENT_HYPOTHESIS in pair_kinds
+        assert PAIR_KIND_ANALYSIS_PLAN in pair_kinds
+        assert PAIR_KIND_OUTCOME_NARRATIVE in pair_kinds
+        for row in result[0].rows:
+            if row["record_meta"]["pair_kind"] in {
+                PAIR_KIND_PARENT_HYPOTHESIS,
+                PAIR_KIND_ANALYSIS_PLAN,
+                PAIR_KIND_DATASET_HYPOTHESIS,
+            }:
+                assert row["parent_row_id"] == "ep-explore-only:0"
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_DATASET_HYPOTHESIS:
+                assert "Experiment 1" not in row["prompt"]
+                assert "porosity correlates with depth" not in row["prompt"]
+
     def test_outcome_narrative_tagged_post_hoc(self) -> None:
         """Outcome narratives are marked as reconstructed after evaluation."""
         episode = _episode()
@@ -352,6 +405,88 @@ class TestProvenanceMetadata:
             "Expected no parent-hypothesis rows when parent context is missing, "
             f"got {len(parent_rows)}"
         )
+
+    def test_historical_tool_output_prompts_backfill_phase_data(self) -> None:
+        """Older exports store phase data in embedded tool-output JSON."""
+        hypothesis = "silver overprint follows cobalt-rich reduced facies"
+        data_spec = {
+            "analysis_steps": ["filter high Co", "filter high Ag", "intersect prospects"],
+            "required_files": ["/workspace/input/USGS/TZ_ssCu_Prospects.csv"],
+            "target_feature": "co_ag_overlap",
+        }
+        phase_output = {
+            "output": {
+                "hypothesis": hypothesis,
+                "data_spec": data_spec,
+                "parent_experiments": ["parent-a", "parent-b"],
+            },
+            "success": True,
+        }
+        result_output = {
+            "output": {
+                "hypothesis": hypothesis,
+                "data_spec": data_spec,
+                "code_executed": "print('analysis')",
+                "result_summary": "identified overlapping Co and Ag prospects",
+                "feature_layer_name": "co_ag_overlap",
+                "bic_delta": -1.5,
+                "admitted": True,
+                "mutual_info": {},
+            },
+            "success": True,
+        }
+        group = EpisodeTrainingRows(
+            episode_id="ep-historical",
+            episode_index=0,
+            generation_id=1,
+            episode_score=1.0,
+            rows=[
+                _base_row(
+                    episode_id="ep-historical",
+                    row_index=0,
+                    workflow_step="hypothesise",
+                    prompt=(
+                        'Experiment 1: "cobalt tracks reduced facies"\n'
+                        'Experiment 2: "silver follows late fluid pathways"\n'
+                        "Given these parent findings, propose a combined hypothesis."
+                    ),
+                    raw_response="",
+                ),
+                _base_row(
+                    episode_id="ep-historical",
+                    row_index=1,
+                    workflow_step="code",
+                    prompt=f"[tool]\n{json.dumps(phase_output)}",
+                    raw_response="",
+                ),
+                _base_row(
+                    episode_id="ep-historical",
+                    row_index=2,
+                    workflow_step="translate",
+                    prompt=f"[tool]\n{json.dumps(result_output)}",
+                    raw_response="",
+                ),
+                _base_row(
+                    episode_id="ep-historical",
+                    row_index=3,
+                    workflow_step="rewrite",
+                    actor_role="rewriter_output",
+                    prompt="[user]\nDataset context and tested hypothesis.",
+                    raw_response=(
+                        "Narrative: the overlap feature captures a plausible "
+                        "multi-stage mineralization signal.\n"
+                        "Result: -1.5000 BIC delta. Admitted."
+                    ),
+                ),
+            ],
+        )
+
+        result = _run_transform([group])
+
+        pair_kinds = {row["record_meta"]["pair_kind"] for row in result[0].rows}
+        assert PAIR_KIND_PARENT_HYPOTHESIS in pair_kinds
+        assert PAIR_KIND_ANALYSIS_PLAN in pair_kinds
+        assert PAIR_KIND_OUTCOME_NARRATIVE in pair_kinds
 
 
 # ---------------------------------------------------------------------------
