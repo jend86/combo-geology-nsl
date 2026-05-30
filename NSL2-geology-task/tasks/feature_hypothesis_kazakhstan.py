@@ -164,55 +164,172 @@ This dataset contains comprehensive geological data for the Teniz Basin region o
 # Each episode is assigned the least-explored entry so agents are forced to
 # derive hypotheses from different data sources rather than free-roaming and
 # fixating on whatever the context history primes them toward.
+#
+# Entries with a "glob_pattern" field (str or list[str]) point to a directory;
+# the agent is shown a code snippet to enumerate only that section's files.
+# Entries without "glob_pattern" are read as a single file or plain directory.
 _KAZAKHSTAN_SOURCE_FILES = [
+    # --- Spatial GeoJSON ---
     {
-        "key": "copper_prospects",
-        "path": "converted_spatial_data/copper_prospects.geojson",
+        "key": "copper_prospects_aoi",
+        "path": "converted_spatial_data/copper_prospects_aoi.geojson",
         "description": (
-            "113 sediment-hosted copper prospect points — coordinates, tonnage, "
-            "Cu% grade, Ag content, deposit classification. Economic focus."
+            "112 sediment-hosted copper prospect points (area-of-interest subset) — "
+            "coordinates, tonnage (Tonnage_Mt), Cu% grade (Cu_pct), Ag content, "
+            "deposit classification."
         ),
     },
     {
         "key": "anticlines_synclines",
         "path": "converted_spatial_data/anticlines_synclines.geojson",
         "description": (
-            "33 geological fold structures (anticlines and synclines) — line features "
-            "showing fold axes, structure names, geological ages."
+            "58 geological fold structures (anticlines and synclines) — fold axes, "
+            "structure names, geological ages."
+        ),
+    },
+    # --- Smolianova 1984 Russian survey — section-level ---
+    {
+        "key": "smolianova_geological_study",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*II_GEOLOGICAL-GEOPHYSICAL*.md",
+        "description": (
+            "Smolianova 1984 Ch. II — geological-geophysical survey (~10 chunks): "
+            "regional setting, survey methods, geophysical interpretation."
         ),
     },
     {
-        "key": "assessment_tract",
-        "path": "converted_spatial_data/assessment_tract.geojson",
+        "key": "smolianova_stratigraphy_early",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": ["*Proterozoic*.md", "*Cambrian*.md", "*Ordovician*.md"],
         "description": (
-            "Teniz Basin boundary polygon (49,714 km²) — USGS assessment tract extent "
-            "and area-of-interest metadata."
+            "Smolianova 1984 Ch. V — early stratigraphy (~20 chunks): "
+            "Proterozoic, Cambrian, Ordovician sequences and basement lithology."
         ),
     },
     {
-        "key": "copper_prospects_aoi",
-        "path": "converted_spatial_data/copper_prospects_aoi.geojson",
+        "key": "smolianova_stratigraphy_devonian",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Devonian*.md",
         "description": (
-            "Copper prospects clipped to the area of interest — same attributes as "
-            "copper_prospects but spatially filtered for focused sub-basin analysis."
+            "Smolianova 1984 Ch. V — Devonian stratigraphy (~16 chunks): "
+            "sedimentary sequences, redbeds, lithology descriptions."
         ),
     },
     {
-        "key": "smolianova_survey",
-        "path": "36572_Smolianova_1984/",
+        "key": "smolianova_stratigraphy_carboniferous_lower",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Lower*.md",
         "description": (
-            "Russian geological survey (1984): 329 text chunks covering stratigraphy, "
-            "tectonics, magmatic formations, useful minerals, geophysics; "
-            "60+ drill hole logs (drill_holes_data/); geophysical section descriptions."
+            "Smolianova 1984 Ch. V — Lower Carboniferous (~31 chunks): "
+            "key copper-hosting sedimentary sequences and diagenetic features."
         ),
     },
     {
-        "key": "usgs_assessment",
-        "path": "USGS/",
+        "key": "smolianova_stratigraphy_carboniferous_middle",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Middle*.md",
         "description": (
-            "USGS sandstone copper assessment: English-language report chunks, "
-            "figure descriptions (13 figures), quantitative resource estimates, "
-            "deposit model methodology."
+            "Smolianova 1984 Ch. V — Middle Carboniferous (~10 chunks): "
+            "stratigraphy, lithology, and depositional environment."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_carboniferous_upper",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*Carboniferous_Upper*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Upper Carboniferous (~15 chunks): "
+            "stratigraphy, lithology, and lateral facies variation."
+        ),
+    },
+    {
+        "key": "smolianova_stratigraphy_permian",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*STRATIGRAPHY_Permian*.md",
+        "description": (
+            "Smolianova 1984 Ch. V — Permian stratigraphy (~27 chunks): "
+            "red-bed sequences, evaporites, post-orogenic basin evolution."
+        ),
+    },
+    {
+        "key": "smolianova_magmatic",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*MAGMATIC_FORMATIONS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VI — Magmatic formations (~49 chunks): "
+            "igneous intrusions, volcanic sequences, geochemistry."
+        ),
+    },
+    {
+        "key": "smolianova_tectonics",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*TECTONICS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VII — Tectonics (~8 chunks): "
+            "structural geology, fault systems, basin architecture, fold belts."
+        ),
+    },
+    {
+        "key": "smolianova_useful_minerals",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*USEFUL_MINERALS*.md",
+        "description": (
+            "Smolianova 1984 Ch. VIII — Useful minerals (~21 chunks): "
+            "economic mineralogy, Cu/Ag occurrences, mineral paragenesis."
+        ),
+    },
+    {
+        "key": "smolianova_prognosis",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*REGULARITIES_AND_PROGNOSIS*.md",
+        "description": (
+            "Smolianova 1984 Ch. IX — Ore-forming regularities and prognosis (~8 chunks): "
+            "spatial controls on mineralisation, exploration targeting criteria."
+        ),
+    },
+    {
+        "key": "smolianova_geological_work",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*GEOLOGICAL_WORK_IN_APPENDICES*.md",
+        "description": (
+            "Smolianova 1984 Ch. XI — Geological work in appendices (~14 chunks): "
+            "detailed analytical results, laboratory data, supporting studies."
+        ),
+    },
+    {
+        "key": "smolianova_textual_appendix",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*TEXTUAL_APPENDIX*.md",
+        "description": (
+            "Smolianova 1984 Textual appendix (~74 chunks): mineral deposits catalogue "
+            "with deposit name, location, type, tonnage, and grade data."
+        ),
+    },
+    {
+        "key": "smolianova_nrs_review",
+        "path": "36572_Smolianova_1984/chunks/",
+        "glob_pattern": "*NRS_REVIEW*.md",
+        "description": (
+            "Smolianova 1984 — NRS review & commission appendix (~9 chunks): "
+            "expert commentary on survey conclusions and recommended follow-up."
+        ),
+    },
+    {
+        "key": "smolianova_drill_holes",
+        "path": "36572_Smolianova_1984/drill_holes_data/",
+        "description": (
+            "Smolianova 1984 — 60+ borehole logs: lithology descriptions, depth "
+            "intervals, core recovery, mineralisation intercepts."
+        ),
+    },
+    # --- USGS sandstone copper assessment ---
+    {
+        "key": "usgs_report",
+        "path": "USGS/chunks/",
+        "description": (
+            "USGS sandstone copper assessment (~7 chunks): English-language report, "
+            "quantitative resource estimates, deposit model methodology, figure "
+            "descriptions (13 figures)."
         ),
     },
 ]
@@ -1891,31 +2008,62 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     def _generate_survey_prompt_with_context(self, episode_context: dict[str, Any]) -> str:
         """Generate survey prompt with file assignment and coverage map.
 
-        Each episode is anchored to a specific source file selected at populate()
-        time.  The prompt shows a neutral file-coverage map (counts only, no
-        hypothesis text) so the agent is never primed with past concepts.
+        Each episode is anchored to a specific source selected at populate() time.
+        The prompt shows a neutral coverage map (counts only, no hypothesis text)
+        so the agent is never primed with past concepts.
+
+        Entries with a ``glob_pattern`` field receive a code snippet showing how
+        to enumerate that section's files; plain-path entries get a direct path.
         """
         assigned = episode_context.get("assigned_source", {})
         coverage = episode_context.get("source_coverage", {})
 
-        # --- Build the coverage map (file names + counts, no concept words) ---
+        # --- Build the coverage map (key labels + counts, no concept words) ---
         coverage_lines = []
         for src in _KAZAKHSTAN_SOURCE_FILES:
             count = coverage.get(src["key"], 0)
             marker = "  ← assigned this episode" if src["key"] == assigned.get("key") else ""
-            coverage_lines.append(f"  {src['path']}: {count} episode(s){marker}")
+            coverage_lines.append(f"  {src['key']}: {count} episode(s){marker}")
         coverage_block = "\n".join(coverage_lines)
 
         # --- Mandatory assignment block ---
         if assigned:
-            assignment_block = (
-                f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
-                f"  Path   : {assigned['path']}\n"
-                f"  Details: {assigned['description']}\n\n"
-                f"You MUST derive your hypothesis candidate from this file.\n"
-                f"Do not freely browse other files during the survey phase.\n"
-                f"Open and examine the assigned file first with analysis_shell.\n"
-            )
+            glob_pattern = assigned.get("glob_pattern")
+            if glob_pattern:
+                # Section-level chunk entry — show glob enumeration snippet
+                patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
+                glob_lines = "\n".join(
+                    f"    files += glob.glob(os.path.join(dataset_dir, '{assigned['path']}', '{p}'))"
+                    for p in patterns
+                )
+                assignment_block = (
+                    f"YOUR ASSIGNED SOURCE FOR THIS EPISODE\n"
+                    f"  Section: {assigned['key']}\n"
+                    f"  Details: {assigned['description']}\n\n"
+                    f"To list the files in this section, run in analysis_shell:\n"
+                    f"```python\n"
+                    f"import glob, os\n"
+                    f"dataset_dir = '/workspace/input'\n"
+                    f"files = []\n"
+                    f"{glob_lines}\n"
+                    f"files = sorted(files)\n"
+                    f"print(f'Found {{len(files)}} files:')\n"
+                    f"for f in files: print(f)\n"
+                    f"```\n\n"
+                    f"Read the files in this section with analysis_shell, then derive\n"
+                    f"your hypothesis from what you find there.\n"
+                    f"You MUST stay within this section — do not browse other directories.\n"
+                )
+            else:
+                # Plain file or directory entry
+                assignment_block = (
+                    f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
+                    f"  Path   : {assigned['path']}\n"
+                    f"  Details: {assigned['description']}\n\n"
+                    f"You MUST derive your hypothesis candidate from this file.\n"
+                    f"Do not freely browse other files during the survey phase.\n"
+                    f"Open and examine the assigned file first with analysis_shell.\n"
+                )
         else:
             assignment_block = (
                 "Explore the Kazakhstan Teniz Basin dataset to identify regional feature opportunities.\n"
@@ -1925,10 +2073,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             "Phase 1: Survey\n\n"
             + assignment_block
             + "\n"
-            "SOURCE COVERAGE (episodes completed per file — for situational awareness only):\n"
+            "SOURCE COVERAGE (episodes completed per source — for situational awareness only):\n"
             + coverage_block
             + "\n\n"
-            "Use analysis_shell to read and explore your assigned file, then identify\n"
+            "Use analysis_shell to read and explore your assigned source, then identify\n"
             "ONE promising feature layer candidate grounded in what you find there.\n\n"
             "Close with:\n"
             "  record_phase(phase='survey', candidates=[...])"
