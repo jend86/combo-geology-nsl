@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -74,6 +74,10 @@ class UtilizationSummary:
     avg_kv_cache_usage_pct: Optional[float] = None
     peak_num_requests_running: Optional[int] = None
     peak_num_requests_waiting: Optional[int] = None
+    # Windowed counter deltas (preemptions, prefix-cache hit ratio, token
+    # throughput) over the sampling window — ``asdict(InferenceMetricsDelta)``.
+    # ``None`` when fewer than two inference scrapes were collected.
+    inference_metrics_delta: Optional[Dict[str, Any]] = None
 
 
 @dataclass

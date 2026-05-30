@@ -16,6 +16,8 @@ from src.observability.types import (
 
 from src.observability.gpu import read_gpu_memory_info, read_gpu_utilization_pct
 from src.observability.vllm_metrics import (
+    InferenceMetricsSnapshot,
+    inference_metrics_delta,
     snapshot_inference_metrics,
     snapshot_vllm_metrics,
 )
@@ -70,6 +72,10 @@ class MetricsCollector:
         self._vllm_kv_cache_count: int = 0
         self._vllm_peak_requests_running: int | None = None
         self._vllm_peak_requests_waiting: int | None = None
+        # First and latest counter snapshots within the active sampling window,
+        # used to compute windowed deltas (preemptions, prefix-cache hit ratio).
+        self._vllm_first_snapshot: InferenceMetricsSnapshot | None = None
+        self._vllm_last_snapshot: InferenceMetricsSnapshot | None = None
         self._summary = {
             "inference_calls": 0,
             "phase_count": 0,
@@ -197,6 +203,8 @@ class MetricsCollector:
             self._vllm_kv_cache_count = 0
             self._vllm_peak_requests_running = None
             self._vllm_peak_requests_waiting = None
+            self._vllm_first_snapshot = None
+            self._vllm_last_snapshot = None
         self._record_utilization_sample(
             self._read_gpu_utilization_pct(),
             self._read_cpu_utilization_pct(),
@@ -233,6 +241,8 @@ class MetricsCollector:
             avg_kv = self._vllm_sum_kv_cache / kv_count if kv_count > 0 else None
             peak_running = self._vllm_peak_requests_running
             peak_waiting = self._vllm_peak_requests_waiting
+            first_snapshot = self._vllm_first_snapshot
+            last_snapshot = self._vllm_last_snapshot
             # Reset all state
             self._utilization_peak_gpu = None
             self._utilization_peak_cpu = None
@@ -246,6 +256,19 @@ class MetricsCollector:
             self._vllm_kv_cache_count = 0
             self._vllm_peak_requests_running = None
             self._vllm_peak_requests_waiting = None
+            self._vllm_first_snapshot = None
+            self._vllm_last_snapshot = None
+
+        # Windowed delta needs two distinct scrapes within the window.
+        inference_delta: Optional[dict] = None
+        if (
+            first_snapshot is not None
+            and last_snapshot is not None
+            and last_snapshot is not first_snapshot
+        ):
+            inference_delta = asdict(
+                inference_metrics_delta(first_snapshot, last_snapshot)
+            )
 
         return UtilizationSummary(
             peak_gpu_utilization_pct=peak_gpu,
@@ -257,6 +280,7 @@ class MetricsCollector:
             avg_kv_cache_usage_pct=avg_kv,
             peak_num_requests_running=peak_running,
             peak_num_requests_waiting=peak_waiting,
+            inference_metrics_delta=inference_delta,
         )
 
     def live_utilization_snapshot(self) -> LiveUtilizationSnapshot:
@@ -337,6 +361,9 @@ class MetricsCollector:
         if snapshot is None:
             return
         with self._lock:
+            if self._vllm_first_snapshot is None:
+                self._vllm_first_snapshot = snapshot
+            self._vllm_last_snapshot = snapshot
             if snapshot.kv_cache_usage_pct is not None:
                 if (
                     self._vllm_peak_kv_cache is None

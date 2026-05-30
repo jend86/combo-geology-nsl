@@ -583,6 +583,17 @@ def _run_generation_parallel(
                         f"peak_requests_running={utilization_summary.peak_num_requests_running}, "
                         f"peak_requests_waiting={utilization_summary.peak_num_requests_waiting}"
                     )
+                    delta = utilization_summary.inference_metrics_delta
+                    if delta is not None:
+                        logger.info(
+                            "Parallel generation vLLM deltas (window="
+                            f"{delta.get('window_seconds')}s): "
+                            f"preemptions={delta.get('preemptions')}, "
+                            f"prefix_cache_hit_rate={delta.get('prefix_cache_hit_rate')}, "
+                            f"prompt_tokens_cached_rate={delta.get('prompt_tokens_cached_rate')}, "
+                            f"prompt_tok/s={delta.get('prompt_tokens_per_second')}, "
+                            f"gen_tok/s={delta.get('generation_tokens_per_second')}"
+                        )
                     rt.metrics.flush()
             finally:
                 parallel_runtime.teardown_worker_slots(slots)
