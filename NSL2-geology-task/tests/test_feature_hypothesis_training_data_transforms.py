@@ -32,6 +32,7 @@ from tasks.feature_hypothesis import (
     FeatureHypothesisVariation,
 )
 from tasks.feature_hypothesis_kazakhstan import (
+    ExperimentReasoningRows,
     FeatureHypothesisKazakhstanProposerRows,
     FeatureHypothesisKazakhstanTask,
     FeatureHypothesisKazakhstanVariation,
@@ -239,7 +240,7 @@ class TestTaskWiresTransform:
         task = _kz_task(tmp_path)
         transforms = tuple(task.training_data_transforms())
         assert len(transforms) == 1
-        assert isinstance(transforms[0], FeatureHypothesisKazakhstanProposerRows)
+        assert isinstance(transforms[0], ExperimentReasoningRows)
 
 
 # ---------------------------------------------------------------------------
@@ -379,3 +380,5 @@ class TestSubmitRewriteSynthesizesRow:
         assert len(synth) == 1
         assert "kz prompt" in synth[0].messages[0]["content"]
         assert "kz response" in synth[0].response
+        assert synth[0].meta["experiment_record"]["source"] == "submit_rewrite"
+        assert "phase_records" in synth[0].meta["experiment_record"]

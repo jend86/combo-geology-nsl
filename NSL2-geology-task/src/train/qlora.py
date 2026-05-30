@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 
-from unsloth import FastLanguageModel
 from datasets import Dataset
 from dotenv import dotenv_values, find_dotenv, load_dotenv
 from loguru import logger
@@ -41,6 +40,23 @@ SUPPORTED_TRAINING_BASE_MODEL_EXAMPLES = (
     "Qwen/Qwen2.5-Coder-7B-Instruct",
     "unsloth/Qwen2.5-Coder-7B-Instruct-bnb-4bit",
 )
+
+
+class _FastLanguageModelProxy:
+    """Import Unsloth only when training actually loads or patches the model."""
+
+    def from_pretrained(self, *args: Any, **kwargs: Any) -> Any:
+        from unsloth import FastLanguageModel as _FastLanguageModel
+
+        return _FastLanguageModel.from_pretrained(*args, **kwargs)
+
+    def get_peft_model(self, *args: Any, **kwargs: Any) -> Any:
+        from unsloth import FastLanguageModel as _FastLanguageModel
+
+        return _FastLanguageModel.get_peft_model(*args, **kwargs)
+
+
+FastLanguageModel = _FastLanguageModelProxy()
 
 
 def _export_timestamp() -> str:
@@ -92,6 +108,18 @@ def _cleanup_torch_cuda_state() -> None:
         return
 
     torch.cuda.empty_cache()
+
+
+def _mixed_precision_kwargs() -> dict[str, bool]:
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return {"bf16": False, "fp16": False}
+
+    if not torch.cuda.is_available():
+        return {"bf16": False, "fp16": False}
+    bf16 = bool(getattr(torch.cuda, "is_bf16_supported", lambda: False)())
+    return {"bf16": bf16, "fp16": not bf16}
 
 
 def _load_base_model(
@@ -228,15 +256,20 @@ def _load_sft_dataset(training_data_paths: Sequence[Path], tokenizer: Any) -> An
                 if not isinstance(prompt, str) or not isinstance(raw_response, str):
                     continue
 
-                text = tokenizer.apply_chat_template(
+                prompt_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                completion_text = tokenizer.apply_chat_template(
                     [
                         {"role": "user", "content": prompt},
                         {"role": "assistant", "content": raw_response},
                     ],
                     tokenize=False,
                     add_generation_prompt=False,
-                )
-                rows.append({"text": text})
+                )[len(prompt_text):]
+                rows.append({"prompt": prompt_text, "completion": completion_text})
 
     if not rows:
         raise ValueError("No training rows found")
@@ -308,8 +341,9 @@ def train_sft(
             logging_steps=logging_steps,
             save_strategy="no",
             report_to=report_to,
-            dataset_text_field="text",
             max_length=max_seq_length,
+            completion_only_loss=True,
+            **_mixed_precision_kwargs(),
             optim="paged_adamw_8bit",
         ),
         train_dataset=dataset,

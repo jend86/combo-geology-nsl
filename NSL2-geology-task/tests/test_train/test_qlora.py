@@ -66,6 +66,8 @@ class TestLoadSftDataset(unittest.TestCase):
 
         def apply_chat_template(messages, tokenize, add_generation_prompt):
             user_content = messages[0]["content"]
+            if len(messages) == 1:
+                return f"<user>{user_content}</user><asst>"
             asst_content = messages[1]["content"]
             return f"<user>{user_content}</user><asst>{asst_content}</asst>"
 
@@ -96,7 +98,21 @@ class TestLoadSftDataset(unittest.TestCase):
             self._make_jsonl([self._make_row(), self._make_row()], path)
             dataset = _load_sft_dataset([path], tokenizer)
         self.assertGreater(len(dataset), 0)
-        self.assertIn("text", dataset.column_names)
+        self.assertIn("prompt", dataset.column_names)
+        self.assertIn("completion", dataset.column_names)
+        self.assertNotIn("text", dataset.column_names)
+
+    def test_load_sft_dataset_splits_prompt_and_completion(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(prompt="Question", raw_response="Answer")], path)
+            dataset = _load_sft_dataset([path], tokenizer)
+
+        self.assertEqual(dataset[0]["prompt"], "<user>Question</user><asst>")
+        self.assertEqual(dataset[0]["completion"], "Answer</asst>")
 
     def test_load_sft_dataset_multiple_files(self):
         from src.train.qlora import _load_sft_dataset
@@ -231,6 +247,8 @@ class TestTrainSft(unittest.TestCase):
             )
 
         trainer_instance.train.assert_called_once()
+        trainer_args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertIs(trainer_args.completion_only_loss, True)
         model.save_pretrained.assert_called_once()
         tokenizer.save_pretrained.assert_called_once()
         model.save_pretrained_merged.assert_not_called()

@@ -302,6 +302,735 @@ class FeatureHypothesisKazakhstanState:
     prompt_response_pair: dict[str, str] = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# BIC-result appendix pattern — injected by _exec_submit_rewrite, must be
+# stripped from T4 completions before export.
+# ---------------------------------------------------------------------------
+_BIC_RESULT_RE = re.compile(
+    r"\s*Result:\s*-?\d+(?:\.\d+)?\s+BIC delta\.\s*(?:Admitted|Not admitted)\.",
+    re.IGNORECASE,
+)
+
+# Stop-words for the novelty heuristic (T2 routing).
+_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "a", "an", "the", "and", "or", "of", "in", "to", "for", "with",
+        "is", "are", "was", "were", "that", "this", "it", "be", "by",
+        "at", "as", "on", "from", "can", "will", "may", "has", "have",
+    }
+)
+
+
+def _content_words(text: str) -> set[str]:
+    """Return lower-cased non-stop words from *text*."""
+    tokens = re.findall(r"[a-z]+", text.lower())
+    return {t for t in tokens if t not in _STOP_WORDS}
+
+
+def _is_novel_vs_parents(hypothesis: str, parent_hypotheses: list[str]) -> bool:
+    """Return True when >50% of the child hypothesis content-words are absent
+    from all parent hypotheses combined.  Falls back to True when there are no
+    parents (genuinely de-novo survey episode)."""
+    if not parent_hypotheses:
+        return True
+    child_words = _content_words(hypothesis)
+    if not child_words:
+        return False
+    parent_words: set[str] = set()
+    for ph in parent_hypotheses:
+        parent_words |= _content_words(ph)
+    novel_count = sum(1 for w in child_words if w not in parent_words)
+    return novel_count / len(child_words) > 0.50
+
+
+class ExperimentReasoningRows:
+    """SFT transform: synthesize T1/T2/T3/T4 prompt-completion pairs from
+    training-successful geology episodes.
+
+    Each training-successful episode produces up to 4 rows:
+
+    - **T1** (compose): parent-findings prompt → child hypothesis + rationale.
+      Skipped when parent context is not recoverable.
+    - **T2** (de-novo survey): dataset-overview prompt → hypothesis + rationale.
+      Only emitted when the hypothesis is >50% novel vs. parent vocabulary.
+    - **T3** (test-design): hypothesis + available-files prompt → data_spec plan.
+    - **T4** (adjudicate / narrative): hypothesis + context prompt → narrative.
+      Tagged ``record_meta.faithfulness = "post_hoc"``.  BIC appendix is
+      stripped from the completion.
+
+    Leakage guards
+    --------------
+    - ΔBIC float, sign ("admitted", "not admitted") never appear in any prompt.
+    - T4 ``raw_response`` has the ``"Result: … BIC delta. …"`` suffix stripped.
+
+    Curation (L2)
+    -------------
+    - Collapse exact prompt/completion duplicates, keeping the row from the
+      strongest ``|bic_delta|`` episode.
+    - Family balance caps dominant hypothesis families. T2 exploration rows are
+      preserved even when the rest of an over-cap family is dropped.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_per_family: int = 5,
+        novelty_threshold: float = 0.50,
+        max_pair_chars: int = 12_000,
+    ) -> None:
+        self._max_per_family = max_per_family
+        self._novelty_threshold = novelty_threshold
+        self._max_pair_chars = max_pair_chars
+
+    # ------------------------------------------------------------------
+    # TrainingDataTransform protocol
+    # ------------------------------------------------------------------
+
+    @property
+    def name(self) -> str:
+        return "ExperimentReasoningRows[v1]"
+
+    def config(self) -> dict[str, Any]:
+        return {
+            "max_per_family": self._max_per_family,
+            "novelty_threshold": self._novelty_threshold,
+            "max_pair_chars": self._max_pair_chars,
+        }
+
+    def transform_export_rows(
+        self,
+        context: Any,
+        episodes: list[Any],
+    ) -> list[Any]:
+        from src.training_data.transforms import EpisodeTrainingRows
+
+        source_payloads = self._load_source_episode_payloads(context)
+        raw: list[tuple[EpisodeTrainingRows, list[dict[str, Any]], float | None]] = []
+
+        for episode in episodes:
+            source_payload = source_payloads.get(getattr(episode, "episode_id", ""), {})
+            record = self._backfill_record(episode, source_payload)
+            if not record.get("training_success", True):
+                raw.append((episode, [], None))
+                continue
+
+            rows = self._synthesize_rows(episode, record)
+            raw.append((episode, rows, record.get("bic_delta")))
+
+        # Phase 2: L2 curation — dedup + family balance.
+        curated = self._curate(raw)
+
+        # Phase 3: pack into EpisodeTrainingRows, preserving empty groups for
+        # failed episodes so the caller sees the same episode count.
+        out: list[EpisodeTrainingRows] = []
+        for episode, rows, _bic in curated:
+            out.append(
+                EpisodeTrainingRows(
+                    episode_id=episode.episode_id,
+                    episode_index=episode.episode_index,
+                    generation_id=episode.generation_id,
+                    episode_score=episode.episode_score,
+                    rows=rows,
+                )
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_source_episode_payloads(context: Any) -> dict[str, dict[str, Any]]:
+        path = getattr(context, "source_all_episodes_path", None)
+        if path is None:
+            return {}
+        source_path = Path(path)
+        if not source_path.exists():
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        try:
+            with source_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    payload = json.loads(line)
+                    if isinstance(payload, dict) and isinstance(payload.get("episode_id"), str):
+                        out[payload["episode_id"]] = payload
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"ExperimentReasoningRows: failed to inspect all_episodes.jsonl: {exc}")
+        return out
+
+    def _backfill_record(
+        self,
+        episode: Any,
+        source_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        episode_context = self._episode_context(episode, source_payload)
+        rows = list(getattr(episode, "rows", []))
+        meta_record = self._first_meta_record(rows)
+
+        phase_records = self._first_dict(
+            meta_record.get("phase_records"),
+            episode_context.get("phase_records"),
+            meta_record.get("experiment_record", {}).get("phase_records")
+            if isinstance(meta_record.get("experiment_record"), dict)
+            else None,
+        )
+        terminal_record = self._first_dict(
+            meta_record.get("terminal_record"),
+            episode_context.get("terminal_record"),
+            meta_record.get("experiment_record", {}).get("terminal_record")
+            if isinstance(meta_record.get("experiment_record"), dict)
+            else None,
+        )
+        graph_node = self._first_dict(
+            terminal_record.get("graph_node") if isinstance(terminal_record, dict) else None,
+            meta_record.get("graph_node"),
+        )
+
+        hypothesise = self._first_dict(phase_records.get("hypothesise"))
+        code = self._first_dict(phase_records.get("code"))
+        translate = self._first_dict(phase_records.get("translate"))
+        evaluate = self._first_dict(phase_records.get("evaluate"))
+        outcome = self._first_dict(graph_node.get("outcome"))
+        task_breakdown = self._first_dict(source_payload.get("task_breakdown"))
+
+        hypothesise_row = self._row_for_step(rows, "hypothesise")
+        survey_row = self._row_for_step(rows, "survey")
+        rewrite_row = self._row_for_step(rows, "rewrite")
+
+        hypothesis, hypothesis_source = self._first_text_with_source(
+            (hypothesise.get("hypothesis"), "phase_records"),
+            (graph_node.get("hypothesis"), "graph_node"),
+            (meta_record.get("hypothesis"), "record_meta"),
+            (self._parse_hypothesis(hypothesise_row), "transcript"),
+        )
+        data_spec, data_spec_source = self._first_value_with_source(
+            (hypothesise.get("data_spec"), "phase_records"),
+            (graph_node.get("data_spec"), "graph_node"),
+            (meta_record.get("data_spec"), "record_meta"),
+            (self._parse_data_spec(hypothesise_row), "transcript"),
+        )
+        if not isinstance(data_spec, dict):
+            data_spec = {}
+        parent_ids = self._string_list(hypothesise.get("parent_experiments"))
+        if not parent_ids:
+            parent_ids = self._string_list(meta_record.get("parent_experiments"))
+        parent_context, parents_source = self._parent_context(
+            episode_context,
+            hypothesise,
+            hypothesise_row,
+            hypothesis,
+        )
+        parent_hypotheses = self._parent_hypotheses(hypothesise, parent_context)
+        bic_delta, outcome_source = self._first_float_with_source(
+            (evaluate.get("bic_delta"), "phase_records"),
+            (outcome.get("bic_delta"), "graph_node"),
+            (task_breakdown.get("bic_delta"), "task_breakdown"),
+            (meta_record.get("bic_delta"), "record_meta"),
+        )
+
+        narrative, narrative_source = self._first_text_with_source(
+            (rewrite_row.get("raw_response") if rewrite_row else None, "rewrite_output"),
+            (
+                terminal_record.get("training_pair", {}).get("response")
+                if isinstance(terminal_record.get("training_pair"), dict)
+                else None,
+                "terminal_record",
+            ),
+        )
+        narrative_clean, outcome_appended = self._strip_outcome_appendix(narrative)
+
+        return {
+            "training_success": bool(episode_context.get("success", True)),
+            "duplicate_rejected": bool(episode_context.get("duplicate_rejected", False)),
+            "hypothesis": hypothesis,
+            "data_spec": data_spec,
+            "parent_ids": parent_ids,
+            "parent_context": parent_context,
+            "parent_hypotheses": parent_hypotheses,
+            "survey_context": self._survey_context(survey_row),
+            "hypothesise_response": self._row_text(hypothesise_row, "raw_response"),
+            "feature_layer_name": str(
+                translate.get("feature_layer_name")
+                or graph_node.get("feature_layer_name")
+                or ""
+            ).strip(),
+            "result_summary": str(
+                code.get("result_summary")
+                or graph_node.get("experiment_summary")
+                or ""
+            ).strip(),
+            "bic_delta": bic_delta,
+            "narrative": narrative_clean,
+            "outcome_appended": outcome_appended,
+            "source_rows": {
+                "survey": survey_row,
+                "hypothesise": hypothesise_row,
+                "rewrite": rewrite_row,
+            },
+            "provenance": {
+                "hypothesis": hypothesis_source,
+                "data_spec": data_spec_source,
+                "parents": parents_source,
+                "outcome": outcome_source,
+                "narrative": narrative_source,
+            },
+        }
+
+    @staticmethod
+    def _episode_context(episode: Any, source_payload: dict[str, Any]) -> dict[str, Any]:
+        ctx: dict[str, Any] = {}
+        raw_ctx = getattr(episode, "episode_context", None)
+        if isinstance(raw_ctx, dict):
+            ctx.update(raw_ctx)
+        if source_payload:
+            ctx.setdefault("success", bool(source_payload.get("success", True)))
+            ctx.setdefault("task_breakdown", source_payload.get("task_breakdown", {}))
+            ctx.setdefault("trajectory", source_payload.get("trajectory", {}))
+        return ctx
+
+    @staticmethod
+    def _first_meta_record(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for row in rows:
+            meta = row.get("record_meta")
+            if not isinstance(meta, dict):
+                continue
+            experiment_record = meta.get("experiment_record")
+            if isinstance(experiment_record, dict):
+                out.update(experiment_record)
+            for key in (
+                "phase_records",
+                "terminal_record",
+                "graph_node",
+                "hypothesis",
+                "data_spec",
+                "parent_experiments",
+                "bic_delta",
+            ):
+                if key in meta and key not in out:
+                    out[key] = meta[key]
+        return out
+
+    @staticmethod
+    def _first_dict(*values: Any) -> dict[str, Any]:
+        for value in values:
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    @staticmethod
+    def _row_for_step(rows: list[dict[str, Any]], step: str) -> dict[str, Any]:
+        for row in rows:
+            if row.get("workflow_step") == step:
+                return row
+        return {}
+
+    @staticmethod
+    def _row_text(row: dict[str, Any], field: str) -> str:
+        value = row.get(field) if isinstance(row, dict) else None
+        return value.strip() if isinstance(value, str) else ""
+
+    @staticmethod
+    def _parse_hypothesis(row: dict[str, Any]) -> str:
+        text = ExperimentReasoningRows._row_text(row, "raw_response")
+        if not text:
+            return ""
+        match = re.search(r"Hypothesis:\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _parse_data_spec(row: dict[str, Any]) -> dict[str, Any]:
+        text = ExperimentReasoningRows._row_text(row, "raw_response")
+        if not text:
+            return {}
+        match = re.search(r"DataSpec:\s*(.+)$", text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return {}
+        return {"text": match.group(1).strip()}
+
+    @staticmethod
+    def _first_text_with_source(*items: tuple[Any, str]) -> tuple[str, str]:
+        for value, source in items:
+            if isinstance(value, str) and value.strip():
+                return value.strip(), source
+        return "", "missing"
+
+    @staticmethod
+    def _first_value_with_source(*items: tuple[Any, str]) -> tuple[Any, str]:
+        for value, source in items:
+            if isinstance(value, dict) and value:
+                return value, source
+            if isinstance(value, str) and value.strip():
+                return {"text": value.strip()}, source
+        return {}, "missing"
+
+    @staticmethod
+    def _first_float_with_source(*items: tuple[Any, str]) -> tuple[float | None, str]:
+        for value, source in items:
+            if value is None:
+                continue
+            try:
+                return float(value), source
+            except (TypeError, ValueError):
+                continue
+        return None, "missing"
+
+    @staticmethod
+    def _string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item for item in value if isinstance(item, str) and item]
+
+    def _parent_context(
+        self,
+        episode_context: dict[str, Any],
+        hypothesise: dict[str, Any],
+        hypothesise_row: dict[str, Any],
+        child_hypothesis: str,
+    ) -> tuple[str, str]:
+        parent_context = hypothesise.get("parent_context")
+        if isinstance(parent_context, list) and parent_context:
+            rendered = self._format_parent_summary(parent_context)
+            sanitized = self._sanitize_prompt_context(rendered, child_hypothesis)
+            if sanitized:
+                return sanitized, "phase_records"
+
+        crossbreed_context = episode_context.get("crossbreed_context")
+        if isinstance(crossbreed_context, dict):
+            prompt = crossbreed_context.get("prompt")
+            if isinstance(prompt, str):
+                sanitized = self._sanitize_prompt_context(prompt, child_hypothesis)
+                if sanitized:
+                    return sanitized, "episode_context"
+
+        prompt = self._row_text(hypothesise_row, "prompt")
+        if prompt and re.search(r"parent|prior experiment|experiment\s+\d", prompt, re.IGNORECASE):
+            sanitized = self._sanitize_prompt_context(prompt, child_hypothesis)
+            if sanitized:
+                return sanitized, "transcript"
+        return "", "missing"
+
+    @staticmethod
+    def _parent_hypotheses(hypothesise: dict[str, Any], parent_context: str) -> list[str]:
+        parent_records = hypothesise.get("parent_context")
+        if isinstance(parent_records, list):
+            out = [
+                item.get("hypothesis", "").strip()
+                for item in parent_records
+                if isinstance(item, dict) and isinstance(item.get("hypothesis"), str)
+            ]
+            if out:
+                return out
+        quoted = re.findall(r"Experiment\s+\d+:\s*\"(.+?)\"", parent_context)
+        return [item.strip() for item in quoted if item.strip()]
+
+    @staticmethod
+    def _strip_outcome_appendix(text: str) -> tuple[str, bool]:
+        if not text:
+            return "", False
+        cleaned, count = _BIC_RESULT_RE.subn("", text)
+        return cleaned.rstrip(), count > 0
+
+    @staticmethod
+    def _sanitize_prompt_context(text: str, child_hypothesis: str = "") -> str:
+        cleaned = _BIC_RESULT_RE.sub("", text)
+        cleaned = re.sub(
+            r"^.*\bBIC (?:delta|improvement)\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        cleaned = re.sub(
+            r"\s*-?\d+(?:\.\d+)?\s+BIC (?:delta|improvement)\b\.?:?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\bnot admitted\b|\badmitted\b", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        if child_hypothesis and child_hypothesis.strip() in cleaned:
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _survey_context(survey_row: dict[str, Any]) -> str:
+        prompt = ExperimentReasoningRows._row_text(survey_row, "prompt")
+        response = ExperimentReasoningRows._row_text(survey_row, "raw_response")
+        if prompt and response:
+            return f"{prompt}\n\nSurvey notes:\n{response}"
+        return prompt or response or _DATASET_OVERVIEW
+
+    def _synthesize_rows(self, episode: Any, record: dict[str, Any]) -> list[dict[str, Any]]:
+        hypothesis = str(record.get("hypothesis") or "").strip()
+        if not hypothesis:
+            return []
+        rows: list[dict[str, Any]] = []
+        provenance = dict(record.get("provenance") or {})
+        source_rows = dict(record.get("source_rows") or {})
+        hypothesise_response = str(record.get("hypothesise_response") or "").strip()
+        hypothesis_target = hypothesise_response if hypothesis in hypothesise_response else f"Hypothesis: {hypothesis}"
+
+        parent_context = str(record.get("parent_context") or "").strip()
+        if parent_context and record.get("parent_ids"):
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("hypothesise", {}),
+                    row_suffix="t1",
+                    prompt=(
+                        "Prior experiment findings:\n"
+                        f"{parent_context}\n\n"
+                        "Task: Compose a new geological hypothesis that extends or "
+                        "contrasts with these findings."
+                    ),
+                    raw_response=hypothesis_target,
+                    pair_kind="T1",
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={"parent_ids": record.get("parent_ids", [])},
+                )
+            )
+
+        if self._is_novel(hypothesis, list(record.get("parent_hypotheses") or [])):
+            survey_context = self._sanitize_prompt_context(str(record.get("survey_context") or ""))
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("survey", {}),
+                    row_suffix="t2",
+                    prompt=(
+                        "Dataset context:\n"
+                        f"{survey_context}\n\n"
+                        "Task: Propose a de-novo geological hypothesis from the available data."
+                    ),
+                    raw_response=hypothesis_target,
+                    pair_kind="T2",
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={"novelty_routed": True},
+                )
+            )
+
+        data_spec = record.get("data_spec")
+        if isinstance(data_spec, dict) and data_spec:
+            files = self._data_spec_files(data_spec)
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("hypothesise", {}),
+                    row_suffix="t3",
+                    prompt=(
+                        f"Hypothesis: {hypothesis}\n\n"
+                        f"Available files: {', '.join(files) if files else 'see dataset context'}\n\n"
+                        "Task: Design the analysis plan for testing the hypothesis."
+                    ),
+                    raw_response=self._format_data_spec(data_spec),
+                    pair_kind="T3",
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={},
+                )
+            )
+
+        narrative = str(record.get("narrative") or "").strip()
+        if narrative:
+            feature = str(record.get("feature_layer_name") or "").strip()
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("rewrite", {}),
+                    row_suffix="t4",
+                    prompt=(
+                        f"Hypothesis: {hypothesis}\n\n"
+                        + (f"Feature built: {feature}\n\n" if feature else "")
+                        + "Task: Interpret whether the experiment was informative for "
+                        "geological model compression. Do not cite any BIC number."
+                    ),
+                    raw_response=narrative,
+                    pair_kind="T4",
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={
+                        "faithfulness": "post_hoc",
+                        "outcome_appended": False,
+                        "stripped_outcome_appendix": bool(record.get("outcome_appended")),
+                    },
+                )
+            )
+        return [row for row in rows if len(row["prompt"]) + len(row["raw_response"]) <= self._max_pair_chars]
+
+    def _is_novel(self, hypothesis: str, parent_hypotheses: list[str]) -> bool:
+        if not parent_hypotheses:
+            return True
+        child_words = _content_words(hypothesis)
+        if not child_words:
+            return False
+        parent_words: set[str] = set()
+        for ph in parent_hypotheses:
+            parent_words |= _content_words(ph)
+        novel_count = sum(1 for word in child_words if word not in parent_words)
+        return novel_count / len(child_words) > self._novelty_threshold
+
+    def _make_row(
+        self,
+        *,
+        episode: Any,
+        source_row: dict[str, Any],
+        row_suffix: str,
+        prompt: str,
+        raw_response: str,
+        pair_kind: str,
+        hypothesis: str,
+        provenance: dict[str, Any],
+        extra_meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build one fully-validated training row dict."""
+        prompt = self._sanitize_prompt_context(prompt)
+        record_meta: dict[str, Any] = {
+            "task_kind": pair_kind,
+            "pair_kind": pair_kind,
+            "hypothesis": hypothesis,
+            "field_provenance": provenance,
+            **extra_meta,
+        }
+        source_row_id = source_row.get("row_id") if isinstance(source_row, dict) else None
+        source_row_index = source_row.get("source_row_index", 0) if isinstance(source_row, dict) else 0
+        source_interaction_type = (
+            source_row.get("interaction_type") if isinstance(source_row, dict) else None
+        ) or "synthesized"
+        return {
+            "row_id": f"{episode.episode_id}:synth:{row_suffix}",
+            "parent_row_id": source_row_id if isinstance(source_row_id, str) and source_row_id else None,
+            "prompt": prompt,
+            "raw_response": raw_response,
+            "interaction_type": "synthesized",
+            "source_interaction_type": source_interaction_type,
+            "timestamp": self._source_timestamp(source_row, episode),
+            "success": True,
+            "error_message": None,
+            "episode_id": episode.episode_id,
+            "episode_index": episode.episode_index,
+            "generation_id": episode.generation_id,
+            "episode_score": episode.episode_score,
+            "episode_score_scope": "whole_episode",
+            "source_episode_id": episode.episode_id,
+            "source_row_index": int(source_row_index) if isinstance(source_row_index, int) else 0,
+            "workflow_step": f"synth_{pair_kind.lower()}",
+            "actor_role": "synthesizer",
+            "record_meta": record_meta,
+        }
+
+    @staticmethod
+    def _source_timestamp(source_row: dict[str, Any], episode: Any) -> str:
+        timestamp = source_row.get("timestamp") if isinstance(source_row, dict) else None
+        if isinstance(timestamp, str) and timestamp:
+            return timestamp
+        return str(getattr(episode, "generation_id", ""))
+
+    def _format_parent_summary(self, parent_context: list[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for i, pc in enumerate(parent_context, 1):
+            hyp = pc.get("hypothesis", "")
+            finding = pc.get("finding") or pc.get("response") or pc.get("result") or ""
+            line = f"Parent {i}: {hyp}"
+            if finding:
+                line += f"\nFinding: {finding}"
+            parts.append(line)
+        return "\n".join(parts)
+
+    def _format_data_spec(self, data_spec: Any) -> str:
+        if isinstance(data_spec, dict):
+            steps = data_spec.get("analysis_steps", [])
+            files = data_spec.get("files", data_spec.get("required_files", []))
+            target = data_spec.get("target_feature", "")
+            lines: list[str] = []
+            if target:
+                lines.append(f"Target feature: {target}")
+            if files:
+                lines.append(f"Required files: {', '.join(files)}")
+            if steps:
+                lines.append("Analysis steps:")
+                for j, step in enumerate(steps, 1):
+                    lines.append(f"  {j}. {step}")
+            if lines:
+                return "\n".join(lines)
+            return json.dumps(data_spec, sort_keys=True)
+        return str(data_spec)
+
+    @staticmethod
+    def _data_spec_files(data_spec: dict[str, Any]) -> list[str]:
+        for key in ("files", "required_files"):
+            value = data_spec.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, str) and item]
+        return []
+
+    def _hypothesis_head(self, hypothesis: str) -> str:
+        """Return a coarse lexical family key for balance capping."""
+        words = [word for word in re.findall(r"[a-z]+", hypothesis.lower()) if word not in _STOP_WORDS]
+        return " ".join(words[:7]) or "other"
+
+    def _curate(
+        self,
+        raw: list[tuple[Any, list[dict[str, Any]], float | None]],
+    ) -> list[tuple[Any, list[dict[str, Any]], float | None]]:
+        """Deduplicate exact pairs, then cap dominant hypothesis families.
+
+        T2 rows are always preserved even at the family cap.
+        """
+        best_by_pair: dict[str, tuple[int, int, float, dict[str, Any]]] = {}
+        for episode_index, (_episode, rows, bic) in enumerate(raw):
+            strength = abs(bic) if bic is not None else 0.0
+            for row_index, row in enumerate(rows):
+                key = self._pair_key(row)
+                current = best_by_pair.get(key)
+                if current is None or strength > current[2]:
+                    best_by_pair[key] = (episode_index, row_index, strength, row)
+
+        rows_by_episode: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(raw))}
+        for episode_index, row_index, _strength, row in sorted(best_by_pair.values()):
+            rows_by_episode[episode_index].append(row)
+
+        family_counts: dict[str, int] = {}
+        result: list[tuple[Any, list[dict[str, Any]], float | None]] = []
+        for index, (episode, _rows, bic) in enumerate(raw):
+            rows = rows_by_episode.get(index, [])
+            if not rows:
+                result.append((episode, [], bic))
+                continue
+            hypothesis = self._extract_hypothesis_from_rows(rows) or episode.episode_id
+            family = self._hypothesis_head(hypothesis)
+            if family_counts.get(family, 0) >= self._max_per_family:
+                rows = [row for row in rows if row.get("record_meta", {}).get("pair_kind") == "T2"]
+            else:
+                family_counts[family] = family_counts.get(family, 0) + 1
+            result.append((episode, rows, bic))
+        return result
+
+    @staticmethod
+    def _pair_key(row: dict[str, Any]) -> str:
+        prompt = re.sub(r"\s+", " ", str(row.get("prompt", ""))).strip().lower()
+        response = re.sub(r"\s+", " ", str(row.get("raw_response", ""))).strip().lower()
+        return hashlib.sha256(f"{prompt}\n---\n{response}".encode("utf-8")).hexdigest()
+
+    def _extract_hypothesis_from_rows(self, rows: list[dict[str, Any]]) -> str:
+        """Extract the hypothesis string from a T3 row's prompt (most reliable)."""
+        for row in rows:
+            if row.get("record_meta", {}).get("pair_kind") == "T3":
+                meta = row.get("record_meta", {})
+                if isinstance(meta, dict) and isinstance(meta.get("hypothesis"), str):
+                    return meta["hypothesis"].strip()
+                prompt: str = row.get("prompt", "")
+                # T3 prompt starts with "Hypothesis: <hypothesis>\n\n"
+                m = re.match(r"Hypothesis:\s*(.+?)(?:\n|$)", prompt)
+                if m:
+                    return m.group(1).strip()
+        return ""
+
+
 class FeatureHypothesisKazakhstanProposerRows:
     """SFT transform: keep proposer-persona turns, drop pure executor turns.
 
@@ -614,8 +1343,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
 
-    def training_data_transforms(self) -> tuple[FeatureHypothesisKazakhstanProposerRows, ...]:
-        return (FeatureHypothesisKazakhstanProposerRows(),)
+    def training_data_transforms(self) -> tuple[ExperimentReasoningRows, ...]:
+        return (ExperimentReasoningRows(),)
 
     # ------------------------------------------------------------------
     # Workflows
@@ -2025,6 +2754,20 @@ finally:
         from datetime import datetime as _dt
         from src.harness.recorder import TrajectoryRecord
 
+        phase_records = ctx.episode_context.get("phase_records", {})
+        terminal_record = ctx.episode_context.get("terminal_record", {})
+        experiment_record = _to_jsonable(
+            {
+                "schema_version": 1,
+                "source": "submit_rewrite",
+                "phase_records": phase_records if isinstance(phase_records, dict) else {},
+                "terminal_record": terminal_record if isinstance(terminal_record, dict) else {},
+                "crossbreed_context": ctx.episode_context.get("crossbreed_context", {}),
+                "workflow_kind": ctx.episode_context.get("workflow_kind"),
+                "duplicate_rejected": bool(ctx.episode_context.get("duplicate_rejected", False)),
+            }
+        )
+
         record = TrajectoryRecord(
             episode_id=ctx.episode_id,
             phase="rewrite_output",
@@ -2041,6 +2784,7 @@ finally:
                 "client": "task_synth",
                 "model": "task_synth",
                 "episode_id": ctx.episode_id,
+                "experiment_record": experiment_record,
             },
         )
         try:
@@ -3796,4 +4540,3 @@ finally:
         if len(parents) == 2 and frozenset(parents) in consummated:
             decayed *= _CONSUMMATED_DISCOUNT
         return decayed
-
