@@ -14,9 +14,6 @@
           allowUnfree = true;
         };
       };
-      llamaCppCuda = pkgs.llama-cpp.override {
-        cudaSupport = true;
-      };
       # Pip-installed wheels (torch, unsloth, triton, ...) dlopen these at runtime.
       wheelRuntimeLibs = with pkgs; [
         stdenv.cc.cc.lib
@@ -53,9 +50,6 @@
           # before baking it into Dockerfile.anvil. Dockerfile.foundry pins
           # its own foundry version for the in-image build.
           foundry
-
-          # Useful for local GGUF tooling and conversion workflows.
-          llamaCppCuda
         ];
 
         shellHook = ''
@@ -79,15 +73,6 @@
           if [ -z "$NSL_VLLM_NETWORK_MODE" ]; then
             export NSL_VLLM_NETWORK_MODE=hostip
           fi
-
-          # Convenience symlinks for llama.cpp binaries in-repo.
-          LLAMA_CPP_DIR="$PWD/.llama"
-          mkdir -p "$LLAMA_CPP_DIR"
-          for bin in llama-quantize llama-cli llama-server llama-gguf-split; do
-            if [ -e "${llamaCppCuda}/bin/$bin" ]; then
-              ln -sf "${llamaCppCuda}/bin/$bin" "$LLAMA_CPP_DIR/$bin"
-            fi
-          done
 
           echo "Nix dev shell ready (limiting-factor). Next: uv sync --all-extras"
         '';
