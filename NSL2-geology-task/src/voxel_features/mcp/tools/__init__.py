@@ -26,6 +26,10 @@ from voxel_features.mcp.tools.execution_tools import (
     execution_cancel,
     execution_reset_session,
 )
+from voxel_features.mcp.tools.search_tools import (
+    web_search_geological,
+    geonames_lookup,
+)
 
 __all__ = [
     # Feature tools
@@ -50,4 +54,7 @@ __all__ = [
     "execution_results",
     "execution_cancel",
     "execution_reset_session",
+    # Search tools
+    "web_search_geological",
+    "geonames_lookup",
 ]

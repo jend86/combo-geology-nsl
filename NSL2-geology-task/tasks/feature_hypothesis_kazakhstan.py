@@ -92,48 +92,11 @@ _KAZAKHSTAN_TENIZ_GRID = {
 }
 
 
-_SYSTEM_PROMPT = """You are in mineral exploration mode for Kazakhstan geological analysis.
+_SYSTEM_PROMPT = """You are analyzing Kazakhstan mineral prospects.
 
-Your goal is to identify informative feature layers that would improve compression 
-of a voxel-based world model. You are rewarded when adding a feature layer improves BIC on a ridge regression of the overall world model.
+Grid: lon 66.5–71.5°E, lat 49.5–52.5°N, depth 0–80m (200×200×8 voxels, ~1.75km/voxel).
 
-## Grid
-
-The voxel grid covers the Teniz Basin region of Kazakhstan:
-- Longitude: 66.5° to 71.5°E
-- Latitude: 49.5° to 52.5°N
-- Depth: 0 to 80m
-- Resolution: 200 × 200 × 8 voxels (~1.75km × 1.75km × 10m per voxel)
-
-## Scoring
-
-The workflow converts geographic analysis results into 3D feature layers through spatial operations:
-1. **Analysis phase** identifies geological patterns in coordinate data
-2. **Translation phase** converts findings to spatial commands (spatial_add_point, spatial_add_line)  
-3. **Automatic voxel mapping** projects geographic coordinates onto the 200×200×8 grid
-4. **BIC evaluation** tests if the new spatial feature improves joint prediction
-
-Feature layers are evaluated by:
-- BIC - n*ln(MSE) + k*ln(n) (joint ridge regression across all layers)
-
-A layer is admitted if bic_delta < 0.
-
-## Capabilities
-
-**Phase 1-3 (Hypothesis & Analysis):**
-- analysis_shell: Execute Python code in a sandbox with polars/duckdb/scipy
-- hypothesis_create: Register a falsifiable hypothesis
-- execution_submit/status/results/finalize: Async code execution with budget control
-
-**Phase 4 (Spatial Translation):**
-- spatial_add_point: Add point features at geographic coordinates with radius of effect
-- spatial_add_line: Add linear features (faults, veins) between two 3D points
-- spatial_query_region: Query existing spatial features in a geographic region
-- spatial_coord_to_voxel: Convert geographic coordinates to voxel indices
-- spatial_get_operations_log: Get history of spatial operations
-
-**Phase 5 (Rewrite):**
-- record_phase: Record workflow phase completion
+A feature layer is admitted if bic_delta < 0.
 """
 
 
@@ -506,6 +469,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
             episode_context["assigned_source"] = rotation["source"]
             episode_context["source_coverage"] = rotation["all_counts"]
+            episode_context["source_sample"] = self._read_source_sample(
+                rotation["source"], variation.dataset_dir
+            )
         
         results = [
             PopulationResult(
@@ -606,38 +572,16 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     ) -> Workflow:
         """Standard workflow: Survey → Hypothesise → Code → Translate → Evaluate → Rewrite"""
         
-        # Generate dynamic survey prompt with file assignment for this episode
-        survey_prompt = self._generate_survey_prompt_with_context(episode_context)
+        # Generate dynamic explore prompt with file assignment for this episode
+        survey_prompt = self._generate_explore_prompt(episode_context)
         
         return Workflow(
             steps=(
-                # HYPOTHESIS AGENT: Phase 1
+                # EXPLORE + HYPOTHESISE AGENT: Phase 1
                 WorkflowStep(
-                    name="survey",
+                    name="explore",
                     is_entry=True,
                     prompt=survey_prompt,
-                    inherit_all_capabilities=False,
-                    capabilities=(
-                        "analysis_shell",
-                        "record_phase",
-                    ),
-                    terminator_capabilities=("record_phase",),
-                    next_steps=("hypothesise",),
-                ),
-                
-                # HYPOTHESIS AGENT: Phase 2
-                WorkflowStep(
-                    name="hypothesise",
-                    prompt=(
-                        "Phase 2: Hypothesise\n\n"
-                        "Pick one candidate and state a falsifiable hypothesis.\n\n"
-                        "Include a data_spec with:\n"
-                        "- files: list of data sources to analyze\n"
-                        "- analysis: analytical approach\n"
-                        "- output: what the output should represent\n\n"
-                        "Close with:\n"
-                        "  record_phase(phase='hypothesise', hypothesis=..., data_spec=...)"
-                    ),
                     inherit_all_capabilities=False,
                     capabilities=(
                         "analysis_shell",
@@ -662,14 +606,16 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Performs statistical analysis, correlation, classification\n"
                         "   - Creates filtered DataFrames, computed arrays, summary statistics\n"
                         "   - Tests geological relationships and patterns\n"
-                        "   - Stores results in variables (these become artifacts automatically)\n"
+                        "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
+                        "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
                         "   execution_status(execution_id='...')  # Check status/progress\n"
                         "   execution_status(execution_id='...')  # Keep checking until 'completed'\n\n"
-                        "5. Get results and validate artifacts:\n"
-                        "   execution_results(execution_id='...')  # Get artifacts + output\n\n"
+                        "5. Get results and confirm artifacts exist:\n"
+                        "   execution_results(execution_id='...')  # MUST show artifact_files non-empty\n"
+                        "   If artifact_files is empty: fix your code to save files, then resubmit.\n\n"
                         "6. Finalize successful execution:\n"
                         "   execution_finalize(execution_id='...', success=True, summary='Brief summary of results')\n\n"
                         "**RETRY STRATEGY**:\n"
@@ -712,9 +658,17 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
                         "   **For geological structures (faults, anticlines, basins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
-                        "   **For statistical results without coordinates:**\n"
-                        "   - Use geological knowledge: regional trends, basin centers, prospect clusters\n"
-                        "   - Create spatial patterns: geological formations, mineral belts\n"
+                        "   **For text-based locations without coordinates:**\n"
+                        "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
+                        "   2. Use search tools with 3-call budget:\n"
+                        "      • search_web_geological('Vladimirovskoye geological formation')\n"
+                        "      • search_geonames_lookup('M42-I', 'Kazakhstan')\n"
+                        "   3. If search yields coordinates → use them\n"
+                        "   4. If search fails or is ambiguous → BE CREATIVE and make geological sense:\n"
+                        "      • 'southeastern' → bottom-right 25% of grid (lat<50.75°, lon>69.0°)\n"
+                        "      • 'northern edge' → top 12.5% (lat>51.75°)\n"
+                        "      • 'central basin' → around 69°E, 51°N\n"
+                        "      • When in doubt, distribute spatially and document your reasoning\n"
                         "3. Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
                         "   - Values must be floats or booleans: 'copper_potential' → 0.75\n"
@@ -740,6 +694,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "spatial_coord_to_voxel",
                         "spatial_get_operations_log",
                         "scoring_create_feature_layer",
+                        "search_web_geological",
+                        "search_geonames_lookup",
                     ),
                     terminator_capabilities=("scoring_create_feature_layer",),
                     next_steps=("rewrite",),
@@ -809,9 +765,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             next_steps=("code",),
         )
         new_steps = tuple(
-            crossbreed_hypothesise if s.name == "hypothesise" else s
+            crossbreed_hypothesise if s.name == "explore" else s
             for s in base_workflow.steps
-            if s.name != "survey"
         )
         return Workflow(steps=new_steps)
     
@@ -1058,6 +1013,39 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "required": ["name"],
                 },
             ),
+            Capability(
+                name="search_web_geological",
+                description="Search for geological location information using web search.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query (e.g., 'Vladimirovskoye geological formation')"
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            Capability(
+                name="search_geonames_lookup",
+                description="Look up geographical coordinates using OpenStreetMap.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "place_name": {
+                            "type": "string",
+                            "description": "Name to search for (e.g., 'Vladimirovskoye', 'M42-I')"
+                        },
+                        "region": {
+                            "type": "string",
+                            "description": "Geographic region to constrain search",
+                            "default": "Kazakhstan"
+                        },
+                    },
+                    "required": ["place_name"],
+                },
+            ),
         ]
     
     def execute_capability(
@@ -1098,6 +1086,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             return self._exec_spatial_capability(containers, args, ctx, name)
         elif name == "scoring_create_feature_layer":
             return self._exec_scoring_capability(containers, args, ctx, name)
+        elif name.startswith("search_"):
+            return self._exec_search_capability(containers, args, ctx, name)
         else:
             return CapabilityResult(name, success=False, error=f"Unknown capability: {name}")
     
@@ -1180,7 +1170,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         
         # Auto-enhance data_spec for coding phase with Kazakhstan data
         if phase == "hypothesise" and "data_spec" in output:
-            output["data_spec"] = self._enhance_data_spec_kazakhstan(output["data_spec"])
+            output["data_spec"] = self._enhance_data_spec_kazakhstan(
+                output["data_spec"], ctx.episode_context
+            )
         
         return CapabilityResult(
             "phase_get",
@@ -1188,91 +1180,100 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             success=True,
         )
     
-    def _enhance_data_spec_kazakhstan(self, data_spec: dict[str, Any]) -> dict[str, Any]:
+    def _enhance_data_spec_kazakhstan(
+        self, data_spec: dict[str, Any], episode_context: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Enhance data_spec with Kazakhstan-specific file guidance and correct paths."""
         import os
         enhanced = data_spec.copy()
         files = enhanced.get("files", [])
         
-        # Add the known Kazakhstan GeoJSON files with correct paths
-        kazakhstan_geojson_files = [
-            {
-                "file": "converted_spatial_data/copper_prospects.geojson",
+        # Known GeoJSON schemas — only applied when the agent references that file.
+        # Do NOT inject the full dataset catalogue unconditionally: the code agent
+        # should work with what the hypothesis specifies, not whatever looks most
+        # structured in a global list.
+        _GEOJSON_SCHEMAS = {
+            "copper_prospects.geojson": {
                 "full_path": "/workspace/input/converted_spatial_data/copper_prospects.geojson",
                 "type": "geojson",
                 "geometry": "points",
                 "properties": ["name", "tonnage", "grade", "coordinates", "deposit_type"],
-                "note": "113 copper prospects with economic data - use geopandas.read_file(full_path)",
-                "count": 113,
-                "description": "Sediment-hosted copper prospects in Teniz Basin"
+                "note": "113 copper prospects — use geopandas.read_file(full_path)",
             },
-            {
-                "file": "converted_spatial_data/anticlines_synclines.geojson", 
+            "anticlines_synclines.geojson": {
                 "full_path": "/workspace/input/converted_spatial_data/anticlines_synclines.geojson",
                 "type": "geojson",
                 "geometry": "linestrings/polygons",
                 "properties": ["structure_type", "geological_age", "fold_axis"],
-                "note": "33 geological fold structures - use geopandas.read_file(full_path)",
-                "count": 33,
-                "description": "Regional anticline and syncline structures"
+                "note": "33 fold structures — use geopandas.read_file(full_path)",
             },
-            {
-                "file": "converted_spatial_data/assessment_tract.geojson",
-                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson", 
+            "assessment_tract.geojson": {
+                "full_path": "/workspace/input/converted_spatial_data/assessment_tract.geojson",
                 "type": "geojson",
                 "geometry": "polygon",
                 "properties": ["area_km2", "tract_name", "assessment_type"],
-                "note": "Teniz Basin boundary (49,714 km²) - use geopandas.read_file(full_path)",
-                "area_km2": 49714,
-                "description": "USGS assessment tract boundary"
+                "note": "Teniz Basin boundary (49,714 km²) — use geopandas.read_file(full_path)",
             },
-            {
-                "file": "converted_spatial_data/copper_prospects_aoi.geojson",
+            "copper_prospects_aoi.geojson": {
                 "full_path": "/workspace/input/converted_spatial_data/copper_prospects_aoi.geojson",
-                "type": "geojson", 
+                "type": "geojson",
                 "geometry": "polygons",
-                "properties": ["area_of_interest", "prospect_density"],
-                "note": "Copper prospect areas of interest - use geopandas.read_file(full_path)",
-                "description": "AOI polygons for copper exploration"
-            }
-        ]
-        
-        # Add Russian geological survey data
-        russian_survey_files = [
-            {
-                "file": "36572_Smolianova_1984",
-                "full_path": "/workspace/input/36572_Smolianova_1984",
-                "type": "directory",
-                "language": "Russian/English",
-                "content": "geological survey texts and drill hole data",
-                "note": "579 Russian geological survey files - use os.listdir() to explore",
-                "file_count": 579,
-                "description": "Comprehensive geological survey (Smolianova 1984)"
-            }
-        ]
-        
-        # Add USGS data
-        usgs_files = [
-            {
-                "file": "USGS", 
-                "full_path": "/workspace/input/USGS",
-                "type": "directory",
-                "content": "USGS assessment data and reports",
-                "note": "USGS English-language data - use os.listdir() to explore",
-                "description": "USGS Teniz Basin assessment data"
-            }
-        ]
-        
-        # Combine all known file specifications, then append any agent-supplied
-        # extras the enhancer doesn't already cover. Previously enhanced[
-        # "file_specs"] was overwritten with `all_files` after the extras were
-        # appended to a separate `file_specs` list, silently dropping the
-        # agent's own file list.
-        file_specs = list(kazakhstan_geojson_files + russian_survey_files + usgs_files)
-        known_file_keys = {spec["file"] for spec in file_specs}
+                "properties": ["area_of_interest"],
+                "note": "AOI polygons — use geopandas.read_file(full_path)",
+            },
+        }
+
+        # Build file_specs from files the agent explicitly listed — add schema
+        # metadata for known types, leave others with minimal guidance.
+        file_specs = []
         for file_path in files:
-            if not any(known in file_path for known in known_file_keys):
-                file_specs.append({"file": file_path, "type": "unknown", "note": "Additional file - check format"})
+            matched = False
+            for key, schema in _GEOJSON_SCHEMAS.items():
+                if key in file_path:
+                    file_specs.append({"file": file_path, **schema})
+                    matched = True
+                    break
+            if not matched:
+                if file_path.endswith(".md"):
+                    file_specs.append({
+                        "file": file_path,
+                        "full_path": file_path,
+                        "type": "markdown_chunk",
+                        "note": "Read with open(file_path).read()",
+                    })
+                elif "36572_Smolianova_1984" in file_path or "USGS" in file_path:
+                    file_specs.append({
+                        "file": file_path,
+                        "full_path": file_path,
+                        "type": "text",
+                        "note": "Read with open(file_path).read()",
+                    })
+                else:
+                    file_specs.append({"file": file_path, "type": "unknown"})
+
+        # Prepend the assigned source so the code agent always sees it first
+        assigned = (episode_context or {}).get("assigned_source", {})
+        if assigned:
+            apath = assigned.get("path", "")
+            aglob = assigned.get("glob_pattern")
+            if aglob:
+                patterns = [aglob] if isinstance(aglob, str) else aglob
+                for p in patterns:
+                    resolved = f"/workspace/input/{apath}/{p}"
+                    if not any(resolved in str(s.get("file", "")) for s in file_specs):
+                        file_specs.insert(0, {
+                            "file": resolved,
+                            "type": "md_chunks",
+                            "note": f"Assigned section — {assigned.get('key', '')}: use glob to enumerate",
+                        })
+            elif apath:
+                resolved = f"/workspace/input/{apath}"
+                if not any(resolved in str(s.get("file", "")) for s in file_specs):
+                    file_specs.insert(0, {
+                        "file": resolved,
+                        "full_path": resolved,
+                        "note": f"Assigned source — {assigned.get('key', '')}",
+                    })
 
         enhanced["file_specs"] = file_specs
         enhanced["kazakhstan_data_structure"] = {
@@ -1329,26 +1330,48 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         execution_id = args.get("execution_id", "")
         success = args.get("success", False)
         summary = args.get("summary", "")
-        
+
         if not execution_id:
             return CapabilityResult("execution_finalize", success=False, error="execution_id required")
-        
-        # For now, simple implementation - can be enhanced with actual execution system
+
         phase_records = ctx.episode_context.setdefault("phase_records", {})
+        code_record = phase_records.get("code", {})
+
+        # Gate: if the agent reports success, artifacts must exist.
+        # Returning success=False here prevents the terminator from firing,
+        # forcing a retry within the 3-attempt budget.
+        if success and not code_record.get("artifact_files"):
+            return CapabilityResult(
+                "execution_finalize",
+                success=False,
+                error=(
+                    "Cannot finalize: no artifact files were registered. "
+                    "Your code must save output to /tmp/ "
+                    "(e.g. df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)). "
+                    "Fix the code, resubmit with execution_submit, call execution_results "
+                    "to confirm artifact_files is non-empty, then call execution_finalize again."
+                ),
+            )
+
         phase_records["code"] = {
-            "code_executed": "Kazakhstan analysis executed",
+            **code_record,
+            "code_executed": code_record.get("code_executed", "Kazakhstan analysis executed"),
             "result_summary": summary,
             "success": success,
             "timestamp": time.time(),
             "execution_id": execution_id,
+            "artifact_files": code_record.get("artifact_files", []),
+            "artifact_directory": code_record.get("artifact_directory", ""),
         }
-        
+
         return CapabilityResult(
             "execution_finalize",
             output={
                 "execution_id": execution_id,
                 "success": success,
                 "summary": summary,
+                "artifacts_count": len(code_record.get("artifact_files", [])),
+                "artifact_files": code_record.get("artifact_files", []),
             },
             success=True,
         )
@@ -1419,7 +1442,20 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "submission_timestamp": time.time(),
                         "region": "kazakhstan",
                     }
-            
+
+            # Store artifact info in context when execution_results is called
+            # so execution_finalize can verify and record them
+            if capability_name == "execution_results":
+                artifact_files = result.get("artifact_files", [])
+                artifact_directory = result.get("artifact_directory", "")
+                phase_records = ctx.episode_context.setdefault("phase_records", {})
+                existing_code = phase_records.get("code", {})
+                phase_records["code"] = {
+                    **existing_code,
+                    "artifact_files": artifact_files,
+                    "artifact_directory": artifact_directory,
+                }
+
             return CapabilityResult(
                 capability_name,
                 output=_to_jsonable(result),
@@ -1849,6 +1885,69 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 error=f"Kazakhstan scoring capability execution failed: {str(e)}",
             )
     
+    def _exec_search_capability(
+        self,
+        containers: list[Container],
+        args: dict[str, Any],
+        ctx: CapabilityExecutionContext,
+        capability_name: str,
+    ) -> CapabilityResult:
+        """Execute search tool capability for geological location resolution."""
+        
+        print(f"🔍 DEBUG: Starting search capability: {capability_name}")
+        print(f"🔍 DEBUG: Args: {args}")
+        
+        try:
+            # Import search tools directly
+            import sys
+            from pathlib import Path
+            
+            # Add the tools directory to Python path
+            tools_path = str(Path(__file__).parent.parent / "src" / "voxel_features" / "mcp" / "tools")
+            if tools_path not in sys.path:
+                sys.path.append(tools_path)
+            
+            # Import search functions
+            print("🔍 DEBUG: Importing search tools...")
+            from search_tools import web_search_geological, geonames_lookup
+            print("🔍 DEBUG: ✅ Search imports successful")
+            
+            # Route to appropriate search function
+            print(f"🔍 DEBUG: Routing to tool: {capability_name}")
+            if capability_name == "search_web_geological":
+                print("🔍 DEBUG: Calling web_search_geological...")
+                result = web_search_geological(**args)
+            elif capability_name == "search_geonames_lookup":
+                print("🔍 DEBUG: Calling geonames_lookup...")
+                result = geonames_lookup(**args)
+            else:
+                print(f"🔍 DEBUG: ❌ Unknown search capability: {capability_name}")
+                return CapabilityResult(
+                    capability_name,
+                    success=False,
+                    error=f"Unknown search capability: {capability_name}",
+                )
+            
+            print(f"🔍 DEBUG: ✅ Search tool result: {result}")
+            
+            # Return result
+            return CapabilityResult(
+                capability_name,
+                output=result,
+                success=result.get("success", False),
+                error=result.get("error"),
+            )
+            
+        except Exception as e:
+            print(f"🔍 DEBUG: ❌ Exception in search capability: {e}")
+            import traceback
+            traceback.print_exc()
+            return CapabilityResult(
+                capability_name,
+                success=False,
+                error=f"Search capability execution failed: {str(e)}",
+            )
+    
     # ------------------------------------------------------------------
     # State measurement and rewards
     # ------------------------------------------------------------------
@@ -2005,39 +2104,25 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         except Exception:
             return 0
     
-    def _generate_survey_prompt_with_context(self, episode_context: dict[str, Any]) -> str:
-        """Generate survey prompt with file assignment and coverage map.
+    def _generate_explore_prompt(self, episode_context: dict[str, Any]) -> str:
+        """Generate the combined explore+hypothesise prompt for the survey workflow.
 
         Each episode is anchored to a specific source selected at populate() time.
-        The prompt shows a neutral coverage map (counts only, no hypothesis text)
-        so the agent is never primed with past concepts.
-
-        Entries with a ``glob_pattern`` field receive a code snippet showing how
-        to enumerate that section's files; plain-path entries get a direct path.
+        Sample content is pre-read and injected so the agent sees real data immediately.
         """
         assigned = episode_context.get("assigned_source", {})
-        coverage = episode_context.get("source_coverage", {})
 
-        # --- Build the coverage map (key labels + counts, no concept words) ---
-        coverage_lines = []
-        for src in _KAZAKHSTAN_SOURCE_FILES:
-            count = coverage.get(src["key"], 0)
-            marker = "  ← assigned this episode" if src["key"] == assigned.get("key") else ""
-            coverage_lines.append(f"  {src['key']}: {count} episode(s){marker}")
-        coverage_block = "\n".join(coverage_lines)
-
-        # --- Mandatory assignment block ---
+        # --- Assignment + file access block ---
         if assigned:
             glob_pattern = assigned.get("glob_pattern")
             if glob_pattern:
-                # Section-level chunk entry — show glob enumeration snippet
                 patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
                 glob_lines = "\n".join(
                     f"    files += glob.glob(os.path.join(dataset_dir, '{assigned['path']}', '{p}'))"
                     for p in patterns
                 )
                 assignment_block = (
-                    f"YOUR ASSIGNED SOURCE FOR THIS EPISODE\n"
+                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
                     f"  Section: {assigned['key']}\n"
                     f"  Details: {assigned['description']}\n\n"
                     f"To list the files in this section, run in analysis_shell:\n"
@@ -2049,37 +2134,49 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     f"files = sorted(files)\n"
                     f"print(f'Found {{len(files)}} files:')\n"
                     f"for f in files: print(f)\n"
-                    f"```\n\n"
-                    f"Read the files in this section with analysis_shell, then derive\n"
-                    f"your hypothesis from what you find there.\n"
-                    f"You MUST stay within this section — do not browse other directories.\n"
+                    f"```\n"
                 )
             else:
-                # Plain file or directory entry
                 assignment_block = (
-                    f"YOUR ASSIGNED SOURCE FILE FOR THIS EPISODE\n"
-                    f"  Path   : {assigned['path']}\n"
-                    f"  Details: {assigned['description']}\n\n"
-                    f"You MUST derive your hypothesis candidate from this file.\n"
-                    f"Do not freely browse other files during the survey phase.\n"
-                    f"Open and examine the assigned file first with analysis_shell.\n"
+                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
+                    f"  Path   : /workspace/input/{assigned['path']}\n"
+                    f"  Details: {assigned['description']}\n"
                 )
         else:
             assignment_block = (
-                "Explore the Kazakhstan Teniz Basin dataset to identify regional feature opportunities.\n"
+                "Explore the Kazakhstan Teniz Basin dataset to identify a regional feature opportunity.\n"
             )
 
+        # --- Sample content block ---
+        sample = episode_context.get("source_sample", "")
+        if sample:
+            sample_block = (
+                "\nSAMPLE CONTENT FROM YOUR ASSIGNED SOURCE\n"
+                "─────────────────────────────────────────\n"
+                + sample
+                + "\n"
+            )
+        else:
+            sample_block = ""
+
         prompt = (
-            "Phase 1: Survey\n\n"
+            "Phase 1: Explore and Hypothesise\n\n"
             + assignment_block
+            + sample_block
             + "\n"
-            "SOURCE COVERAGE (episodes completed per source — for situational awareness only):\n"
-            + coverage_block
-            + "\n\n"
-            "Use analysis_shell to read and explore your assigned source, then identify\n"
-            "ONE promising feature layer candidate grounded in what you find there.\n\n"
-            "Close with:\n"
-            "  record_phase(phase='survey', candidates=[...])"
+            "Use analysis_shell to read and explore your assigned source.\n"
+            "When you have identified a promising geological pattern, record ONE falsifiable hypothesis:\n\n"
+            "  record_phase(\n"
+            "      phase='hypothesise',\n"
+            "      hypothesis='...',\n"
+            "      data_spec={\n"
+            "          'files': ['/workspace/input/{your_assigned_path}', ...],\n"
+            "          'analysis': '...',\n"
+            "          'output': '...'\n"
+            "      }\n"
+            "  )\n\n"
+            "Your hypothesis MUST be grounded in what you found in the assigned source above.\n"
+            "Do NOT introduce topics not present in the assigned source."
         )
         return prompt
 
@@ -2115,6 +2212,111 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             logger.warning(f"Could not write file_rotation_state.json: {exc}")
 
         return {"source": assigned, "all_counts": counts}
+
+    def _read_source_sample(
+        self,
+        assigned: dict[str, Any],
+        dataset_dir: str,
+    ) -> str:
+        """Read a compact sample from the assigned source for injection into the survey prompt.
+
+        Returns a formatted string block capped at ~2500 chars total.
+        Silently returns an empty string on any read error or missing path.
+
+        Sampling strategy by entry type:
+        - glob_pattern (md chunks): pick first, middle, last file; read ~800 chars each.
+        - GeoJSON: property schema + first 3 features (properties only, no geometry).
+        - CSV: header row + first 5 data rows.
+        - Directory: list up to 10 files + read first 2 files ~800 chars each.
+        """
+        import csv as csv_mod
+        import glob as glob_mod
+        import json as json_mod
+
+        base = Path(dataset_dir)
+        path = assigned.get("path", "")
+        glob_pattern = assigned.get("glob_pattern")
+        full_path = base / path
+
+        MAX_PER_FILE = 800
+        MAX_TOTAL = 2500
+        parts: list[str] = []
+
+        try:
+            if glob_pattern:
+                # Section-level markdown chunks — pick first, middle, last
+                patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
+                files: list[str] = []
+                for p in patterns:
+                    files.extend(glob_mod.glob(str(base / path / p)))
+                files = sorted(set(files))
+                if not files:
+                    return ""
+                indices = sorted({0, len(files) // 2, len(files) - 1})
+                selected = [files[i] for i in indices]
+                for fpath in selected:
+                    try:
+                        text = Path(fpath).read_text(encoding="utf-8", errors="replace")
+                        snippet = text[:MAX_PER_FILE]
+                        if len(text) > MAX_PER_FILE:
+                            snippet += "\n[…truncated]"
+                        parts.append(f"--- {Path(fpath).name} ---\n{snippet}")
+                    except Exception:
+                        pass
+
+            elif path.endswith(".geojson"):
+                # GeoJSON: schema + first 3 features (properties only, no geometry)
+                with open(full_path, encoding="utf-8") as fh:
+                    data = json_mod.load(fh)
+                features = data.get("features", [])
+                if features:
+                    keys = list(features[0].get("properties", {}).keys())
+                    parts.append(f"Property columns: {keys}")
+                    for feat in features[:3]:
+                        props = feat.get("properties", {})
+                        geom_type = feat.get("geometry", {}).get("type", "?")
+                        row = json_mod.dumps(props)
+                        parts.append(f"  [{geom_type}] {row[:280]}")
+
+            elif path.lower().endswith(".csv"):
+                # CSV: header row + first 5 data rows (always include header)
+                with open(full_path, encoding="utf-8", errors="replace") as fh:
+                    reader = csv_mod.reader(fh)
+                    rows: list[str] = []
+                    for i, row in enumerate(reader):
+                        rows.append(",".join(str(c) for c in row[:15]))
+                        if i >= 5:
+                            break
+                parts.append("\n".join(rows))
+
+            elif full_path.is_dir():
+                # Directory: list files + read first 2
+                all_files = sorted(p for p in full_path.iterdir() if p.is_file())
+                file_list = [fp.name for fp in all_files[:10]]
+                parts.append("Files: " + ", ".join(file_list))
+                for fp in all_files[:2]:
+                    try:
+                        text = fp.read_text(encoding="utf-8", errors="replace")
+                        snippet = text[:MAX_PER_FILE]
+                        if len(text) > MAX_PER_FILE:
+                            snippet += "\n[…truncated]"
+                        parts.append(f"--- {fp.name} ---\n{snippet}")
+                    except Exception:
+                        pass
+
+            else:
+                # Single file fallback
+                if full_path.is_file():
+                    text = full_path.read_text(encoding="utf-8", errors="replace")
+                    parts.append(text[:MAX_PER_FILE])
+
+        except Exception:
+            return ""
+
+        combined = "\n\n".join(parts)
+        if len(combined) > MAX_TOTAL:
+            combined = combined[:MAX_TOTAL] + "\n[…truncated]"
+        return combined
 
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> bool:
         """Check if there are crossbreed pairs available for Kazakhstan."""
