@@ -19,6 +19,11 @@ TerminationCategory = Literal[
     "repetition_collapse",
     "budget_exhausted",
     "wall_clock",
+    # Backend faults (not the agent's): a true outage that quarantines the
+    # endpoint, vs a request timeout that is benign and retryable (must NOT
+    # quarantine — a single timeout would breach the capacity floor).
+    "endpoint_unavailable",
+    "inference_timeout",
 ]
 
 

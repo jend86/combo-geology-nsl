@@ -305,11 +305,8 @@ def run_generation_sequential(
     has_admission = _has_any_admission(generation_data.all_episodes)
 
     def _budget_exhausted() -> bool:
-        # Absolute cap always wins regardless of bootstrap vs regular mode.
-        if episode_index >= max_episode_count:
-            return True
         if max_bootstrap_count is None:
-            return False
+            return episode_index >= max_episode_count
         # Until the pool has any admitted graph, the next episode is bootstrap;
         # only the bootstrap cap applies. Once we've admitted at least one
         # graph, the pool is non-empty and future episodes run the regular

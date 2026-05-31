@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime
 import itertools
 import json
@@ -15,6 +16,7 @@ from typing import Any
 from loguru import logger
 
 import src.parallel as parallel_runtime
+from src.backend.endpoint_pool import EndpointPoolUnavailable
 from src.execution.backend_runtime import BackendRuntime, _coerce_runtime
 from src.execution.episode_runner import run_single_episode
 from src.execution.telemetry import (
@@ -23,13 +25,9 @@ from src.execution.telemetry import (
 )
 from src.harness.loader import construct_harness
 from src.parallel import (
-    GlobalCircuitBreaker,
-    SlotCircuitBreaker,
     StopReason,
     ThreadSafeGenerationCollector,
     WorkerSlot,
-    create_worker_slots,
-    teardown_worker_slots,
 )
 from src.training_data.transforms import (
     TARGET_COUNT_BASIS,
@@ -44,6 +42,19 @@ from src.typing.training import (
     save_generation_checkpoint,
 )
 from src.typing.trajectory import GenerationData
+
+
+def _episode_triggers_endpoint_quarantine(error_category: str | None) -> bool:
+    """Whether an episode's failure should quarantine its inference endpoint.
+
+    Only a genuine outage (``endpoint_unavailable``) does. A request timeout
+    (``inference_timeout``) is a benign, retryable failure — the endpoint is
+    healthy, the model was just slow (e.g. decode starvation). Quarantining the
+    (possibly sole) endpoint on a timeout would breach the capacity floor and
+    abort the whole run, so it must not. Mirrors ``EndpointAwareGenner``, which
+    keys quarantine on the ``inference_unavailable`` prefix, not on timeouts.
+    """
+    return error_category == "endpoint_unavailable"
 
 
 @contextmanager
@@ -199,6 +210,7 @@ def _run_generation_parallel(
     global_circuit = parallel_runtime.GlobalCircuitBreaker(
         [s.circuit_breaker for s in slots], threshold=0.5
     )
+    endpoint_pool = rt.endpoint_pool
     file_lock = threading.Lock()
     stop_event = threading.Event()
     stop_reason = StopReason()
@@ -236,6 +248,7 @@ def _run_generation_parallel(
         rt.metrics.start_utilization_sampling(
             inference_metrics_url=rt.metrics.inference_metrics_url,
             inference_metrics_backend=rt.metrics.inference_metrics_backend,
+            inference_metrics_api_key=getattr(rt.metrics, "inference_metrics_api_key", None),
         )
 
     def _display_update_slot(slot_id: int, **kwargs: Any) -> None:
@@ -245,6 +258,29 @@ def _run_generation_parallel(
     def _signal_stop(reason: str) -> None:
         stop_reason.set(reason)
         stop_event.set()
+
+    def _endpoint_capacity_floor_tripped() -> bool:
+        return bool(
+            endpoint_pool is not None and endpoint_pool.below_capacity_floor()
+        )
+
+    def _mark_endpoint_unavailable(lease: Any, detail: str | None) -> None:
+        if endpoint_pool is None or lease is None:
+            return
+        if endpoint_pool.is_healthy(lease.endpoint_id):
+            endpoint_pool.mark_unhealthy(lease.endpoint_id, detail)
+        if endpoint_pool.below_capacity_floor():
+            _signal_stop("endpoint_capacity_floor")
+
+    def _annotate_endpoint_metadata(episode: Any, lease: Any) -> None:
+        if lease is None:
+            return
+        trajectory = getattr(episode, "trajectory", None)
+        if not isinstance(trajectory, dict):
+            return
+        extra = trajectory.setdefault("extra", {})
+        if isinstance(extra, dict):
+            extra["inference_endpoint"] = dict(lease.metadata)
 
     def _make_telemetry_observer(slot_id: int):
         active_display = display
@@ -295,6 +331,9 @@ def _run_generation_parallel(
             and not collector.should_stop(target_rows)
             and not global_circuit.is_tripped()
         ):
+            if _endpoint_capacity_floor_tripped():
+                _signal_stop("endpoint_capacity_floor")
+                break
             with counter_lock:
                 episode_index = next(episode_counter)
             if episode_index >= max_episodes:
@@ -356,21 +395,49 @@ def _run_generation_parallel(
                     _display_update_slot(slot.slot_id, status="running")
                     continue
 
-                episode = run_single_episode(
-                    slot_runtime,
-                    container_manager=slot.container_manager,
-                    generation_id=generation_id,
-                    episode_index=episode_index,
-                    variation_index=variation_index,
-                    population_outcome=population_outcome,
-                    verified=verified,
-                    parallel_episodes=n_workers,
-                    stop_event=stop_event,
-                    stop_reason=stop_reason,
-                    variation=selected_variation,
-                    telemetry_observer=_make_telemetry_observer(slot.slot_id),
-                    harness_session=slot.harness_session,
-                )
+                lease = None
+                try:
+                    if endpoint_pool is not None:
+                        lease = endpoint_pool.lease(
+                            home_key=slot.slot_id,
+                            stop_event=stop_event,
+                        )
+                        episode_runtime = replace(slot_runtime, genner=lease.genner)
+                    else:
+                        episode_runtime = slot_runtime
+                except EndpointPoolUnavailable as exc:
+                    logger.warning(
+                        f"Slot {slot.slot_id}: endpoint lease unavailable - {exc}"
+                    )
+                    _signal_stop(
+                        "endpoint_capacity_floor"
+                        if _endpoint_capacity_floor_tripped()
+                        else "endpoint_pool_unavailable"
+                    )
+                    break
+
+                try:
+                    episode = run_single_episode(
+                        episode_runtime,
+                        container_manager=slot.container_manager,
+                        generation_id=generation_id,
+                        episode_index=episode_index,
+                        variation_index=variation_index,
+                        population_outcome=population_outcome,
+                        verified=verified,
+                        parallel_episodes=n_workers,
+                        stop_event=stop_event,
+                        stop_reason=stop_reason,
+                        variation=selected_variation,
+                        telemetry_observer=_make_telemetry_observer(slot.slot_id),
+                        harness_session=slot.harness_session,
+                    )
+                    _annotate_endpoint_metadata(episode, lease)
+                    if _episode_triggers_endpoint_quarantine(episode.error_category):
+                        _mark_endpoint_unavailable(lease, episode.error_message)
+                finally:
+                    if endpoint_pool is not None:
+                        endpoint_pool.release(lease)
 
                 if episode.error_message == "container population verification failed":
                     slot.circuit_breaker.record_verification_failure()
@@ -381,6 +448,7 @@ def _run_generation_parallel(
                 elif episode.error_category in {
                     "context_overflow",
                     "repetition_collapse",
+                    "inference_timeout",
                 }:
                     slot.circuit_breaker.record_benign_abort()
                 elif episode.error_category == "harness_error":
@@ -388,6 +456,12 @@ def _run_generation_parallel(
                     logger.warning(
                         f"Slot {slot.slot_id} episode {episode_index}: "
                         f"harness error - {episode.error_message}"
+                    )
+                elif episode.error_category == "endpoint_unavailable":
+                    slot.circuit_breaker.record_benign_abort()
+                    logger.warning(
+                        f"Slot {slot.slot_id} episode {episode_index}: "
+                        f"endpoint unavailable - {episode.error_message}"
                     )
                 else:
                     slot.circuit_breaker.record_success()

@@ -112,6 +112,30 @@ class TestBuildVllmDockerConfig(unittest.TestCase):
 
         self.assertEqual(vllm_config.model, "Qwen/Qwen2.5-7B-Instruct")
 
+    def test_vllm_endpoint_list_config_parses(self) -> None:
+        config = make_app_config("vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ")
+        config.vllm = AppConfig.VllmConfig(
+            endpoints=[
+                {
+                    "base_url": "https://ep0.example/v1",
+                    "capacity": 6,
+                    "api_key_env": "VLLM_EP0_KEY",
+                },
+                {"base_url": "https://ep1.example", "capacity": 12},
+            ]
+        )
+
+        self.assertEqual(len(config.vllm.endpoints), 2)
+        self.assertEqual(config.vllm.endpoints[0].base_url, "https://ep0.example/v1")
+        self.assertEqual(config.vllm.endpoints[0].capacity, 6)
+        self.assertEqual(config.vllm.endpoints[0].api_key_env, "VLLM_EP0_KEY")
+
+    def test_vllm_legacy_endpoint_string_config_parses(self) -> None:
+        config = make_app_config("vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ")
+        config.vllm = AppConfig.VllmConfig(endpoint="http://127.0.0.1:8000")
+
+        self.assertEqual(config.vllm.endpoint, "http://127.0.0.1:8000")
+
     def test_build_vllm_config_infers_hermes_parser_for_qwen_models(self) -> None:
         from src.backend.vllm import _build_vllm_config
 
@@ -699,6 +723,57 @@ class TestVllmContainerLifecycle(unittest.TestCase):
         with setup_vllm(config) as session:
             self.assertIsNotNone(session.genner)
             self.assertIsNone(session.process)
+            self.assertIn("endpoint_pool", session.extras)
+            pool = session.extras["endpoint_pool"]
+            self.assertEqual(pool.endpoint_ids(), ["vllm-0"])
+
+    @patch.dict(os.environ, {"VLLM_EP0_KEY": "secret-0"}, clear=False)
+    @patch("src.backend.vllm.get_genner")
+    @patch("src.backend.vllm.OpenAI")
+    @patch("src.backend.vllm._is_http_ready_with_auth", return_value=True)
+    def test_configured_external_endpoints_build_endpoint_pool(
+        self,
+        mock_ready: MagicMock,
+        mock_openai_cls: MagicMock,
+        mock_get_genner: MagicMock,
+    ) -> None:
+        from src.backend.vllm import setup_vllm
+
+        fake0 = MagicMock(spec=Genner)
+        fake0.identifier = "vllm"
+        fake1 = MagicMock(spec=Genner)
+        fake1.identifier = "vllm"
+        mock_get_genner.side_effect = [fake0, fake1]
+        config = make_app_config("vllm:Qwen/Qwen2.5-7B-Instruct")
+        config.vllm = AppConfig.VllmConfig(
+            endpoints=[
+                {
+                    "id": "local",
+                    "base_url": "http://127.0.0.1:8000",
+                    "capacity": 3,
+                    "api_key_env": "VLLM_EP0_KEY",
+                },
+                {
+                    "id": "remote",
+                    "base_url": "https://remote.example/v1",
+                    "capacity": 5,
+                },
+            ]
+        )
+
+        with setup_vllm(config) as session:
+            pool = session.extras["endpoint_pool"]
+            self.assertEqual(pool.endpoint_ids(), ["local", "remote"])
+            self.assertEqual(pool.healthy_capacity(), 8)
+            self.assertEqual(session.extras["metrics_api_key"], "secret-0")
+
+        self.assertEqual(mock_openai_cls.call_count, 2)
+        self.assertEqual(mock_openai_cls.call_args_list[0].kwargs["api_key"], "secret-0")
+        self.assertEqual(mock_openai_cls.call_args_list[1].kwargs["api_key"], "dummy")
+        mock_ready.assert_any_call(
+            "http://127.0.0.1:8000/v1/models",
+            api_key="secret-0",
+        )
 
     @patch("src.backend.vllm.get_genner")
     @patch("src.backend.vllm.OpenAI")
@@ -835,7 +910,7 @@ class TestVllmContainerLifecycle(unittest.TestCase):
 
         config = make_app_config("vllm:Qwen/Qwen2.5-7B-Instruct")
 
-        with setup_vllm(config) as session:
+        with setup_vllm(config):
             stale_container.remove.assert_called_once_with(force=True)
             mock_start.assert_called_once()
 

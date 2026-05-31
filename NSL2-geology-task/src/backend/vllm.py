@@ -4,6 +4,7 @@ import os
 import socket
 import subprocess
 import time
+import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -14,6 +15,7 @@ from docker.errors import NotFound
 from loguru import logger
 from openai import OpenAI
 
+from src.backend.endpoint_pool import EndpointPool, EndpointState
 from src.backend.utils import is_http_ready
 from src.genner import get_genner
 from src.genner.config import VllmConfig
@@ -328,7 +330,12 @@ def wait_for_gpu_memory_release(
             return
 
 
-def _build_vllm_config(app_config: AppConfig, endpoint: str) -> VllmConfig:
+def _build_vllm_config(
+    app_config: AppConfig,
+    endpoint: str,
+    *,
+    api_key: str | None = None,
+) -> VllmConfig:
     config = VllmConfig()
     if app_config.model_name.startswith("vllm:"):
         config.model = app_config.model_name.split(":", 1)[1].strip()
@@ -340,6 +347,7 @@ def _build_vllm_config(app_config: AppConfig, endpoint: str) -> VllmConfig:
     config.model = resolved_model
     parser_model_name = resolved_model
     config.endpoint = endpoint
+    config.api_key = api_key
     config.timeout = app_config.inference.timeout
     config.gpu_memory_utilization = app_config.gpu_memory_utilization
     config.temperature = app_config.inference.temperature
@@ -396,6 +404,186 @@ def _build_vllm_config(app_config: AppConfig, endpoint: str) -> VllmConfig:
             f"or inferred for model {parser_model_name!r}"
         )
     return config
+
+
+def _endpoint_base_urls(endpoint: str) -> tuple[str, str, str, str]:
+    root = endpoint.rstrip("/")
+    base_url = root if root.endswith("/v1") else f"{root}/v1"
+    models_url = f"{base_url}/models"
+    server_root = base_url.rsplit("/v1", 1)[0]
+    metrics_url = f"{server_root}/metrics"
+    return root, base_url, models_url, metrics_url
+
+
+def _default_endpoint_capacity(app_config: AppConfig) -> int:
+    vllm_cfg = app_config.vllm
+    if vllm_cfg is not None and vllm_cfg.max_num_seqs is not None:
+        return max(1, int(vllm_cfg.max_num_seqs))
+    if app_config.generation is not None:
+        return max(1, int(app_config.generation.parallel_episodes))
+    return 1
+
+
+def _min_healthy_endpoint_capacity(app_config: AppConfig) -> int:
+    vllm_cfg = app_config.vllm
+    if vllm_cfg is None:
+        return 1
+    return vllm_cfg.min_healthy_endpoint_capacity
+
+
+def _api_key_from_env(api_key_env: str | None) -> str | None:
+    if not api_key_env:
+        return None
+    api_key = os.getenv(api_key_env)
+    if not api_key:
+        raise ValueError(f"Environment variable {api_key_env} is required for vLLM endpoint auth")
+    return api_key
+
+
+def _is_http_ready_with_auth(
+    url: str,
+    *,
+    api_key: str | None = None,
+    timeout_sec: float = 2.0,
+) -> bool:
+    if not api_key:
+        return is_http_ready(url, timeout_sec=timeout_sec)
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _attach_endpoint_pool(
+    session: BackendSession,
+    app_config: AppConfig,
+    *,
+    endpoint_id: str = "vllm-0",
+    capacity: int | None = None,
+    api_key: str | None = None,
+    healthy: bool = True,
+) -> BackendSession:
+    if session.base_url is None or session.models_url is None:
+        return session
+    endpoint_capacity = capacity if capacity is not None else _default_endpoint_capacity(app_config)
+    pool = EndpointPool(
+        [
+            EndpointState(
+                endpoint_id=endpoint_id,
+                base_url=session.base_url,
+                models_url=session.models_url,
+                metrics_url=session.metrics_url,
+                capacity=endpoint_capacity,
+                genner=session.genner,
+                api_key=api_key,
+                healthy=healthy,
+                metadata={"capacity": endpoint_capacity},
+            )
+        ],
+        min_healthy_capacity=_min_healthy_endpoint_capacity(app_config),
+    )
+    session.genner = pool.default_genner
+    session.extras = {
+        "endpoint_pool": pool,
+        "metrics_api_key": pool.default_api_key,
+        "metrics_urls": [pool.default_metrics_url] if pool.default_metrics_url else [],
+    }
+    return session
+
+
+def _build_pool_smoke_test(
+    pool: EndpointPool,
+    sessions_by_endpoint: dict[str, BackendSession],
+):
+    def run_smoke_test() -> str:
+        errors: list[str] = []
+        for endpoint_id in pool.endpoint_ids():
+            if not pool.is_healthy(endpoint_id):
+                continue
+            session = sessions_by_endpoint[endpoint_id]
+            if session.smoke_test is None:
+                return f"{endpoint_id}: smoke test unavailable"
+            try:
+                return f"{endpoint_id}: {session.smoke_test()}"
+            except Exception as exc:
+                pool.mark_unhealthy(endpoint_id, str(exc))
+                errors.append(f"{endpoint_id}: {exc}")
+        detail = "; ".join(errors) if errors else "no healthy endpoints"
+        raise RuntimeError(f"No healthy vLLM endpoint passed smoke test ({detail})")
+
+    return run_smoke_test
+
+
+def _build_external_endpoint_pool_session(app_config: AppConfig) -> BackendSession:
+    vllm_cfg = app_config.vllm
+    if vllm_cfg is None or not vllm_cfg.endpoints:
+        raise ValueError("vllm.endpoints is required for external endpoint pool setup")
+
+    states: list[EndpointState] = []
+    sessions_by_endpoint: dict[str, BackendSession] = {}
+    ordered_sessions: list[BackendSession] = []
+    for index, endpoint_cfg in enumerate(vllm_cfg.endpoints):
+        endpoint_id = endpoint_cfg.id or f"vllm-{index}"
+        raw_endpoint, base_url, models_url, metrics_url = _endpoint_base_urls(
+            endpoint_cfg.base_url
+        )
+        api_key = _api_key_from_env(endpoint_cfg.api_key_env)
+        config = _build_vllm_config(app_config, endpoint=raw_endpoint, api_key=api_key)
+        client = OpenAI(api_key=api_key or "dummy", base_url=base_url, timeout=config.timeout)
+        session = _build_vllm_session(client, config, base_url, models_url)
+        session.metrics_url = metrics_url
+        healthy = _is_http_ready_with_auth(models_url, api_key=api_key)
+        states.append(
+            EndpointState(
+                endpoint_id=endpoint_id,
+                base_url=base_url,
+                models_url=models_url,
+                metrics_url=metrics_url,
+                capacity=endpoint_cfg.capacity,
+                genner=session.genner,
+                api_key=api_key,
+                healthy=healthy,
+                metadata={
+                    "capacity": endpoint_cfg.capacity,
+                    "api_key_env": endpoint_cfg.api_key_env,
+                },
+            )
+        )
+        sessions_by_endpoint[endpoint_id] = session
+        ordered_sessions.append(session)
+        if healthy:
+            logger.info(
+                f"Configured vLLM endpoint {endpoint_id} at {base_url} "
+                f"(capacity={endpoint_cfg.capacity})"
+            )
+        else:
+            logger.warning(
+                f"Configured vLLM endpoint {endpoint_id} at {base_url} is not ready; "
+                "it will remain quarantined until a probe succeeds"
+            )
+
+    pool = EndpointPool(
+        states,
+        min_healthy_capacity=_min_healthy_endpoint_capacity(app_config),
+    )
+    primary = ordered_sessions[0]
+    primary.genner = pool.default_genner
+    primary.smoke_test = _build_pool_smoke_test(pool, sessions_by_endpoint)
+    primary.metrics_url = pool.default_metrics_url
+    primary.extras = {
+        "endpoint_pool": pool,
+        "endpoint_sessions": sessions_by_endpoint,
+        "metrics_api_key": pool.default_api_key,
+        "metrics_urls": [
+            session.metrics_url for session in ordered_sessions if session.metrics_url
+        ],
+    }
+    return primary
 
 
 def _build_container_command(
@@ -522,6 +710,17 @@ def _start_vllm_container(
     """
     HF_CACHE_HOST.mkdir(parents=True, exist_ok=True)
 
+    # Honor CUDA_VISIBLE_DEVICES from the host env when wiring the CDI device
+    # spec. Default to "all" (preserves prior behavior). When a single GPU is
+    # disconnected/in error, "all" makes the container's NVML init crash at
+    # vllm.platforms.cuda module load (log_warnings enumerates every physical
+    # device via NVML, regardless of CUDA_VISIBLE_DEVICES). Passing only the
+    # healthy GPU indices via CDI avoids that.
+    cdi_gpu_spec = "all"
+    visible_env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if visible_env and visible_env != "all":
+        cdi_gpu_spec = visible_env
+
     docker_cmd = [
         "docker",
         "run",
@@ -529,7 +728,7 @@ def _start_vllm_container(
         "--name",
         name,
         "--device",
-        "nvidia.com/gpu=all",
+        f"nvidia.com/gpu={cdi_gpu_spec}",
         "--ipc=host",
         "--network=host",
         "--user",
@@ -747,6 +946,13 @@ def setup_vllm(
     endpoint: str = "http://127.0.0.1:8000",
 ) -> Iterator[BackendSession]:
     vllm_cfg = app_config.vllm
+    if vllm_cfg is not None and vllm_cfg.endpoints:
+        yield _build_external_endpoint_pool_session(app_config)
+        return
+
+    if vllm_cfg is not None and vllm_cfg.endpoint:
+        endpoint = vllm_cfg.endpoint
+
     startup_timeout = (
         vllm_cfg.startup_timeout if vllm_cfg and vllm_cfg.startup_timeout else 500
     )
@@ -769,7 +975,13 @@ def setup_vllm(
     if is_http_ready(models_url):
         logger.info(f"Using existing server at {base_url}")
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=config.timeout)
-        yield _build_vllm_session(client, config, base_url, models_url)
+        session = _build_vllm_session(client, config, base_url, models_url)
+        yield _attach_endpoint_pool(
+            session,
+            app_config,
+            api_key=config.api_key,
+            healthy=True,
+        )
         return
 
     parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
@@ -917,12 +1129,18 @@ def setup_vllm(
 
         client = OpenAI(api_key=api_key, base_url=base_url, timeout=config.timeout)
 
-        yield _build_vllm_session(
+        session = _build_vllm_session(
             client,
             config,
             base_url,
             models_url,
             process=container,
+        )
+        yield _attach_endpoint_pool(
+            session,
+            app_config,
+            api_key=config.api_key,
+            healthy=True,
         )
     finally:
         logger.info(f"Stopping vLLM container '{container_name}'...")

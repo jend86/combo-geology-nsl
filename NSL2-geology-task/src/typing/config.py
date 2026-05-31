@@ -348,6 +348,26 @@ class AppConfig(BaseModel):
     inference: InferenceConfig = Field(default_factory=InferenceConfig)
 
     class VllmConfig(BaseModel):
+        class EndpointConfig(BaseModel):
+            model_config = ConfigDict(extra="forbid")
+
+            id: Optional[str] = None
+            base_url: str
+            capacity: int = 1
+            api_key_env: Optional[str] = None
+
+            @model_validator(mode="after")
+            def _validate_capacity(self) -> "AppConfig.VllmConfig.EndpointConfig":
+                if self.capacity <= 0:
+                    raise ValueError("vllm endpoint capacity must be positive")
+                return self
+
+        # Legacy/configured single endpoint. When omitted, setup_vllm keeps its
+        # existing default endpoint argument and local-container startup behavior.
+        endpoint: Optional[str] = None
+        endpoints: List[EndpointConfig] = Field(default_factory=list)
+        min_healthy_endpoint_capacity: int = 1
+
         chat_template_path: Optional[str] = None
         local_model_path: Optional[str] = None
         lora_adapter_path: Optional[str] = None
@@ -374,6 +394,14 @@ class AppConfig(BaseModel):
         enforce_eager: bool = False
         cudagraph_mode: Optional[CudagraphMode] = None
         extra_env: Dict[str, str] = Field(default_factory=dict)
+
+        @model_validator(mode="after")
+        def _validate_endpoints(self) -> "AppConfig.VllmConfig":
+            if self.endpoint and self.endpoints:
+                raise ValueError("set either vllm.endpoint or vllm.endpoints, not both")
+            if self.min_healthy_endpoint_capacity < 0:
+                raise ValueError("min_healthy_endpoint_capacity must be non-negative")
+            return self
 
     vllm: Optional[VllmConfig] = None
 

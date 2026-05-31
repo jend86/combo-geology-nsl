@@ -16,7 +16,11 @@ from result import Result, Ok, Err
 
 from dataclasses import dataclass, field
 
-from src.genner.Base import CONTEXT_OVERFLOW_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.observability.types import InferenceResult, UsageInfo
 from src.typing.message import Message
 from .Base import Genner
@@ -244,12 +248,29 @@ class OAIGenner(Genner):
                 f"`messages`: \n{messages}\n"
                 f"`e`: \n{e}"
             )
-        except (APIConnectionError, APITimeoutError) as e:
-            # Endpoint unreachable / timed out at the transport layer
-            # (e.g. vLLM crashed, network blip). Tag with a distinct
-            # prefix so the harness can elevate this to a HarnessError
-            # and let the existing consecutive_harness_error_limit
-            # circuit breaker abort the run loudly.
+        except APITimeoutError as e:
+            # NOTE: APITimeoutError subclasses APIConnectionError, so this
+            # MUST be caught before the APIConnectionError branch below.
+            #
+            # A request-level timeout: the client gave up waiting (e.g. decode
+            # starvation under load) but the endpoint is still reachable. This
+            # is a RETRYABLE episode failure, NOT an endpoint outage. Tag it
+            # with the timeout prefix so the endpoint pool does NOT quarantine
+            # the (possibly sole) endpoint — quarantining the only endpoint
+            # would breach the capacity floor and abort the whole run. Logged
+            # at WARNING (not exception) because timeouts are expected under
+            # load and a per-timeout traceback floods the run log.
+            logger.warning(
+                f"OAIGenner.plist_completion: inference request timed out "
+                f"for model {self.config.model}: {e}"
+            )
+            return Err(f"{INFERENCE_TIMEOUT_PREFIX} {type(e).__name__}: {e}")
+        except APIConnectionError as e:
+            # Endpoint unreachable at the transport layer (e.g. vLLM crashed,
+            # network blip). Tag with the inference_unavailable prefix so the
+            # endpoint pool quarantines it and fails over to healthy endpoints,
+            # and the harness elevates this to a HarnessError that the existing
+            # consecutive_harness_error_limit circuit breaker can abort on.
             logger.exception(
                 f"OAIGenner.plist_completion: inference endpoint "
                 f"unavailable for model {self.config.model}"

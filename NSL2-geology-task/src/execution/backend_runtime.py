@@ -29,6 +29,7 @@ class BackendRuntime:
     genner: Genner
     docker_client: docker.DockerClient
     metrics: MetricsCollector | None = None
+    endpoint_pool: Any | None = None
 
 
 def _run_backend_smoke_test(backend_session: Any) -> None:
@@ -52,7 +53,11 @@ def _configure_metrics_url(
         backend = "vllm"
     metrics_collector.inference_metrics_url = metrics_url
     metrics_collector.inference_metrics_backend = backend
+    metrics_collector.inference_metrics_api_key = None
     metrics_collector.vllm_metrics_url = metrics_url
+    extras = getattr(backend_session, "extras", None)
+    if isinstance(extras, dict):
+        metrics_collector.inference_metrics_api_key = extras.get("metrics_api_key")
     if metrics_collector.inference_metrics_url:
         logger.info(
             f"{backend} metrics scraping enabled: {metrics_collector.inference_metrics_url}"
@@ -70,6 +75,24 @@ def _wrap_genner(
     if metrics_collector is None:
         return genner
     return MetricsGenner(genner, metrics_collector)
+
+
+def _endpoint_pool_from_session(backend_session: Any) -> Any | None:
+    extras = getattr(backend_session, "extras", None)
+    if not isinstance(extras, dict):
+        return None
+    return extras.get("endpoint_pool")
+
+
+def _wrap_endpoint_pool_genners(
+    endpoint_pool: Any | None,
+    metrics_collector: MetricsCollector | None,
+) -> None:
+    if endpoint_pool is None or metrics_collector is None:
+        return
+    wrap = getattr(endpoint_pool, "wrap_genners", None)
+    if callable(wrap):
+        wrap(lambda genner: MetricsGenner(genner, metrics_collector))
 
 
 def _resolve_tool_contract_profile(config: AppConfig) -> Any | None:
@@ -91,6 +114,7 @@ def _coerce_runtime(
     genner: Genner,
     docker_client: docker.DockerClient,
     metrics: MetricsCollector | None,
+    endpoint_pool: Any | None = None,
 ) -> BackendRuntime:
     return BackendRuntime(
         config=config,
@@ -99,6 +123,7 @@ def _coerce_runtime(
         genner=genner,
         docker_client=docker_client,
         metrics=metrics,
+        endpoint_pool=endpoint_pool,
     )
 
 
@@ -135,6 +160,8 @@ def open_backend_runtime(
         _run_backend_smoke_test(backend_session)
         _configure_metrics_url(active_metrics, backend_session)
         genner = _wrap_genner(backend_session, active_metrics)
+        endpoint_pool = _endpoint_pool_from_session(backend_session)
+        _wrap_endpoint_pool_genners(endpoint_pool, active_metrics)
         try:
             if tool_contract_profile is not None:
                 run_tool_call_contract_probe(
@@ -151,6 +178,7 @@ def open_backend_runtime(
                 genner=genner,
                 docker_client=active_docker_client,
                 metrics=active_metrics,
+                endpoint_pool=endpoint_pool,
             )
             yield runtime
         finally:

@@ -25,7 +25,11 @@ from loguru import logger
 from result import Err, Ok
 
 from src.framework.capability_bridge import CapabilityMcpBridge
-from src.genner.Base import CONTEXT_OVERFLOW_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.harness.base import HarnessError, HarnessSpec
 from src.harness.context import HarnessContext
 from src.harness.orchestrator_modes.memory import CrossEpisodeScratchpad
@@ -550,7 +554,12 @@ class OrchestratorModeHarness(HarnessSpec):
                 )
                 if str(error).startswith(CONTEXT_OVERFLOW_PREFIX):
                     raise ContextOverflowError(str(error))
-                if str(error).startswith(INFERENCE_UNAVAILABLE_PREFIX):
+                if str(error).startswith(
+                    (INFERENCE_UNAVAILABLE_PREFIX, INFERENCE_TIMEOUT_PREFIX)
+                ):
+                    # A timeout is grouped with a true outage here (graceful
+                    # HarnessError, counted by the consecutive-harness-error
+                    # breaker) rather than falling through to a hard error.
                     raise HarnessError(str(error))
                 raise RuntimeError(f"Orchestrator execution failed: {error}")
         raise RuntimeError("unreachable: Result must be Ok or Err")
@@ -838,7 +847,12 @@ class OrchestratorModeHarness(HarnessSpec):
                 )
                 if str(error).startswith(CONTEXT_OVERFLOW_PREFIX):
                     raise ContextOverflowError(str(error))
-                if str(error).startswith(INFERENCE_UNAVAILABLE_PREFIX):
+                if str(error).startswith(
+                    (INFERENCE_UNAVAILABLE_PREFIX, INFERENCE_TIMEOUT_PREFIX)
+                ):
+                    # A timeout is grouped with a true outage here (graceful
+                    # HarnessError, counted by the consecutive-harness-error
+                    # breaker) rather than falling through to a hard error.
                     raise HarnessError(str(error))
                 logger.error(f"{mode_name} mode failed: {error}")
                 return _ModeTurnResult(

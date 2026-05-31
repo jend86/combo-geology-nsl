@@ -15,7 +15,11 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from result import Err, Ok
 
-from src.genner.Base import Genner, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    Genner,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.harness.openai_shim import OpenAiShim, _extract_pseudo_tool_calls
 from src.harness.recorder import EventRecorder
 from src.harness.traced_genner import TracedGenner
@@ -399,6 +403,39 @@ def test_shim_latches_inference_unavailable_flag(tmp_path: Path) -> None:
     assert response.status_code == 502
     assert shim.inference_unavailable_detail is not None
     assert shim.inference_unavailable_detail.startswith(INFERENCE_UNAVAILABLE_PREFIX)
+
+
+def test_shim_latches_timeout_into_separate_timeout_detail(tmp_path: Path) -> None:
+    # A request timeout is the backend being slow, not an outage. The shim
+    # latches it into a SEPARATE inference_timeout_detail (NOT
+    # inference_unavailable_detail) so ContainerHarness categorises the episode
+    # as inference_timeout — a benign, retryable abort that does NOT quarantine
+    # the endpoint. (Latching it into inference_unavailable_detail would route
+    # it to the endpoint_unavailable category, which the worker loop quarantines
+    # on — with a single endpoint that breaches the capacity floor and aborts
+    # the run.)
+    shim, _recorder, inner = _build_shim(
+        tmp_path, token="abc", episode_id="ep-inf-timeout"
+    )
+
+    def _timeout(messages, *, tools=None, tool_choice=None):
+        return Err(f"{INFERENCE_TIMEOUT_PREFIX} APITimeoutError: Request timed out.")
+
+    inner.plist_completion = _timeout  # type: ignore[assignment]
+    client = TestClient(shim.app)
+    assert shim.inference_timeout_detail is None
+    assert shim.inference_unavailable_detail is None
+
+    response = client.post(
+        "/v1/chat/completions",
+        json=_openai_body(),
+        headers={"Authorization": "Bearer abc"},
+    )
+    assert response.status_code == 502
+    # Timeout latches into its OWN field, and NOT into the outage field.
+    assert shim.inference_timeout_detail is not None
+    assert shim.inference_timeout_detail.startswith(INFERENCE_TIMEOUT_PREFIX)
+    assert shim.inference_unavailable_detail is None
 
 
 def test_extract_multi_parameter_blocks() -> None:

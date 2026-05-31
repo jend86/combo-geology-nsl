@@ -52,6 +52,26 @@ def _write_base_compose(root: Path) -> Path:
     return base
 
 
+class TestEndpointQuarantineDecision(unittest.TestCase):
+    """Only a genuine endpoint outage quarantines the endpoint.
+
+    A request timeout (``inference_timeout``) is a benign, retryable failure —
+    quarantining the (possibly sole) endpoint on a timeout breaches the capacity
+    floor and aborts the whole run. This is the exact decision the worker loop
+    makes at the ``episode.error_category == "endpoint_unavailable"`` check.
+    """
+
+    def test_only_endpoint_unavailable_triggers_quarantine(self) -> None:
+        from src.execution.parallel import _episode_triggers_endpoint_quarantine
+
+        self.assertTrue(_episode_triggers_endpoint_quarantine("endpoint_unavailable"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine("inference_timeout"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine("agent_failure"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine("harness_error"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine("success"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine(None))
+
+
 class TestSlotCircuitBreaker(unittest.TestCase):
     def test_trips_on_consecutive_failures(self):
         from src.parallel import SlotCircuitBreaker

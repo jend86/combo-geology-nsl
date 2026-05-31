@@ -18,7 +18,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from result import Err, Ok
 
-from src.genner.Base import INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import INFERENCE_TIMEOUT_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
 from src.harness.recorder import EventRecorder
 from src.harness.tool_contract import ToolResponseClassification, allowed_tool_names
 from src.harness.traced_genner import TracedGenner
@@ -470,7 +470,12 @@ class OpenAiShim:
         self._phase_lock = threading.Lock()
         self.last_tool_response_classification: ToolResponseClassification | None = None
         # Read after container exit to report inference outages as harness errors.
+        # A genuine outage (inference_unavailable) and a request timeout
+        # (inference_timeout) are latched SEPARATELY: only the former quarantines
+        # the endpoint; the latter is a benign, retryable episode failure (a
+        # single timeout must not breach the capacity floor and abort the run).
         self.inference_unavailable_detail: str | None = None
+        self.inference_timeout_detail: str | None = None
         self.app = FastAPI()
         self._register_routes()
 
@@ -559,10 +564,21 @@ class OpenAiShim:
                 return response
             case Err(error):
                 error_str = str(error)
+                # The backend, not the agent, caused these. Latch them so
+                # ContainerHarness categorises the episode as a backend fault
+                # (not agent_failure, which would churn the per-slot breaker).
+                # Keep them SEPARATE: a true outage (inference_unavailable)
+                # quarantines the endpoint; a request timeout (inference_timeout,
+                # e.g. decode starvation) does NOT — it is benign and retryable,
+                # and quarantining the (possibly sole) endpoint on a timeout
+                # would breach the capacity floor and abort the whole run.
+                # Keep the first occurrence even if a later retry succeeds.
                 if error_str.startswith(INFERENCE_UNAVAILABLE_PREFIX):
-                    # Keep the first outage even if a later retry succeeds.
                     if self.inference_unavailable_detail is None:
                         self.inference_unavailable_detail = error_str
+                elif error_str.startswith(INFERENCE_TIMEOUT_PREFIX):
+                    if self.inference_timeout_detail is None:
+                        self.inference_timeout_detail = error_str
                 raise HTTPException(status_code=502, detail=error_str)
         raise HTTPException(status_code=500, detail="unreachable result branch")
 

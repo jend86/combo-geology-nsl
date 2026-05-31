@@ -456,15 +456,30 @@ class ContainerHarness(HarnessSpec):
                 # agent container would have exited non-zero from a 502 on
                 # /v1/chat/completions — which _wait_with_cancel reports as
                 # `agent_failure`. That's wrong: the agent didn't fail, the
-                # backend did. Elevate to harness_error so the existing
-                # consecutive_harness_error_limit breaker can abort the run.
+                # backend did. Give inference outages their own category so
+                # endpoint-level routing handles quarantine/failover instead
+                # of tripping the per-slot harness breaker.
                 if shim.inference_unavailable_detail is not None:
                     termination = _Termination(
                         reason=(
                             "inference endpoint unavailable: "
                             f"{shim.inference_unavailable_detail}"
                         ),
-                        category="harness_error",
+                        category="endpoint_unavailable",
+                    )
+                elif shim.inference_timeout_detail is not None:
+                    # A request timeout (decode starvation) is the backend's
+                    # fault, not the agent's — but it is NOT an outage. It gets
+                    # its own benign, non-quarantining category so a single
+                    # timeout cannot breach the single-endpoint capacity floor
+                    # and abort the run (quarantine is keyed on
+                    # endpoint_unavailable; see the parallel worker loop).
+                    termination = _Termination(
+                        reason=(
+                            "inference request timed out: "
+                            f"{shim.inference_timeout_detail}"
+                        ),
+                        category="inference_timeout",
                     )
 
                 budget_exhaustion = (

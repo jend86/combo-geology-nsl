@@ -64,9 +64,11 @@ class MetricsCollector:
         # internally for output compatibility with existing summaries.
         self.inference_metrics_url: str | None = None
         self.inference_metrics_backend: Literal["vllm", "sglang"] = "vllm"
+        self.inference_metrics_api_key: str | None = None
         self.vllm_metrics_url: str | None = None
         self._inference_metrics_url: str | None = None
         self._inference_metrics_backend: Literal["vllm", "sglang"] = "vllm"
+        self._inference_metrics_api_key: str | None = None
         self._vllm_peak_kv_cache: float | None = None
         self._vllm_sum_kv_cache: float = 0.0
         self._vllm_kv_cache_count: int = 0
@@ -166,6 +168,7 @@ class MetricsCollector:
         interval_seconds: float = 1.0,
         inference_metrics_url: str | None = None,
         inference_metrics_backend: Literal["vllm", "sglang"] = "vllm",
+        inference_metrics_api_key: str | None = None,
         vllm_metrics_url: str | None = None,
     ) -> None:
         """Start a background thread that polls GPU/CPU utilization at the given interval.
@@ -184,6 +187,7 @@ class MetricsCollector:
             inference_metrics_backend = "vllm"
         self._inference_metrics_url = inference_metrics_url
         self._inference_metrics_backend = inference_metrics_backend
+        self._inference_metrics_api_key = inference_metrics_api_key
 
         # Stop any in-progress sampling before resetting
         if self._sampling_stop_event is not None:
@@ -352,12 +356,18 @@ class MetricsCollector:
         if self._inference_metrics_url is None:
             return
         if self._inference_metrics_backend == "vllm":
-            snapshot = snapshot_vllm_metrics(self._inference_metrics_url)
+            if self._inference_metrics_api_key:
+                snapshot = snapshot_vllm_metrics(
+                    self._inference_metrics_url,
+                    api_key=self._inference_metrics_api_key,
+                )
+            else:
+                snapshot = snapshot_vllm_metrics(self._inference_metrics_url)
         else:
-            snapshot = snapshot_inference_metrics(
-                self._inference_metrics_url,
-                backend=self._inference_metrics_backend,
-            )
+            kwargs = {"backend": self._inference_metrics_backend}
+            if self._inference_metrics_api_key:
+                kwargs["api_key"] = self._inference_metrics_api_key
+            snapshot = snapshot_inference_metrics(self._inference_metrics_url, **kwargs)
         if snapshot is None:
             return
         with self._lock:

@@ -9,7 +9,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from src.execution import BackendRuntime, run_generation
-from src.execution.episode import EpisodeOutcome, EpisodeRequest, run_episode
+from src.execution.episode import EpisodeOutcome, EpisodeRequest
 from src.execution.episode_runner import run_single_episode
 from src.execution.generation import (
     save_generation_data,
@@ -102,6 +102,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
         genner: MagicMock | None = None,
         docker_client: MagicMock | None = None,
         metrics: MagicMock | None = None,
+        endpoint_pool: object | None = None,
         run_id: str = "run-123",
     ) -> BackendRuntime:
         return BackendRuntime(
@@ -111,6 +112,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
             genner=genner or MagicMock(),
             docker_client=docker_client or MagicMock(),
             metrics=metrics,
+            endpoint_pool=endpoint_pool,
         )
 
     def make_episode_request(
@@ -1447,7 +1449,7 @@ class GenerationOrchestratorTests(unittest.TestCase):
                     self.make_episode(9, row_count=1, success=True),
                 ]
 
-                generation_data = run_generation(
+                run_generation(
                     genner=MagicMock(),
                     docker_client=MagicMock(),
                     config=config,
@@ -2090,6 +2092,217 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.termination_reason, "max_episodes")
         self.assertEqual(result.total_episodes_run, 1)
         self.assertEqual(observed_stop_events, [True])
+
+    def test_run_generation_parallel_uses_endpoint_pool_lease_and_releases(self) -> None:
+        from src.backend.endpoint_pool import EndpointPool, EndpointState
+        from src.genner.Base import Genner
+
+        class TinyGenner(Genner):
+            def plist_completion(self, messages, *, tools=None, tool_choice=None):
+                raise AssertionError("not used by this test")
+
+            @staticmethod
+            def get_usage_info(response):
+                return None
+
+        observed_endpoint_ids: list[str | None] = []
+
+        def fake_run_single_episode(runtime: BackendRuntime, **kwargs: object):
+            observed_endpoint_ids.append(getattr(runtime.genner, "endpoint_id", None))
+            return self.make_episode(
+                int(kwargs["episode_index"]),
+                row_count=0,
+                success=False,
+                score=0.0,
+            )
+
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=1,
+                target_training_rows=100,
+                max_episodes=1,
+            )
+            manager = MagicMock()
+            self.configure_manager_mock(manager)
+            slot = WorkerSlot(
+                slot_id=0,
+                container_manager=manager,
+                docker_client=MagicMock(),
+                circuit_breaker=SlotCircuitBreaker(),
+                cache_dir=base_dir / "slot-0",
+            )
+            pool = EndpointPool(
+                [
+                    EndpointState(
+                        endpoint_id="ep0",
+                        base_url="http://ep0:8000/v1",
+                        models_url="http://ep0:8000/v1/models",
+                        metrics_url="http://ep0:8000/metrics",
+                        capacity=1,
+                        genner=TinyGenner("vllm"),
+                    )
+                ]
+            )
+            rt = self.make_backend_runtime(config, endpoint_pool=pool)
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=[slot]),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    side_effect=fake_run_single_episode,
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = run_generation_parallel(rt, generation_id=0)
+
+        self.assertEqual(result.total_episodes_run, 1)
+        self.assertEqual(observed_endpoint_ids, ["ep0"])
+        self.assertEqual(pool.total_in_flight(), 0)
+
+    def test_run_generation_parallel_releases_endpoint_lease_on_exception(self) -> None:
+        from src.backend.endpoint_pool import EndpointPool, EndpointState
+        from src.genner.Base import Genner
+
+        class TinyGenner(Genner):
+            def plist_completion(self, messages, *, tools=None, tool_choice=None):
+                raise AssertionError("not used by this test")
+
+            @staticmethod
+            def get_usage_info(response):
+                return None
+
+        def fake_run_single_episode(runtime: BackendRuntime, **kwargs: object):
+            raise RuntimeError("episode crashed")
+
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=1,
+                target_training_rows=100,
+                max_episodes=1,
+            )
+            manager = MagicMock()
+            self.configure_manager_mock(manager)
+            slot = WorkerSlot(
+                slot_id=0,
+                container_manager=manager,
+                docker_client=MagicMock(),
+                circuit_breaker=SlotCircuitBreaker(max_consecutive_failures=10),
+                cache_dir=base_dir / "slot-0",
+            )
+            pool = EndpointPool(
+                [
+                    EndpointState(
+                        endpoint_id="ep0",
+                        base_url="http://ep0:8000/v1",
+                        models_url="http://ep0:8000/v1/models",
+                        metrics_url="http://ep0:8000/metrics",
+                        capacity=1,
+                        genner=TinyGenner("vllm"),
+                    )
+                ]
+            )
+            rt = self.make_backend_runtime(config, endpoint_pool=pool)
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=[slot]),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    side_effect=fake_run_single_episode,
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                run_generation_parallel(rt, generation_id=0)
+
+        self.assertEqual(pool.total_in_flight(), 0)
+
+    def test_endpoint_unavailable_bypasses_slot_breaker_and_marks_endpoint(self) -> None:
+        from src.backend.endpoint_pool import EndpointPool, EndpointState
+        from src.genner.Base import Genner
+
+        class TinyGenner(Genner):
+            def plist_completion(self, messages, *, tools=None, tool_choice=None):
+                raise AssertionError("not used by this test")
+
+            @staticmethod
+            def get_usage_info(response):
+                return None
+
+        def fake_run_single_episode(runtime: BackendRuntime, **kwargs: object):
+            return self.make_episode(
+                int(kwargs["episode_index"]),
+                row_count=0,
+                success=False,
+                score=0.0,
+                error_message="inference endpoint unavailable: connection refused",
+                error_category="endpoint_unavailable",
+            )
+
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=1,
+                target_training_rows=100,
+                max_episodes=1,
+            )
+            manager = MagicMock()
+            self.configure_manager_mock(manager)
+            breaker = MagicMock()
+            breaker.is_tripped.return_value = False
+            breaker.is_verification_tripped.return_value = False
+            slot = WorkerSlot(
+                slot_id=0,
+                container_manager=manager,
+                docker_client=MagicMock(),
+                circuit_breaker=breaker,
+                cache_dir=base_dir / "slot-0",
+            )
+            pool = EndpointPool(
+                [
+                    EndpointState(
+                        endpoint_id="ep0",
+                        base_url="http://ep0:8000/v1",
+                        models_url="http://ep0:8000/v1/models",
+                        metrics_url="http://ep0:8000/metrics",
+                        capacity=1,
+                        genner=TinyGenner("vllm"),
+                    )
+                ]
+            )
+            rt = self.make_backend_runtime(config, endpoint_pool=pool)
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=[slot]),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    side_effect=fake_run_single_episode,
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = run_generation_parallel(rt, generation_id=0)
+
+        self.assertEqual(result.total_episodes_run, 1)
+        self.assertFalse(pool.is_healthy("ep0"))
+        breaker.record_failure.assert_not_called()
 
     # --- Baseline measurement fix tests ---
 

@@ -3,9 +3,13 @@ from unittest.mock import MagicMock, patch
 
 import anthropic
 import httpx
-from openai import APIConnectionError, BadRequestError
+from openai import APIConnectionError, APITimeoutError, BadRequestError
 
-from src.genner.Base import CONTEXT_OVERFLOW_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.genner.Claude import ClaudeConfig, ClaudeGenner
 from src.genner.OAI import OAIConfig, OAIGenner
 
@@ -102,6 +106,32 @@ class GennerInferenceUnavailableTests(unittest.TestCase):
         self.assertTrue(
             result.unwrap_err().startswith(INFERENCE_UNAVAILABLE_PREFIX)
         )
+
+    def test_oai_timeout_error_is_classified_as_retryable_timeout(self) -> None:
+        # A request-level timeout (client gave up waiting, e.g. decode
+        # starvation under load) is a RETRYABLE episode failure, not an
+        # endpoint outage. It must carry the distinct timeout prefix and NOT
+        # the inference_unavailable prefix, so the endpoint pool does not
+        # quarantine the (possibly sole) endpoint and abort the run.
+        client = MagicMock()
+        client.chat.completions.create.side_effect = APITimeoutError(
+            request=httpx.Request(
+                "POST", "http://192.168.10.34:8000/v1/chat/completions"
+            ),
+        )
+        genner = OAIGenner(
+            client,
+            OAIConfig(model="demo-model", max_tokens=512, temperature=0.0),
+        )
+
+        result = genner.plist_completion(
+            [{"role": "user", "content": "hello", "meta": {}}]
+        )
+
+        self.assertTrue(result.is_err())
+        err = result.unwrap_err()
+        self.assertTrue(err.startswith(INFERENCE_TIMEOUT_PREFIX))
+        self.assertFalse(err.startswith(INFERENCE_UNAVAILABLE_PREFIX))
 
 
 class ClaudeIsContextOverflowTests(unittest.TestCase):

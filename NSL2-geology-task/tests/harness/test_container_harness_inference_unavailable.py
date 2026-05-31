@@ -1,11 +1,11 @@
-"""ContainerHarness elevates `agent_failure` to `harness_error` when the
+"""ContainerHarness elevates `agent_failure` to `endpoint_unavailable` when the
 inference endpoint went away mid-episode.
 
 A non-zero container exit normally lands as ``agent_failure`` (the agent
 chose to terminate / errored). When the shim observed an
 ``inference_unavailable`` Err from the genner, the cause is the backend,
-not the agent. The harness re-categorises so the existing
-``consecutive_harness_error_limit`` breaker can abort the run.
+not the agent. The harness re-categorises so endpoint-level routing, not the
+per-slot harness breaker, handles the outage.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.genner.Base import INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import INFERENCE_TIMEOUT_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
 from src.harness.container import ContainerHarness
 from src.harness.context import HarnessConfigView, HarnessContext
 from src.harness.recorder import EventRecorder
@@ -117,6 +117,7 @@ def _patch_harness_env(
     monkeypatch: pytest.MonkeyPatch,
     profile_mock: MagicMock,
     flag_shim: bool,
+    timeout_shim: bool = False,
 ) -> None:
     import src.harness.container as container_mod
 
@@ -150,6 +151,10 @@ def _patch_harness_env(
                 self.inference_unavailable_detail = (
                     f"{INFERENCE_UNAVAILABLE_PREFIX} Connection refused"
                 )
+            if timeout_shim:
+                self.inference_timeout_detail = (
+                    f"{INFERENCE_TIMEOUT_PREFIX} APITimeoutError: Request timed out."
+                )
 
     monkeypatch.setattr(container_mod, "OpenAiShim", _ShimWithFlag)
 
@@ -176,7 +181,7 @@ def test_status_1_alone_is_agent_failure(
     assert transcript.termination_category == "agent_failure"
 
 
-def test_inference_unavailable_elevates_to_harness_error(
+def test_inference_unavailable_elevates_to_endpoint_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _patch_harness_env(monkeypatch, _profile_mock(), flag_shim=True)
@@ -185,6 +190,25 @@ def test_inference_unavailable_elevates_to_harness_error(
 
     transcript = _harness().run_episode(ctx=_ctx(tmp_path, docker))
 
-    assert transcript.termination_category == "harness_error"
+    assert transcript.termination_category == "endpoint_unavailable"
     assert "inference endpoint unavailable" in transcript.termination_reason
     assert INFERENCE_UNAVAILABLE_PREFIX in transcript.termination_reason
+
+
+def test_inference_timeout_is_its_own_category_not_endpoint_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A request timeout (decode starvation) must NOT be categorised as
+    # endpoint_unavailable: the parallel worker loop quarantines the endpoint on
+    # that category, and with a single endpoint that breaches the capacity floor
+    # and aborts the whole run. It gets its own benign, non-quarantining
+    # category instead.
+    _patch_harness_env(monkeypatch, _profile_mock(), flag_shim=False, timeout_shim=True)
+    docker = MagicMock()
+    docker.containers.run.return_value = _ExitFailContainer()
+
+    transcript = _harness().run_episode(ctx=_ctx(tmp_path, docker))
+
+    assert transcript.termination_category == "inference_timeout"
+    assert "inference request timed out" in transcript.termination_reason
+    assert transcript.termination_category != "endpoint_unavailable"

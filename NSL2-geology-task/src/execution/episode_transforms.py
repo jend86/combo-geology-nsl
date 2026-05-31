@@ -20,6 +20,7 @@ def categorize_termination(
         "repetition_collapse",
         "wall_clock",
         "harness_error",
+        "endpoint_unavailable",
     }:
         return True, str(category), None if reason is None else str(reason)
     return False, None, None
