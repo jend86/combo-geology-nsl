@@ -404,13 +404,15 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     # (ordered parents + hypothesis) must be unseen; duplicates remain
     # successes for reward purposes but are silently skipped from the pool.
     dedup_enabled: bool = True
-    # Upper bound on concurrent bootstrap (= survey) episodes. Set this to
-    # your `GenerationConfig.parallel_episodes` to choke bootstrap to the
-    # full slot count; set it lower to leave headroom for ramp-up. If the
-    # framework has fewer slots than this, the extras simply do nothing.
-    bootstrap_concurrency_cap: int = 4
-    bootstrap_window_size: int = 8  # episodes over which to ramp N/2 -> N
-    bootstrap_min_concurrency_fraction: float = 0.5
+    # Optional upper bound on concurrent bootstrap (= survey) episodes. The
+    # default 0 disables task-layer gating so `GenerationConfig.parallel_episodes`
+    # is used from the first bootstrap episode. Set a positive value only when
+    # a deliberate survey-phase cap is required.
+    bootstrap_concurrency_cap: int = 0
+    # Legacy ramp knobs retained so older variation configs still deserialize;
+    # when permit gating is enabled, bootstrap starts at the full cap.
+    bootstrap_window_size: int = 0
+    bootstrap_min_concurrency_fraction: float = 1.0
     bootstrap_permit_timeout_s: float = 600.0
     bootstrap_permit_stale_after_s: float = 1800.0
     # Novelty nudge: surface the last K admitted hypotheses in the proposer
@@ -1776,14 +1778,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if workflow_kind in ("survey", "crossbreed"):
             self._assign_rotation_source(episode_context, variation)
 
-        # Survey (= bootstrap): block here until a slot permit is free so
-        # the early generation runs at lower concurrency. The framework
-        # still allocates `parallel_episodes` slots; we choke them at the
-        # task layer to preserve the pytorch-lightning boundary.
+        # Survey (= bootstrap): cap at the configured full slot count from the
+        # first episode. The older N/2 -> N bootstrap ramp is obsolete.
         if (
             workflow_kind == "survey"
             and variation.dedup_enabled
-            and variation.bootstrap_window_size > 0
+            and variation.bootstrap_concurrency_cap > 0
         ):
             permit_slot_id = f"slot_{episode_id}_{uuid.uuid4().hex[:6]}"
             acquired = self._acquire_bootstrap_permit(
@@ -5458,7 +5458,7 @@ finally:
         )
         scratch_npy.unlink(missing_ok=True)
 
-    # ----- Bootstrap concurrency ramp ---------------------------------
+    # ----- Bootstrap concurrency permit -------------------------------
 
     @staticmethod
     def _bootstrap_target_active(
@@ -5467,19 +5467,14 @@ finally:
         window_size: int,
         min_fraction: float,
     ) -> int:
-        """Active-slot target as the bootstrap window progresses.
+        """Active-slot target for bootstrap permit acquisition.
 
-        progress = seen / window  ∈ [0, 1]
-        fraction = min_fraction + (1 - min_fraction) * progress  ∈ [min, 1]
-        target   = ceil(configured_slots * fraction)
-
-        window_size <= 0 means "no ramp" — every slot is allowed.
+        The old bootstrap ramp is obsolete: every configured slot is available
+        from episode zero. ``bootstrap_episodes_seen``, ``window_size``, and
+        ``min_fraction`` are accepted for legacy callers but do not reduce the
+        target.
         """
-        if window_size <= 0 or configured_slots <= 0:
-            return max(0, configured_slots)
-        progress = min(max(bootstrap_episodes_seen / window_size, 0.0), 1.0)
-        fraction = min_fraction + (1.0 - min_fraction) * progress
-        return max(1, math.ceil(configured_slots * fraction))
+        return max(0, configured_slots)
 
     def _read_bootstrap_state(self, kg_dir: Path) -> dict[str, Any]:
         data = self._read_json_or(
@@ -5506,9 +5501,8 @@ finally:
         Returns False on timeout. The caller MUST call
         `_release_bootstrap_permit(slot_id)` once the episode finishes,
         or the in-flight entry will linger until it ages out via
-        ``stale_after_s``. The 0.5 s poll interval is deliberate: the ramp
-        unit is "episodes", not subseconds, so faster polling just burns
-        lock contention with no scheduling benefit.
+        ``stale_after_s``. The 0.5 s poll interval avoids burning lock
+        contention while waiting for a configured-cap slot to free up.
         """
         kg_path = Path(kg_dir)
         state_path = kg_path / _KG_BOOTSTRAP_STATE
@@ -5537,10 +5531,9 @@ finally:
                 if len(in_flight) < target:
                     in_flight.append({"slot_id": slot_id, "acquired_at": now})
                     state["in_flight"] = in_flight
-                    # `bootstrap_episodes_seen` increments on RELEASE, not
-                    # acquire — otherwise the ramp accelerates with raw
-                    # parallelism and lets configured concurrency in before
-                    # any episode has actually completed.
+                    # `bootstrap_episodes_seen` is retained as a completed-
+                    # episode diagnostic counter; it no longer changes the
+                    # active-slot target.
                     self._atomic_write_json(state_path, state)
                     return True
                 # Persist the reap so other slots benefit when they next
@@ -5567,7 +5560,7 @@ finally:
                 if not (isinstance(entry, dict) and entry.get("slot_id") == slot_id)
             ]
             state["in_flight"] = after
-            # Each *completed* episode (release) advances the ramp. Acquires
+            # Count completed bootstrap episodes for state/diagnostics. Acquires
             # that never complete (stale, reaped) do not bump the counter.
             if len(after) != len(before):
                 state["bootstrap_episodes_seen"] = (

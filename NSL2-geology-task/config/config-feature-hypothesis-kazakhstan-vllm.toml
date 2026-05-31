@@ -21,8 +21,8 @@
 # Verification targets for this run:
 #   - dedup gate: `data/kazakhstan/feature-hypothesis/knowledge/teniz_basin/admitted_index.json`
 #     fingerprints accumulate; experiments.jsonl avoids duplicates.
-#   - bootstrap permit: `bootstrap_state.json` shows slots ramping from
-#     half-capacity (~4) to full (parallel_episodes=8) over bootstrap_window_size.
+#   - bootstrap permit: `bootstrap_state.json` shows in-flight slots (capped at
+#     bootstrap_concurrency_cap; full capacity active from episode 0).
 
 model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
 gpu_memory_utilization = 0.90
@@ -121,7 +121,7 @@ max_episodes = 10000
 # Framework cap on survey-phase episodes before transitioning out of
 # bootstrap. Independent of, and complementary to, the per-episode
 # bootstrap_concurrency_cap permit gating in the task (defaults to 4,
-# ramping to parallel_episodes over bootstrap_window_size=8).
+# active at full capacity from episode 0).
 max_bootstrap_episodes = 20
 checkpoint_every_episode = true
 # Resume from prior generation_0 checkpoint when present. Verifies the
