@@ -105,6 +105,40 @@ def _default_artifact_root() -> str:
     return str((Path.cwd() / "data" / "execution-artifacts").resolve())
 
 
+def _collect_artifact_files(artifact_dir: str) -> list[str]:
+    artifact_files = []
+    for root, _, files in os.walk(artifact_dir):
+        for file_name in files:
+            artifact_files.append(os.path.join(root, file_name))
+    return artifact_files
+
+
+def _extract_tar_bytes(raw: bytes, artifact_dir: str) -> list[str]:
+    import io
+    import tarfile
+
+    tar_data = io.BytesIO(raw)
+    with tarfile.open(fileobj=tar_data) as tar:
+        tar.extractall(artifact_dir, filter="data")
+    return _collect_artifact_files(artifact_dir)
+
+
+def _tar_container_path(container: Any, container_path: str, timeout_s: int = 30) -> bytes:
+    archive_script = (
+        "import sys, tarfile\n"
+        f"path = {json.dumps(container_path)}\n"
+        "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as tar:\n"
+        "    tar.add(path, arcname='.')\n"
+    )
+    result = exec_run_with_timeout(
+        container, ["python3", "-c", archive_script], timeout_s=timeout_s
+    )
+    exit_code, raw = coerce_exec_result(result)
+    if exit_code != 0:
+        raise RuntimeError(raw.decode(errors="replace"))
+    return raw
+
+
 def _get_or_create_session(session_id: str | None = None, max_attempts: int = 3) -> ExecutionSession:
     """Get or create execution session."""
     with _session_lock:
@@ -164,6 +198,7 @@ def _execute_in_container(record: ExecutionRecord, artifact_dir: str) -> None:
 import os
 import glob
 import pickle
+import shutil
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -175,6 +210,7 @@ host_artifact_dir = "{artifact_dir}"
 # Container paths - use real data paths
 data_dir = "/workspace/input/amalgamated_csvs"
 output_dir = "/workspace/out"
+shutil.rmtree(output_dir, ignore_errors=True)
 os.makedirs(output_dir, exist_ok=True)
 
 # Store original locals to compare later
@@ -297,22 +333,11 @@ finally:
         record.stdout = stdout.strip()
         record.stderr = stderr.strip()
         
-        # Pull artifacts from container using Docker SDK get_archive
+        # Pull artifacts from the container via an in-container tar stream.
+        # Docker's archive API can miss files under tmpfs-backed paths.
         try:
-            import tarfile
-            import io as _io
-            bits, _ = record.container.get_archive('/workspace/out')
-            tar_data = _io.BytesIO()
-            for chunk in bits:
-                tar_data.write(chunk)
-            tar_data.seek(0)
-            with tarfile.open(fileobj=tar_data) as tar:
-                tar.extractall(artifact_dir)
-            artifact_files = []
-            for root, _, files in os.walk(artifact_dir):
-                for f in files:
-                    artifact_files.append(os.path.join(root, f))
-            record.artifact_files = artifact_files
+            raw_archive = _tar_container_path(record.container, "/workspace/out")
+            record.artifact_files = _extract_tar_bytes(raw_archive, artifact_dir)
         except Exception as copy_err:
             record.add_progress(f"Warning: Could not extract artifacts from container: {copy_err}")
             record.artifact_files = []

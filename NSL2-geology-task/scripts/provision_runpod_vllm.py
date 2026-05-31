@@ -205,10 +205,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(f"No pod found for id {args.pod_id}", file=sys.stderr)
         return 1
     ip, port = _public_tcp(pod_obj)
-    runtime = pod_obj.get("runtime") or {}
     print(f"pod_id        : {args.pod_id}")
     print(f"desiredStatus : {pod_obj.get('desiredStatus')}")
-    print(f"uptime (s)    : {runtime.get('uptimeInSeconds')}")
+    print(f"uptime (s)    : {pod_obj.get('uptimeSeconds')}")
+    print(f"cost/hr       : {pod_obj.get('costPerHr')}")  # actual RunPod rate, not the estimate
     print(f"public 8000   : {f'http://{ip}:{port}' if ip and port else '(not exposed yet)'}")
     vllm_key = os.environ.get("RUNPOD_VLLM_KEY")
     if ip and port:

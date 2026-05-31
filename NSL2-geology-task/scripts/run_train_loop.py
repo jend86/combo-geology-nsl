@@ -240,6 +240,8 @@ def _invoke_train_sft(
         str(training.max_seq_length),
         "--max-steps",
         str(training.max_steps),
+        "--num-train-epochs",
+        str(training.num_train_epochs),
         "--per-device-train-batch-size",
         str(training.per_device_train_batch_size),
         "--gradient-accumulation-steps",
@@ -248,11 +250,37 @@ def _invoke_train_sft(
         str(training.learning_rate),
         "--warmup-steps",
         str(training.warmup_steps),
+        "--warmup-ratio",
+        str(training.warmup_ratio),
+        "--lr-scheduler-type",
+        training.lr_scheduler_type,
+        "--weight-decay",
+        str(training.weight_decay),
+        "--lora-rank",
+        str(training.lora_rank),
+        "--lora-alpha",
+        str(training.lora_alpha),
+        "--lora-dropout",
+        str(training.lora_dropout),
+        "--seed",
+        str(training.seed),
         "--export-format",
         export_format,
         "--quantize",
         training.gguf_quantize,
     ]
+    if training.rehearsal_dataset:
+        cmd += ["--rehearsal-dataset", training.rehearsal_dataset]
+        cmd += ["--rehearsal-split", training.rehearsal_split]
+        cmd += ["--rehearsal-text-field", training.rehearsal_text_field]
+        cmd += [
+            "--rehearsal-rows-per-epoch",
+            str(training.rehearsal_rows_per_epoch),
+        ]
+        cmd += ["--rehearsal-prompt-chars", str(training.rehearsal_prompt_chars)]
+        cmd += ["--rehearsal-max-chars", str(training.rehearsal_max_chars)]
+        if training.rehearsal_seed is not None:
+            cmd += ["--rehearsal-seed", str(training.rehearsal_seed)]
     if training.wandb_project:
         cmd += ["--wandb-project", training.wandb_project]
     for path in training_paths:

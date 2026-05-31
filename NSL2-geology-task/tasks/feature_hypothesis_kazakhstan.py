@@ -3090,10 +3090,19 @@ finally:
                 import io
                 import tarfile
 
-                bits, _ = analysis.get_archive(container_artifact_dir)
-                tar_data = io.BytesIO()
-                for chunk in bits:
-                    tar_data.write(chunk)
+                archive_script = (
+                    "import sys, tarfile\n"
+                    f"path = {json.dumps(container_artifact_dir)}\n"
+                    "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as tar:\n"
+                    "    tar.add(path, arcname='.')\n"
+                )
+                archive_result = exec_run_with_timeout(
+                    analysis, ["python3", "-c", archive_script], timeout_s=30
+                )
+                archive_code, archive_raw = coerce_exec_result(archive_result)
+                if archive_code != 0:
+                    raise RuntimeError(archive_raw.decode(errors="replace"))
+                tar_data = io.BytesIO(archive_raw)
                 tar_data.seek(0)
                 with tarfile.open(fileobj=tar_data) as tar:
                     tar.extractall(artifact_dir, filter="data")

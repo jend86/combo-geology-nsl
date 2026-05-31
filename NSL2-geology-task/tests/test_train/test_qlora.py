@@ -148,6 +148,62 @@ class TestLoadSftDataset(unittest.TestCase):
             dataset = _load_sft_dataset([path], tokenizer)
         self.assertEqual(len(dataset), 1)
 
+    def test_load_sft_dataset_expands_virtual_epochs_with_rehearsal(self):
+        from datasets import Dataset
+
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl(
+                [self._make_row(prompt="Kazakhstan task", raw_response="Hypothesis")],
+                path,
+            )
+            rehearsal = Dataset.from_list(
+                [
+                    {
+                        "text": (
+                            f"Geology rehearsal passage {i}. "
+                            "Sediment, structure, basin, and mineral systems interact. "
+                            "This sentence provides enough continuation text."
+                        )
+                    }
+                    for i in range(8)
+                ]
+            )
+
+            with patch("src.train.qlora.load_dataset", return_value=rehearsal) as mock_load:
+                dataset = _load_sft_dataset(
+                    [path],
+                    tokenizer,
+                    virtual_epochs=2,
+                    rehearsal_dataset="ClickNoow/5k-dataset-geogpt-fineweb",
+                    rehearsal_split="train",
+                    rehearsal_text_field="text",
+                    rehearsal_rows_per_epoch=2,
+                    rehearsal_seed=11,
+                    rehearsal_prompt_chars=32,
+                    rehearsal_max_chars=160,
+                )
+
+        mock_load.assert_called_once_with(
+            "ClickNoow/5k-dataset-geogpt-fineweb",
+            split="train",
+        )
+        self.assertEqual(len(dataset), 6)
+        self.assertEqual(
+            sum(row["prompt"] == "<user>Kazakhstan task</user><asst>" for row in dataset),
+            2,
+        )
+        rehearsal_prompts = [
+            row["prompt"] for row in dataset if "Continue the following" in row["prompt"]
+        ]
+        self.assertEqual(len(rehearsal_prompts), 4)
+        self.assertTrue(
+            all("Geology rehearsal passage" in row["completion"] for row in dataset if row["prompt"] in rehearsal_prompts)
+        )
+
 
 class TestQloraGpuCleanup(unittest.TestCase):
     @patch("src.train.qlora.FastLanguageModel.from_pretrained")
@@ -450,6 +506,95 @@ class TestTrainSft(unittest.TestCase):
         self.assertIn("training_data_paths", metadata)
         self.assertIn("exported_at", metadata)
         self.assertIn("max_steps", metadata)
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_uses_virtual_epoch_rehearsal_and_sft_knobs(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from datasets import Dataset
+
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = MagicMock()
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            user_content = messages[0]["content"]
+            if len(messages) == 1:
+                return f"<user>{user_content}</user><asst>"
+            return f"<user>{user_content}</user><asst>{messages[1]['content']}</asst>"
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+            rehearsal = Dataset.from_list(
+                [
+                    {
+                        "text": (
+                            f"Rehearsal passage {i}. "
+                            "Geological context and environmental process text continue here."
+                        )
+                    }
+                    for i in range(8)
+                ]
+            )
+
+            with patch("src.train.qlora.load_dataset", return_value=rehearsal):
+                train_sft(
+                    base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                    training_data_paths=[str(data_path)],
+                    output_dir=str(output_dir),
+                    max_steps=-1,
+                    num_train_epochs=2,
+                    gradient_accumulation_steps=16,
+                    learning_rate=1e-4,
+                    warmup_ratio=0.03,
+                    lr_scheduler_type="linear",
+                    weight_decay=0.001,
+                    lora_rank=32,
+                    lora_alpha=32,
+                    lora_dropout=0.0,
+                    seed=3407,
+                    rehearsal_dataset="ClickNoow/5k-dataset-geogpt-fineweb",
+                    rehearsal_rows_per_epoch=2,
+                    rehearsal_seed=123,
+                )
+
+            metadata = json.loads(
+                (output_dir.resolve() / "training_info.json").read_text()
+            )
+
+        mock_attach_lora_adapter.assert_called_once()
+        self.assertEqual(mock_attach_lora_adapter.call_args.args[1]["rank"], 32)
+        self.assertEqual(mock_attach_lora_adapter.call_args.args[1]["alpha"], 32)
+        trainer_dataset = mock_sft_trainer_cls.call_args.kwargs["train_dataset"]
+        self.assertEqual(len(trainer_dataset), 6)
+        trainer_args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(trainer_args.max_steps, -1)
+        self.assertEqual(trainer_args.num_train_epochs, 1)
+        self.assertEqual(trainer_args.gradient_accumulation_steps, 16)
+        self.assertEqual(trainer_args.learning_rate, 1e-4)
+        self.assertEqual(trainer_args.warmup_ratio, 0.03)
+        self.assertEqual(trainer_args.lr_scheduler_type.value, "linear")
+        self.assertEqual(trainer_args.weight_decay, 0.001)
+        self.assertEqual(metadata["configured_num_train_epochs"], 2)
+        self.assertEqual(metadata["virtual_epochs"], 2)
+        self.assertEqual(metadata["row_count"], 6)
+        self.assertEqual(metadata["rehearsal_rows_per_epoch"], 2)
 
     def test_train_sft_cli_multiple_training_data(self):
         """CLI should accept multiple --training-data arguments."""

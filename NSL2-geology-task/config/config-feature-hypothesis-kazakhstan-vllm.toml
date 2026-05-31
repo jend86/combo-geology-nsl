@@ -56,11 +56,18 @@ max_model_len = 65536
 # slack: when one slot's prefill stalls, another can pre-empt without
 # the engine queueing.
 max_num_seqs = 10
-# Chunk size for chunked prefill. 16 384 doubles the prefill burst, which
-# is the dominant cost at the observed 84:1 input:output ratio. KV
-# reservation grows with max_model_len × max_num_seqs (unchanged); this
-# knob only governs prefill batching.
-max_num_batched_tokens = 16384
+# Chunk size for chunked prefill. EXPERIMENT 2026-05-31: lowered 16384 -> 4096.
+# The 2026-05-31 live baseline (10x60s windows, vllm_live_metrics.py) showed the
+# box is decode-starved, not preemption-bound: ~0 preemptions, but only ~7%
+# steady-state prefill cached and aggregate gen ~5.7 tok/s (<1 tok/s/stream),
+# blowing the 300s inference timeout (263 APITimeouts). vLLM V1 schedules decode
+# before prefill chunks into the remaining token budget; a smaller budget de-
+# prioritizes the giant uncached prefills so decode advances. Cost: higher TTFT.
+# FLOOR: gemma-4 is multimodal; vLLM requires max_num_batched_tokens >=
+# max_tokens_per_mm_item (2496), so 2048 crashed startup. 4096 is the smallest
+# clean value above that floor (still 4x below baseline).
+# REVERT to 16384 if admit-rate/quality regresses or decode does not recover.
+max_num_batched_tokens = 4096
 cudagraph_mode = "piecewise"
 extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
 enable_auto_tool_choice = true
@@ -125,19 +132,31 @@ generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
 
 [training]
 base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
-max_steps = 100
+max_steps = -1
+num_train_epochs = 2
 per_device_train_batch_size = 1
-gradient_accumulation_steps = 1
-learning_rate = 2e-4
-warmup_steps = 2
+gradient_accumulation_steps = 16
+learning_rate = 1e-4
+warmup_steps = 0
+warmup_ratio = 0.03
+lr_scheduler_type = "linear"
+weight_decay = 0.001
+lora_rank = 32
+lora_alpha = 32
+lora_dropout = 0.0
+seed = 3407
 max_seq_length = 2048
+rehearsal_dataset = "ClickNoow/5k-dataset-geogpt-fineweb"
+rehearsal_split = "train"
+rehearsal_text_field = "text"
+rehearsal_rows_per_epoch = 500
+rehearsal_seed = 3407
 adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
 wandb_project = "feature-hypothesis-kazakhstan"
 gpu_wait_min_free_memory_fraction = 0.7
 
 [orchestration]
-# Temporarily capped to 1 to stay in gen0 only (no finetuning) — restore to 12 when ready to advance.
-num_generations = 1
+num_generations = 12
 training_window_size = 3
 
 [observability]

@@ -620,10 +620,25 @@ class AppConfig(BaseModel):
     class TrainingConfig(BaseModel):
         base_model: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
         max_steps: int = 50
+        num_train_epochs: int = 1
         per_device_train_batch_size: int = 2
         gradient_accumulation_steps: int = 4
         learning_rate: float = 2e-4
         warmup_steps: int = 5
+        warmup_ratio: float = 0.0
+        lr_scheduler_type: str = "linear"
+        weight_decay: float = 0.0
+        lora_rank: int = 32
+        lora_alpha: int = 32
+        lora_dropout: float = 0.0
+        seed: int = 42
+        rehearsal_dataset: Optional[str] = None
+        rehearsal_split: str = "train"
+        rehearsal_text_field: str = "text"
+        rehearsal_rows_per_epoch: int = 0
+        rehearsal_seed: Optional[int] = None
+        rehearsal_prompt_chars: int = 256
+        rehearsal_max_chars: int = 2048
         max_seq_length: int = 2048
         adapter_output_dir: str = "./models/adapters"
         wandb_project: Optional[str] = None

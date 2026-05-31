@@ -153,6 +153,18 @@ generation_output_dir = "./data/generations"
 [training]
 base_model = "Qwen/Qwen2.5-Coder-7B-Instruct"
 adapter_output_dir = "./models/adapters"
+max_steps = -1
+num_train_epochs = 2
+gradient_accumulation_steps = 16
+learning_rate = 1e-4
+warmup_ratio = 0.03
+lr_scheduler_type = "linear"
+weight_decay = 0.001
+lora_rank = 32
+lora_alpha = 32
+seed = 3407
+rehearsal_dataset = "ClickNoow/5k-dataset-geogpt-fineweb"
+rehearsal_rows_per_epoch = 500
 gpu_wait_timeout_seconds = 90
 gpu_wait_min_free_memory_fraction = 0.85
 
@@ -169,6 +181,21 @@ training_window_size = 3
         self.assertEqual(config.orchestration.training_window_size, 3)
         self.assertEqual(config.training.gpu_wait_timeout_seconds, 90)
         self.assertEqual(config.training.gpu_wait_min_free_memory_fraction, 0.85)
+        self.assertEqual(config.training.max_steps, -1)
+        self.assertEqual(config.training.num_train_epochs, 2)
+        self.assertEqual(config.training.gradient_accumulation_steps, 16)
+        self.assertEqual(config.training.learning_rate, 1e-4)
+        self.assertEqual(config.training.warmup_ratio, 0.03)
+        self.assertEqual(config.training.lr_scheduler_type, "linear")
+        self.assertEqual(config.training.weight_decay, 0.001)
+        self.assertEqual(config.training.lora_rank, 32)
+        self.assertEqual(config.training.lora_alpha, 32)
+        self.assertEqual(config.training.seed, 3407)
+        self.assertEqual(
+            config.training.rehearsal_dataset,
+            "ClickNoow/5k-dataset-geogpt-fineweb",
+        )
+        self.assertEqual(config.training.rehearsal_rows_per_epoch, 500)
 
     def test_collect_training_window_uses_latest_n_generations(self) -> None:
         from scripts.run_train_loop import _collect_training_window_paths
@@ -212,6 +239,62 @@ training_window_size = 3
                 / "sft_training_rows.jsonl",
             ],
         )
+
+    @patch("scripts.run_train_loop.subprocess.Popen")
+    def test_invoke_train_sft_passes_sft_and_rehearsal_flags(
+        self,
+        mock_popen: MagicMock,
+    ) -> None:
+        from scripts.run_train_loop import _invoke_train_sft
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            config.training.max_steps = -1
+            config.training.num_train_epochs = 2
+            config.training.gradient_accumulation_steps = 16
+            config.training.learning_rate = 1e-4
+            config.training.warmup_ratio = 0.03
+            config.training.lr_scheduler_type = "linear"
+            config.training.weight_decay = 0.001
+            config.training.lora_rank = 32
+            config.training.lora_alpha = 32
+            config.training.lora_dropout = 0.0
+            config.training.seed = 3407
+            config.training.rehearsal_dataset = "ClickNoow/5k-dataset-geogpt-fineweb"
+            config.training.rehearsal_rows_per_epoch = 500
+            config.training.rehearsal_seed = 2026
+
+            proc = MagicMock()
+            proc.stdout = iter([str(base_dir / "adapter") + "\n"])
+            proc.wait.return_value = 0
+            mock_popen.return_value = proc
+
+            result = _invoke_train_sft(
+                config,
+                training_paths=[base_dir / "rows.jsonl"],
+                output_dir=base_dir / "adapter",
+                export_format="lora",
+            )
+
+        self.assertEqual(result, base_dir / "adapter")
+        cmd = mock_popen.call_args.args[0]
+        self.assertIn("--num-train-epochs", cmd)
+        self.assertIn("2", cmd)
+        self.assertIn("--warmup-ratio", cmd)
+        self.assertIn("0.03", cmd)
+        self.assertIn("--lr-scheduler-type", cmd)
+        self.assertIn("linear", cmd)
+        self.assertIn("--weight-decay", cmd)
+        self.assertIn("0.001", cmd)
+        self.assertIn("--lora-rank", cmd)
+        self.assertIn("32", cmd)
+        self.assertIn("--seed", cmd)
+        self.assertIn("3407", cmd)
+        self.assertIn("--rehearsal-dataset", cmd)
+        self.assertIn("ClickNoow/5k-dataset-geogpt-fineweb", cmd)
+        self.assertIn("--rehearsal-rows-per-epoch", cmd)
+        self.assertIn("500", cmd)
 
     @patch("scripts.run_train_loop._invoke_train_sft")
     @patch("scripts.run_train_loop.run_generation_phase")

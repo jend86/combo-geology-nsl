@@ -4,12 +4,13 @@ import argparse
 import gc
 import json
 import os
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence, cast
 
-from datasets import Dataset
-from dotenv import dotenv_values, find_dotenv, load_dotenv
+from datasets import Dataset, load_dataset
+from dotenv import dotenv_values, find_dotenv
 from loguru import logger
 from trl.trainer.sft_config import SFTConfig
 from trl.trainer.sft_trainer import SFTTrainer
@@ -88,10 +89,7 @@ def _validate_training_base_model(base_model: str) -> None:
 def _load_wandb_api_key_from_dotenv() -> str | None:
     dotenv_path = find_dotenv(usecwd=True)
     if not dotenv_path:
-        try:
-            load_dotenv()
-        except Exception:
-            return None
+        return None
 
     value = dotenv_values(dotenv_path).get("WANDB_API_KEY")
     if not isinstance(value, str) or not value:
@@ -156,7 +154,7 @@ def _attach_lora_adapter(model: Any, config: dict[str, Any]) -> Any:
         r=config.get("rank", 32),
         target_modules=config.get("target_modules", LORA_TARGET_MODULES_LM_ONLY_REGEX),
         lora_alpha=config.get("alpha", 32),
-        lora_dropout=0,
+        lora_dropout=config.get("dropout", 0),
         bias="none",
         use_gradient_checkpointing="unsloth",
     )
@@ -235,9 +233,9 @@ def _training_metadata_path(artifact_path: Path) -> Path:
     return artifact_path / "training_info.json"
 
 
-def _load_sft_dataset(training_data_paths: Sequence[Path], tokenizer: Any) -> Any:
-    """Load one or more generation JSONL files into a chat-formatted Dataset."""
-
+def _load_self_generated_sft_rows(
+    training_data_paths: Sequence[Path], tokenizer: Any
+) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for training_data_path in training_data_paths:
         resolved_path = Path(training_data_path).expanduser().resolve()
@@ -270,11 +268,104 @@ def _load_sft_dataset(training_data_paths: Sequence[Path], tokenizer: Any) -> An
                     add_generation_prompt=False,
                 )[len(prompt_text):]
                 rows.append({"prompt": prompt_text, "completion": completion_text})
+    return rows
+
+
+def _load_rehearsal_sft_rows(
+    *,
+    dataset_name: str,
+    split: str,
+    text_field: str,
+    rows_per_epoch: int,
+    virtual_epochs: int,
+    seed: int,
+    prompt_chars: int,
+    max_chars: int,
+) -> list[list[dict[str, str]]]:
+    if rows_per_epoch <= 0:
+        return [[] for _ in range(virtual_epochs)]
+
+    rehearsal_dataset = load_dataset(dataset_name, split=split)
+    valid_texts: list[str] = []
+    for row in rehearsal_dataset:
+        value = row.get(text_field)
+        if not isinstance(value, str):
+            continue
+        text = " ".join(value.split())
+        if text:
+            valid_texts.append(text[:max_chars])
+
+    if not valid_texts:
+        raise ValueError(
+            f"No rehearsal text found in dataset '{dataset_name}' field '{text_field}'"
+        )
+
+    rows_by_epoch: list[list[dict[str, str]]] = []
+    for epoch in range(virtual_epochs):
+        rng = random.Random(seed + epoch)
+        if rows_per_epoch <= len(valid_texts):
+            selected_texts = rng.sample(valid_texts, rows_per_epoch)
+        else:
+            selected_texts = [rng.choice(valid_texts) for _ in range(rows_per_epoch)]
+
+        epoch_rows: list[dict[str, str]] = []
+        for text in selected_texts:
+            excerpt = text[:prompt_chars].rstrip()
+            prompt = "Continue the following geoscience passage"
+            if excerpt:
+                prompt += f":\n\n{excerpt}"
+            else:
+                prompt += "."
+            epoch_rows.append({"prompt": prompt, "completion": text})
+        rows_by_epoch.append(epoch_rows)
+
+    return rows_by_epoch
+
+
+def _load_sft_dataset(
+    training_data_paths: Sequence[Path],
+    tokenizer: Any,
+    *,
+    virtual_epochs: int = 1,
+    rehearsal_dataset: str | None = None,
+    rehearsal_split: str = "train",
+    rehearsal_text_field: str = "text",
+    rehearsal_rows_per_epoch: int = 0,
+    rehearsal_seed: int = 3407,
+    rehearsal_prompt_chars: int = 256,
+    rehearsal_max_chars: int = 2048,
+) -> Any:
+    """Load generation JSONL files plus optional rehearsal rows into an SFT Dataset."""
+
+    if virtual_epochs < 1:
+        raise ValueError("virtual_epochs must be at least 1")
+
+    rows = _load_self_generated_sft_rows(training_data_paths, tokenizer)
 
     if not rows:
         raise ValueError("No training rows found")
 
-    return Dataset.from_list(rows)
+    rehearsal_rows_by_epoch: list[list[dict[str, str]]]
+    if rehearsal_dataset:
+        rehearsal_rows_by_epoch = _load_rehearsal_sft_rows(
+            dataset_name=rehearsal_dataset,
+            split=rehearsal_split,
+            text_field=rehearsal_text_field,
+            rows_per_epoch=rehearsal_rows_per_epoch,
+            virtual_epochs=virtual_epochs,
+            seed=rehearsal_seed,
+            prompt_chars=rehearsal_prompt_chars,
+            max_chars=rehearsal_max_chars,
+        )
+    else:
+        rehearsal_rows_by_epoch = [[] for _ in range(virtual_epochs)]
+
+    expanded_rows: list[dict[str, str]] = []
+    for epoch in range(virtual_epochs):
+        expanded_rows.extend(rows)
+        expanded_rows.extend(rehearsal_rows_by_epoch[epoch])
+
+    return Dataset.from_list(expanded_rows)
 
 
 def train_sft(
@@ -288,7 +379,22 @@ def train_sft(
     gradient_accumulation_steps: int = 4,
     learning_rate: float = 2e-4,
     warmup_steps: int = 5,
+    warmup_ratio: float = 0.0,
+    lr_scheduler_type: str = "linear",
+    weight_decay: float = 0.0,
     logging_steps: int = 1,
+    num_train_epochs: int = 1,
+    lora_rank: int = 32,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.0,
+    seed: int = 42,
+    rehearsal_dataset: str | None = None,
+    rehearsal_split: str = "train",
+    rehearsal_text_field: str = "text",
+    rehearsal_rows_per_epoch: int = 0,
+    rehearsal_seed: int | None = None,
+    rehearsal_prompt_chars: int = 256,
+    rehearsal_max_chars: int = 2048,
     wandb_project: str | None = None,
     export_format: TrainingExportFormat = "lora",
     gguf_quantize: str = "f16",
@@ -314,7 +420,10 @@ def train_sft(
         base_model,
         max_seq_length=max_seq_length,
     )
-    model = _attach_lora_adapter(model, {})
+    model = _attach_lora_adapter(
+        model,
+        {"rank": lora_rank, "alpha": lora_alpha, "dropout": lora_dropout},
+    )
 
     resolved_output_dir = Path(output_dir).expanduser().resolve()
     if export_format != "gguf":
@@ -326,23 +435,37 @@ def train_sft(
     dataset = _load_sft_dataset(
         [Path(path) for path in resolved_training_paths],
         tokenizer,
+        virtual_epochs=num_train_epochs,
+        rehearsal_dataset=rehearsal_dataset,
+        rehearsal_split=rehearsal_split,
+        rehearsal_text_field=rehearsal_text_field,
+        rehearsal_rows_per_epoch=rehearsal_rows_per_epoch,
+        rehearsal_seed=rehearsal_seed if rehearsal_seed is not None else seed,
+        rehearsal_prompt_chars=rehearsal_prompt_chars,
+        rehearsal_max_chars=rehearsal_max_chars,
     )
     row_count = len(dataset)
+    effective_warmup_steps = 0 if warmup_ratio > 0 else warmup_steps
 
     trainer = SFTTrainer(
         model=model,
         args=SFTConfig(
             output_dir=str(resolved_output_dir),
             max_steps=max_steps,
+            num_train_epochs=1,
             per_device_train_batch_size=per_device_train_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             learning_rate=learning_rate,
-            warmup_steps=warmup_steps,
+            warmup_steps=effective_warmup_steps,
+            warmup_ratio=warmup_ratio,
+            lr_scheduler_type=lr_scheduler_type,
+            weight_decay=weight_decay,
             logging_steps=logging_steps,
             save_strategy="no",
             report_to=report_to,
             max_length=max_seq_length,
             completion_only_loss=True,
+            seed=seed,
             **_mixed_precision_kwargs(),
             optim="paged_adamw_8bit",
         ),
@@ -363,9 +486,26 @@ def train_sft(
         {
             "base_model": base_model,
             "max_steps": max_steps,
+            "configured_num_train_epochs": num_train_epochs,
+            "virtual_epochs": num_train_epochs,
+            "per_device_train_batch_size": per_device_train_batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "learning_rate": learning_rate,
+            "warmup_steps": effective_warmup_steps,
+            "warmup_ratio": warmup_ratio,
+            "lr_scheduler_type": lr_scheduler_type,
+            "weight_decay": weight_decay,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "seed": seed,
             "row_count": row_count,
             "training_data_paths": resolved_training_paths,
+            "rehearsal_dataset": rehearsal_dataset,
+            "rehearsal_split": rehearsal_split,
+            "rehearsal_text_field": rehearsal_text_field,
+            "rehearsal_rows_per_epoch": rehearsal_rows_per_epoch,
+            "rehearsal_seed": rehearsal_seed if rehearsal_seed is not None else seed,
             "export_format": export_format,
             "wandb_project": wandb_project,
             "exported_at": _export_timestamp(),
@@ -387,7 +527,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--warmup-steps", type=int, default=5)
+    parser.add_argument("--warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--lr-scheduler-type", default="linear")
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--logging-steps", type=int, default=1)
+    parser.add_argument("--num-train-epochs", type=int, default=1)
+    parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--lora-alpha", type=int, default=32)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--rehearsal-dataset", default=None)
+    parser.add_argument("--rehearsal-split", default="train")
+    parser.add_argument("--rehearsal-text-field", default="text")
+    parser.add_argument("--rehearsal-rows-per-epoch", type=int, default=0)
+    parser.add_argument("--rehearsal-seed", type=int, default=None)
+    parser.add_argument("--rehearsal-prompt-chars", type=int, default=256)
+    parser.add_argument("--rehearsal-max-chars", type=int, default=2048)
     parser.add_argument("--wandb-project", default=None)
     parser.add_argument(
         "--export-format",
@@ -415,7 +570,22 @@ def main(argv: list[str] | None = None) -> int:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
+        lr_scheduler_type=args.lr_scheduler_type,
+        weight_decay=args.weight_decay,
         logging_steps=args.logging_steps,
+        num_train_epochs=args.num_train_epochs,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        seed=args.seed,
+        rehearsal_dataset=args.rehearsal_dataset,
+        rehearsal_split=args.rehearsal_split,
+        rehearsal_text_field=args.rehearsal_text_field,
+        rehearsal_rows_per_epoch=args.rehearsal_rows_per_epoch,
+        rehearsal_seed=args.rehearsal_seed,
+        rehearsal_prompt_chars=args.rehearsal_prompt_chars,
+        rehearsal_max_chars=args.rehearsal_max_chars,
         wandb_project=args.wandb_project,
         export_format=args.export_format,
         gguf_quantize=args.quantize,
