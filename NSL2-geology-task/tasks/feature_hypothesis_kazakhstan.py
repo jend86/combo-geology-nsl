@@ -123,6 +123,7 @@ _KG_CROSSBREED_INDEX = "crossbreed_index.jsonl"          # legacy MI index — r
 _KG_PAIRWISE_DISTANCE = "pairwise_distance.jsonl"        # new orthogonality index (Jaccard/MAE)
 _KG_ADMITTED_INDEX = "admitted_index.json"
 _KG_BOOTSTRAP_STATE = "bootstrap_state.json"
+_KG_INTERWEAVE_STATE = "interweave_state.json"
 _KG_QUEUE = "crossbreed_queue.jsonl"
 _KG_LOCK = "kg.lock"
 
@@ -421,6 +422,12 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     # Per-entry cap so the block stays bounded under long hypotheses; the
     # rendering uses an ellipsis when exceeded.
     novelty_max_chars_per_hypothesis: int = 280
+    # Once steady-state crossbreed has stalled for this many completed attempts
+    # without a fresh KG admit, inject one survey episode before returning to
+    # crossbreed. This interweaves fresh data-grounded hypotheses without
+    # changing scoring or adding an explicit novelty prompt.
+    interweave_bootstrap_enabled: bool = True
+    interweave_failed_episode_threshold: int = 50
 
 
 @dataclass
@@ -1704,13 +1711,24 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             Path(variation.kg_dir) / "greedy_init_complete.json"
         ).exists()
 
-        workflow_kind = "crossbreed" if (
+        crossbreed_ready = (
             variation.crossbreed_enabled and
             n_features >= variation.min_features and
             all_sources_done and
             greedy_done and
             self._has_crossbreed_pairs(variation)
-        ) else "survey"
+        )
+        interweave_bootstrap = False
+        if crossbreed_ready:
+            interweave_bootstrap = self._claim_interweave_bootstrap(
+                Path(variation.kg_dir),
+                threshold=int(getattr(variation, "interweave_failed_episode_threshold", 0) or 0),
+                episode_id=episode_id,
+                enabled=bool(getattr(variation, "interweave_bootstrap_enabled", True)),
+            )
+        workflow_kind = "survey" if interweave_bootstrap else (
+            "crossbreed" if crossbreed_ready else "survey"
+        )
 
         episode_context: dict[str, Any] = {
             "episode_id": episode_id,
@@ -1722,6 +1740,14 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             "grid_spec": variation.grid_spec,
             "n_features": n_features,
         }
+        if interweave_bootstrap:
+            episode_context.update({
+                "interweave_bootstrap": True,
+                "interweave_reason": "crossbreed_plateau",
+                "interweave_failed_episode_threshold": int(
+                    getattr(variation, "interweave_failed_episode_threshold", 0) or 0
+                ),
+            })
 
         # Crossbreed: serve a distinct ordered (parent_a, parent_b) pair from
         # the queue so concurrent slots do not collide on the same parents.
@@ -4236,6 +4262,28 @@ finally:
             breakdown["bootstrap_active"] = final.workflow_kind == "survey"
             if episode_context.get("duplicate_rejected"):
                 breakdown["duplicate_rejected"] = True
+            kg_dir_ctx = episode_context.get("kg_dir")
+            if isinstance(kg_dir_ctx, str) and kg_dir_ctx:
+                try:
+                    interweave_state = self._record_interweave_episode_result(
+                        Path(kg_dir_ctx),
+                        workflow_kind=final.workflow_kind,
+                        produced_new_admit=bool(reward.success)
+                        and not bool(episode_context.get("duplicate_rejected")),
+                        interweave_bootstrap=bool(
+                            episode_context.get("interweave_bootstrap")
+                        ),
+                    )
+                    if interweave_state:
+                        breakdown["interweave_failed_crossbreed_streak"] = int(
+                            interweave_state.get("consecutive_failed_crossbreed", 0)
+                        )
+                        if episode_context.get("interweave_bootstrap"):
+                            breakdown["interweave_bootstrap"] = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"feature_hypothesis: interweave state update failed: {exc}"
+                    )
             if breakdown != (reward.breakdown or {}):
                 reward = TaskReward(
                     value=reward.value,
@@ -5193,6 +5241,85 @@ finally:
         if summary:
             block = block + "\n\n" + summary
         return block
+
+    def _read_interweave_state(self, kg_dir: Path | str) -> dict[str, Any]:
+        data = self._read_json_or(
+            Path(kg_dir) / _KG_INTERWEAVE_STATE,
+            {"consecutive_failed_crossbreed": 0, "interweave_bootstraps_claimed": 0},
+        )
+        try:
+            data["consecutive_failed_crossbreed"] = max(
+                0, int(data.get("consecutive_failed_crossbreed", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            data["consecutive_failed_crossbreed"] = 0
+        try:
+            data["interweave_bootstraps_claimed"] = max(
+                0, int(data.get("interweave_bootstraps_claimed", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            data["interweave_bootstraps_claimed"] = 0
+        return data
+
+    def _claim_interweave_bootstrap(
+        self,
+        kg_dir: Path | str,
+        *,
+        threshold: int,
+        episode_id: str,
+        enabled: bool = True,
+    ) -> bool:
+        """Atomically claim one survey interweave after a crossbreed plateau.
+
+        The counter resets on claim, not on survey completion, so a plateau
+        injects exactly one bootstrap before returning to crossbreed attempts.
+        """
+        if not enabled or threshold <= 0:
+            return False
+        kg_path = Path(kg_dir)
+        with self._kg_lock(kg_path):
+            state = self._read_interweave_state(kg_path)
+            failures = int(state.get("consecutive_failed_crossbreed", 0))
+            if failures < threshold:
+                return False
+            state["consecutive_failed_crossbreed"] = 0
+            state["interweave_bootstraps_claimed"] = (
+                int(state.get("interweave_bootstraps_claimed", 0)) + 1
+            )
+            state["last_interweave_claimed_at"] = time.time()
+            if episode_id:
+                state["last_interweave_episode_id"] = episode_id
+            self._atomic_write_json(kg_path / _KG_INTERWEAVE_STATE, state)
+        return True
+
+    def _record_interweave_episode_result(
+        self,
+        kg_dir: Path | str,
+        *,
+        workflow_kind: str,
+        produced_new_admit: bool,
+        interweave_bootstrap: bool = False,
+    ) -> dict[str, Any]:
+        """Update the failed-crossbreed streak used by survey interweaving."""
+        if workflow_kind != "crossbreed" and not interweave_bootstrap:
+            return {}
+        kg_path = Path(kg_dir)
+        with self._kg_lock(kg_path):
+            state = self._read_interweave_state(kg_path)
+            if workflow_kind == "crossbreed":
+                if produced_new_admit:
+                    state["consecutive_failed_crossbreed"] = 0
+                else:
+                    state["consecutive_failed_crossbreed"] = (
+                        int(state.get("consecutive_failed_crossbreed", 0)) + 1
+                    )
+            elif interweave_bootstrap and produced_new_admit:
+                state["consecutive_failed_crossbreed"] = 0
+            state["last_recorded_at"] = time.time()
+            state["last_recorded_workflow_kind"] = workflow_kind
+            state["last_recorded_produced_new_admit"] = bool(produced_new_admit)
+            self._atomic_write_json(kg_path / _KG_INTERWEAVE_STATE, state)
+            return dict(state)
 
     @staticmethod
     def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:
