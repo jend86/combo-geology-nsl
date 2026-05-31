@@ -88,6 +88,31 @@ _ROLE_SERVICE = {
     "analysis": "analysis",
 }
 
+_SUMMARY_CODE_MAX_CHARS = 2_000
+_SUMMARY_RESULT_MAX_CHARS = 2_500
+
+
+def _safe_artifact_component(value: Any) -> str:
+    text = str(value or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", text).strip("._")
+    return safe or "unknown"
+
+
+def _compact_agent_text(value: Any, max_chars: int) -> tuple[str, bool]:
+    if not isinstance(value, str):
+        return "", False
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value, False
+    head_chars = max(1, int(max_chars * 0.65))
+    tail_chars = max(1, max_chars - head_chars)
+    omitted = len(value) - head_chars - tail_chars
+    return (
+        value[:head_chars].rstrip()
+        + f"\n...[truncated {omitted} chars; see artifact files/full trace]...\n"
+        + value[-tail_chars:].lstrip(),
+        True,
+    )
+
 _ANALYSIS_INPUT = "/workspace/input"
 _ANALYSIS_OUT = "/workspace/out"
 
@@ -1579,6 +1604,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         default_kg = repo_root / "data" / "kazakhstan" / "feature-hypothesis" / "knowledge"
         self._kg_dir = Path(task_config.get("kg_dir", default_kg)).resolve()
 
+        default_artifacts = self._kg_dir.parent / "train_data" / "artifacts"
+        self._artifact_dir = Path(
+            task_config.get("artifact_dir", default_artifacts)
+        ).resolve()
+
         self._docker_compose_dir = task_config.get(
             "docker_compose_dir", "docker/feature-hypothesis-kazakhstan-compose"
         )
@@ -1594,6 +1624,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             )
             (self._store_dir / sub / "scratch").mkdir(parents=True, exist_ok=True)
             (self._kg_dir / sub).mkdir(parents=True, exist_ok=True)
+        self._artifact_dir.mkdir(parents=True, exist_ok=True)
 
         # Pre-warm voxel-features imports. _exec_spatial_capability /
         # _exec_scoring_capability import voxel_features.spatial (which pulls
@@ -2880,16 +2911,28 @@ except Exception as user_code_error:
         code = phase_records.get("code", {})
         translate = phase_records.get("translate", {})
         evaluate = phase_records.get("evaluate", {})
+        code_executed, code_truncated = _compact_agent_text(
+            code.get("code_executed", ""), _SUMMARY_CODE_MAX_CHARS
+        )
+        result_summary, result_truncated = _compact_agent_text(
+            code.get("result_summary", ""), _SUMMARY_RESULT_MAX_CHARS
+        )
+        artifact_files = code.get("artifact_files", [])
+        if not isinstance(artifact_files, list):
+            artifact_files = []
         
         return CapabilityResult(
             "get_experiment_summary",
             output={
                 "hypothesis": hypothesise.get("hypothesis", ""),
                 "data_spec": hypothesise.get("data_spec", {}),
-                "code_executed": code.get("code_executed", ""),
-                "result_summary": code.get("result_summary", ""),
+                "code_executed": code_executed,
+                "code_executed_truncated": code_truncated,
+                "result_summary": result_summary,
+                "result_summary_truncated": result_truncated,
                 "artifact_directory": code.get("artifact_directory", ""),
-                "artifact_files": code.get("artifact_files", []),
+                "artifact_files": artifact_files,
+                "artifact_count": len(artifact_files),
                 "feature_layer_name": translate.get("feature_layer_name", ""),
                 "dtype": translate.get("dtype", "float"),
                 "bic_delta": evaluate.get("bic_delta"),
@@ -2915,9 +2958,13 @@ except Exception as user_code_error:
         if analysis is None:
             return CapabilityResult("submit_code", success=False, error="No analysis container")
         
-        # Create artifact directory
-        episode_id = ctx.episode_context.get("episode_id", "unknown")
-        artifact_dir = f"/tmp/artifacts/{episode_id}"
+        # Save inside the container, then copy back into the host artifact tree.
+        episode_id = _safe_artifact_component(
+            ctx.episode_context.get("episode_id") or ctx.episode_id
+        )
+        container_artifact_dir = f"/workspace/out/artifacts/{episode_id}"
+        artifact_dir = str(self._execution_artifact_root(ctx) / "submit_code")
+        Path(artifact_dir).mkdir(parents=True, exist_ok=True)
         
         # Wrap user code with automatic artifact capture
         indented_code = '\n'.join("    " + line for line in code.split('\n'))
@@ -2932,7 +2979,7 @@ import numpy as np
 from pathlib import Path
 
 # Create artifact directory and common output directories
-artifact_dir = "''' + artifact_dir + '''"
+artifact_dir = "''' + container_artifact_dir + '''"
 os.makedirs(artifact_dir, exist_ok=True)
 os.makedirs("/workspace/output", exist_ok=True)  # Fix common user code issue
 
@@ -3011,15 +3058,24 @@ finally:
             exit_code, raw = coerce_exec_result(result)
             stdout = raw.decode(errors="replace")
             
-            # Extract artifact information from stdout
+            # Copy container artifacts into the host artifact directory.
             artifact_files = []
-            if "ARTIFACTS_SAVED:" in stdout:
-                import re
-                artifacts_match = re.search(r"ARTIFACTS_SAVED: \[(.*?)\]", stdout)
-                if artifacts_match:
-                    artifacts_str = artifacts_match.group(1)
-                    # Parse the list of file paths
-                    artifact_files = [f.strip().strip("'\"") for f in artifacts_str.split(",") if f.strip()]
+            try:
+                import io
+                import tarfile
+
+                bits, _ = analysis.get_archive(container_artifact_dir)
+                tar_data = io.BytesIO()
+                for chunk in bits:
+                    tar_data.write(chunk)
+                tar_data.seek(0)
+                with tarfile.open(fileobj=tar_data) as tar:
+                    tar.extractall(artifact_dir, filter="data")
+                for root, _, files in os.walk(artifact_dir):
+                    for file_name in files:
+                        artifact_files.append(os.path.join(root, file_name))
+            except Exception as copy_err:
+                stdout += f"\nWarning: Could not extract artifacts from container: {copy_err}"
             
             # Store code and result with artifact information
             phase_records = ctx.episode_context.setdefault("phase_records", {})
@@ -3647,6 +3703,20 @@ finally:
                     success=False,
                     error=f"Unknown execution capability: {capability_name}"
                 )
+
+            args = dict(args)
+            if capability_name == "execution_submit":
+                analysis = self._pick_container(containers, "analysis")
+                if analysis is not None:
+                    args["container"] = analysis
+                else:
+                    print(
+                        "Warning: No analysis container available for "
+                        "execution_submit, using fallback mode"
+                    )
+                args.setdefault(
+                    "artifact_root", str(self._execution_artifact_root(ctx))
+                )
             
             # Call the tool function directly
             tool_func = tool_functions[capability_name]
@@ -3678,6 +3748,28 @@ finally:
                 success=False,
                 error=f"Execution capability failed: {str(e)}",
             )
+
+    def _execution_artifact_root(self, ctx: CapabilityExecutionContext) -> Path:
+        raw_base = (
+            ctx.episode_context.get("artifact_dir")
+            or ctx.episode_context.get("artifact_root")
+        )
+        if raw_base:
+            base = Path(str(raw_base)).expanduser()
+        else:
+            train_data = ctx.episode_context.get("train_data_save_folder")
+            base = (
+                Path(str(train_data)).expanduser() / "artifacts"
+                if train_data
+                else self._artifact_dir
+            )
+        run_id = _safe_artifact_component(ctx.episode_context.get("run_id", "manual"))
+        episode_id = _safe_artifact_component(
+            ctx.episode_context.get("framework_episode_id") or ctx.episode_id
+        )
+        artifact_root = base.resolve() / run_id / episode_id
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        return artifact_root
     
     def _exec_spatial_capability(
         self,
@@ -3869,6 +3961,62 @@ finally:
             # Route to scoring.create_feature_layer MCP tool
             print(f"🎯 DEBUG: Routing to tool: {capability_name}")
             if capability_name == "scoring_create_feature_layer":
+                args = dict(args)
+                requested_name = str(args.get("name", "")).strip()
+                phase_records = ctx.episode_context.setdefault("phase_records", {})
+                translated_name = str(
+                    phase_records.get("translate", {}).get("feature_layer_name", "")
+                ).strip()
+
+                # NAT can emit multiple tool calls in one assistant turn. If a
+                # scoring call races ahead of spatial_add_*, give the scratch
+                # store a short chance to observe the layer before failing.
+                available_layers = set(store.layer_names)
+                if requested_name not in available_layers and not (
+                    translated_name and translated_name in available_layers
+                ):
+                    for _ in range(5):
+                        time.sleep(0.1)
+                        store = SpatialVoxelStore(
+                            scratch_dir, grid, read_only_overlay=admitted_dir
+                        )
+                        available_layers = set(store.layer_names)
+                        if requested_name in available_layers or (
+                            translated_name and translated_name in available_layers
+                        ):
+                            break
+
+                if requested_name not in available_layers:
+                    if translated_name and translated_name in available_layers:
+                        print(
+                            "🎯 DEBUG: Requested scoring layer "
+                            f"{requested_name!r} missing; using last translated "
+                            f"layer {translated_name!r}"
+                        )
+                        args["name"] = translated_name
+                    else:
+                        layer_list = sorted(available_layers)
+                        message = (
+                            f"Spatial layer {requested_name!r} does not exist in "
+                            "the episode scratch store. Call spatial_add_point "
+                            "or spatial_add_line successfully before "
+                            "scoring_create_feature_layer."
+                        )
+                        result = {
+                            "success": False,
+                            "error": message,
+                            "requested_layer": requested_name,
+                            "last_translated_layer": translated_name,
+                            "available_layers": layer_list,
+                        }
+                        print(f"🎯 DEBUG: ❌ {message}")
+                        return CapabilityResult(
+                            capability_name,
+                            output=result,
+                            success=False,
+                            error=message,
+                        )
+
                 print("🎯 DEBUG: Calling scoring_create_feature_layer MCP function...")
                 result = scoring_create_feature_layer(store, **args)
                 # BIC scoring returns numpy scalars (np.bool_/np.float64); coerce

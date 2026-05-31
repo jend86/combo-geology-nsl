@@ -259,6 +259,12 @@ def _build_harness_context(
     tracing: _TracingState,
     cancel_event: threading.Event,
 ) -> HarnessContext:
+    req.episode_context.setdefault("run_id", rt.run_id)
+    req.episode_context.setdefault("framework_episode_id", req.episode_id)
+    req.episode_context.setdefault(
+        "train_data_save_folder", rt.config.train_data_save_folder
+    )
+
     prompt_spec = rt.task.prompt_spec(req.variation, req.episode_context)
     workflow = None
     if callable(getattr(type(rt.task), "workflow", None)):

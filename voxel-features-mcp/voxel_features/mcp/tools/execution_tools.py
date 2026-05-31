@@ -75,6 +75,7 @@ class ExecutionRecord:
     code: str
     timeout_s: int
     container: Any | None = None  # Docker container for execution
+    artifact_root: str | None = None
     status: ExecutionStatus = ExecutionStatus.PENDING
     start_time: float | None = None
     end_time: float | None = None
@@ -97,6 +98,13 @@ _executions: Dict[str, ExecutionRecord] = {}
 _session_lock = threading.Lock()
 
 
+def _default_artifact_root() -> str:
+    configured = os.environ.get("VFM_ARTIFACT_DIR")
+    if configured:
+        return configured
+    return str((Path.cwd() / "data" / "execution-artifacts").resolve())
+
+
 def _get_or_create_session(session_id: str | None = None, max_attempts: int = 3) -> ExecutionSession:
     """Get or create execution session."""
     with _session_lock:
@@ -117,7 +125,7 @@ def _execute_code_in_thread(record: ExecutionRecord) -> None:
         record.add_progress("Starting code execution")
         
         # Create artifact directory
-        base_artifact_dir = os.environ.get("VFM_ARTIFACT_DIR", "/tmp/voxel-features/artifacts")
+        base_artifact_dir = record.artifact_root or _default_artifact_root()
         artifact_dir = f"{base_artifact_dir}/{record.execution_id}"
         os.makedirs(artifact_dir, exist_ok=True)
         record.artifact_directory = artifact_dir
@@ -433,7 +441,8 @@ def execution_submit(
     timeout_s: int = 300,
     session_id: str | None = None,
     max_attempts: int = 3,
-    container: Any | None = None
+    container: Any | None = None,
+    artifact_root: str | None = None,
 ) -> dict[str, Any]:
     """
     Submit code for async execution.
@@ -444,6 +453,7 @@ def execution_submit(
         session_id: Session ID for budget tracking
         max_attempts: Maximum execution attempts for this session
         container: Optional Docker container for execution (recommended)
+        artifact_root: Optional base directory for this episode's artifacts
     
     Returns:
         Dict with execution_id and attempt info, or error if budget exhausted
@@ -465,7 +475,8 @@ def execution_submit(
         session_id=session.session_id,
         code=code,
         timeout_s=timeout_s,
-        container=container
+        container=container,
+        artifact_root=artifact_root,
     )
     
     # Use attempt

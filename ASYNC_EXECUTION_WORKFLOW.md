@@ -21,6 +21,7 @@ Submit code for async execution with budget tracking.
 - `timeout_s` (optional): Execution timeout in seconds (default 300)
 - `session_id` (optional): Session ID for budget tracking
 - `max_attempts` (optional): Maximum attempts for session (default 3)
+- `artifact_root` (optional/internal): Host directory for this episode's artifacts. Kazakhstan runs pass a repo-local `train_data/artifacts/<run_id>/<episode_id>` root automatically.
 
 **Returns:**
 ```json
@@ -65,7 +66,7 @@ Get final results and artifacts from completed execution.
   "status": "completed",
   "stdout": "Analysis output...",
   "stderr": "",
-  "artifact_directory": "/tmp/artifacts/exec_abc123",
+  "artifact_directory": "NSL2-geology-task/data/kazakhstan/feature-hypothesis/train_data/artifacts/<run_id>/<episode_id>/exec_abc123",
   "artifact_files": ["data.csv", "results.pkl"],
   "artifacts_count": 2,
   "execution_success": true,
@@ -128,7 +129,7 @@ Execution results are stored in `phase_records["code"]` with same format as old 
 {
     "code_executed": "original_python_code", 
     "result_summary": "stdout_output",
-    "artifact_directory": "/tmp/artifacts/exec_123",
+    "artifact_directory": "NSL2-geology-task/data/kazakhstan/feature-hypothesis/train_data/artifacts/<run_id>/<episode_id>/exec_123",
     "artifact_files": ["file1.csv", "file2.pkl"],
     "success": True,
     "execution_id": "exec_123",
@@ -141,19 +142,19 @@ Execution results are stored in `phase_records["code"]` with same format as old 
 - `execution_finalize` validates that artifacts were created if execution succeeded
 - Returns error if `success=True` but `artifacts_count=0`
 - Prevents translate agent confusion from missing artifacts
+- Artifacts should be rooted in run-owned repo-local directories, not shared global temp directories. `VFM_ARTIFACT_DIR` remains a manual override for standalone tool runs.
 
 ### Container Integration
 
 - Execution tools run via voxel-features-mcp container
-- Code execution currently simulated (placeholder for real container execution)
-- Artifact capture uses same pattern as original `submit_code`
+- Container execution writes artifacts to `/workspace/out`, then copies them back to the host `artifact_root` with Docker archive extraction.
 
 ## Migration Status
 
 - ✅ **Phase 1**: MCP tools implemented and tested
 - ✅ **Phase 2**: Workflow updated to use new capabilities  
 - ✅ **Phase 3**: Phase records integration complete
-- 🔄 **Phase 4**: Real container execution integration (placeholder currently)
+- ✅ **Phase 4**: Real container execution integration
 - ⏳ **Phase 5**: Agent testing and validation
 
 ## Configuration

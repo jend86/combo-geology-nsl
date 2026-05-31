@@ -5,9 +5,11 @@ import asyncio
 import json
 import sys
 import os
+from pathlib import Path
 
 # Add the voxel-features-mcp to the path
-sys.path.insert(0, '/home/jen/Desktop/GeoNSL_monorepo-pre-kazakh-complete/voxel-features-mcp')
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / 'voxel-features-mcp'))
 
 from voxel_features.mcp.tools.execution_tools import (
     execution_submit, execution_status, execution_results, execution_reset_session
@@ -146,8 +148,10 @@ async def main():
     """Run all tests."""
     print("🚀 Starting execution tools tests...")
     
-    # Set up environment
-    os.environ['VFM_ARTIFACT_DIR'] = '/tmp/voxel-features/artifacts'
+    # Set up repo-local artifacts; NSL2-geology-task/data is gitignored.
+    os.environ['VFM_ARTIFACT_DIR'] = str(
+        REPO_ROOT / 'NSL2-geology-task' / 'data' / 'execution-tools' / 'artifacts'
+    )
     
     # Test sync first
     sync_success = test_sync_execution()
