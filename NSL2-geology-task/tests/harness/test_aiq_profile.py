@@ -202,12 +202,15 @@ def test_render_query_adds_tool_preamble_only_when_capabilities_present() -> Non
 
     assert query.startswith("To take any action, CALL the appropriate tool")
     assert "do not describe what you would do in plain text" in query
+    assert "Tool output truncation:" in query
+    assert "truncated: true" in query
     assert "ends the episode without making progress" not in query
 
     no_tool_query = profile.render_query(
         TaskPromptSpec(system_instruction="Think only.", environment_context="ctx")
     )
     assert no_tool_query == "ctx"
+    assert "Tool output truncation:" not in no_tool_query
 
 
 def test_render_query_includes_static_constraints_block() -> None:

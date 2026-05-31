@@ -162,6 +162,7 @@ class AiqProfile(HarnessProfile):
                 f"function_groups.{group}; the LLM-visible names are prefixed):\n"
                 + caps
             )
+            parts.append(self.render_tool_output_truncation_notice())
         constraints_block = self.render_constraints_block(constraints)
         if constraints_block:
             parts.append(constraints_block)

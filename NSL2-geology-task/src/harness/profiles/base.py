@@ -38,6 +38,15 @@ from src.task.types import (
 )
 
 
+_TOOL_OUTPUT_TRUNCATION_NOTICE = (
+    "Tool output truncation: long tool outputs may be shortened before you see "
+    "them. If a tool result includes `truncated: true` or a marker like "
+    "`...[truncated N chars]`, you saw only a prefix; rely on artifact "
+    "paths/files or run a narrower follow-up tool call rather than assuming "
+    "omitted output is absent."
+)
+
+
 class HarnessProfile(ABC):
     name: ClassVar[str]
     profile_config_class: ClassVar[type[BaseModel]]
@@ -130,10 +139,14 @@ class HarnessProfile(ABC):
             parts.append(
                 "Capabilities (exposed as MCP tools under the 'nsl' server):\n" + caps
             )
+            parts.append(self.render_tool_output_truncation_notice())
         constraints_block = self.render_constraints_block(constraints)
         if constraints_block:
             parts.append(constraints_block)
         return "\n\n".join(parts)
+
+    def render_tool_output_truncation_notice(self) -> str:
+        return _TOOL_OUTPUT_TRUNCATION_NOTICE
 
     def render_constraints_block(
         self,

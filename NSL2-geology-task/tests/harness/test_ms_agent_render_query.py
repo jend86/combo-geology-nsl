@@ -54,6 +54,14 @@ def test_render_query_contains_non_system_prompt_content() -> None:
     assert "exploiter" in out
 
 
+def test_render_query_warns_about_tool_output_truncation() -> None:
+    out = _profile().render_query(_spec())
+
+    assert "Tool output truncation:" in out
+    assert "truncated: true" in out
+    assert "only a prefix" in out
+
+
 def test_render_query_names_at_least_one_capability_as_tool() -> None:
     """The preamble teaches the nsl.<cap> grammar — mention at least one
     capability name concretely so the model connects the manifest to the
