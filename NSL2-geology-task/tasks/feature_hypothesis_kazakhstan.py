@@ -462,6 +462,23 @@ PAIR_KIND_ANALYSIS_PLAN = "analysis_plan"
 PAIR_KIND_OUTCOME_NARRATIVE = "outcome_narrative"
 
 
+# Parse the assigned-source section name and the pre-read sample block out of a
+# survey/explore prompt. The merged ``explore`` step injects an "ASSIGNED SOURCE"
+# header plus a "SAMPLE CONTENT" excerpt of the file the episode was anchored to;
+# both describe what the agent actually read. We lift them onto the QUERY side of
+# synthesized rows so the model conditions on the source evidence and only learns
+# to generate the reasoning/hypothesis/plan (the boundary principle in
+# docs/design/sft-reasoning-decomposition-deep-dive-2026-05-30.md §4).
+_ASSIGNED_SECTION_RE = re.compile(
+    r"ASSIGNED SOURCE FOR THIS EPISODE\s*\n\s*(?:Section|Path)\s*:\s*(.+)"
+)
+_SAMPLE_BLOCK_RE = re.compile(
+    r"SAMPLE CONTENT FROM YOUR ASSIGNED SOURCE\s*\n[-─—_]+\s*\n(.*?)"
+    r"(?:\n\s*\n\s*Use analysis_shell|\n\s*Use analysis_shell|\Z)",
+    re.DOTALL,
+)
+
+
 def _content_words(text: str) -> set[str]:
     """Return lower-cased non-stop words from *text*."""
     tokens = re.findall(r"[a-z]+", text.lower())
@@ -511,10 +528,16 @@ class ExperimentReasoningRows:
         max_per_family: int = 5,
         novelty_threshold: float = 0.50,
         max_pair_chars: int = 12_000,
+        dataset_dir: str = "",
+        max_evidence_chars: int = 2_500,
     ) -> None:
         self._max_per_family = max_per_family
         self._novelty_threshold = novelty_threshold
         self._max_pair_chars = max_pair_chars
+        # Optional host dataset root (maps /workspace/input/X -> dataset_dir/X)
+        # used for best-effort evidence enrichment; "" disables disk reads.
+        self._dataset_dir = dataset_dir
+        self._max_evidence_chars = max_evidence_chars
 
     # ------------------------------------------------------------------
     # TrainingDataTransform protocol
@@ -525,10 +548,14 @@ class ExperimentReasoningRows:
         return "ExperimentReasoningRows[v1]"
 
     def config(self) -> dict[str, Any]:
+        # dataset_dir is deliberately excluded: it is an environment detail, not
+        # a recipe parameter, and including it would make the export recipe hash
+        # machine-specific (breaking the resume/export-recipe-hash guard).
         return {
             "max_per_family": self._max_per_family,
             "novelty_threshold": self._novelty_threshold,
             "max_pair_chars": self._max_pair_chars,
+            "max_evidence_chars": self._max_evidence_chars,
         }
 
     def transform_export_rows(
@@ -694,6 +721,28 @@ class ExperimentReasoningRows:
                 "chunks, and drill-hole descriptions."
             )
 
+        # Lift the source the agent read (assignment + pre-read sample, optionally
+        # enriched from the on-disk dataset) onto the query side; keep the
+        # data_spec 'analysis' as the observation that grounds the analysis plan.
+        explore_prompt_text = self._row_text(explore_row, "prompt")
+        data_spec_files = self._data_spec_files(data_spec)
+        captured_excerpt = ""
+        captured_section = ""
+        if isinstance(hypothesise, dict):
+            captured_excerpt = str(hypothesise.get("source_excerpt") or "").strip()
+            captured_section = str(hypothesise.get("assigned_section") or "").strip()
+        assigned_section, source_evidence = self._source_evidence(
+            explore_prompt_text,
+            data_spec_files,
+            captured_excerpt=captured_excerpt,
+            captured_section=captured_section,
+        )
+        observation = ""
+        if isinstance(data_spec, dict):
+            analysis_value = data_spec.get("analysis")
+            if isinstance(analysis_value, str):
+                observation = analysis_value.strip()
+
         return {
             "training_success": bool(episode_context.get("success", True)),
             "duplicate_rejected": bool(episode_context.get("duplicate_rejected", False)),
@@ -703,6 +752,9 @@ class ExperimentReasoningRows:
             "parent_context": parent_context,
             "parent_hypotheses": parent_hypotheses,
             "survey_context": survey_context,
+            "assigned_section": assigned_section,
+            "source_evidence": source_evidence,
+            "observation": observation,
             "hypothesise_response": self._row_text(hypothesise_row, "raw_response"),
             "feature_layer_name": str(
                 translate.get("feature_layer_name")
@@ -804,11 +856,25 @@ class ExperimentReasoningRows:
             if "[tool]" not in prompt:
                 continue
             for output in cls._iter_tool_outputs(prompt):
-                if "hypothesis" in output or "data_spec" in output or "parent_experiments" in output:
+                if any(
+                    key in output
+                    for key in (
+                        "hypothesis",
+                        "data_spec",
+                        "parent_experiments",
+                        "source_excerpt",
+                    )
+                ):
                     phase_records.setdefault("hypothesise", {}).update(
                         {
                             key: output[key]
-                            for key in ("hypothesis", "data_spec", "parent_experiments")
+                            for key in (
+                                "hypothesis",
+                                "data_spec",
+                                "parent_experiments",
+                                "source_excerpt",
+                                "assigned_section",
+                            )
                             if key in output
                         }
                     )
@@ -1028,45 +1094,80 @@ class ExperimentReasoningRows:
             )
 
         if self._is_novel(hypothesis, list(record.get("parent_hypotheses") or [])):
-            survey_context = self._sanitize_prompt_context(str(record.get("survey_context") or ""))
+            evidence = str(record.get("source_evidence") or "").strip()
+            section = str(record.get("assigned_section") or "").strip()
+            if evidence:
+                header = f"Source examined — {section}:" if section else "Source examined:"
+                dataset_prompt = (
+                    f"{header}\n{evidence}\n\n"
+                    "Task: From the source above, propose a falsifiable geological "
+                    "hypothesis grounded in this evidence."
+                )
+            else:
+                survey_context = self._sanitize_prompt_context(
+                    str(record.get("survey_context") or "")
+                )
+                dataset_prompt = (
+                    "Dataset context:\n"
+                    f"{survey_context}\n\n"
+                    "Task: Propose a de-novo geological hypothesis from the available data."
+                )
             rows.append(
                 self._make_row(
                     episode=episode,
                     source_row=source_rows.get("survey", {}),
                     row_suffix=PAIR_KIND_DATASET_HYPOTHESIS,
-                    prompt=(
-                        "Dataset context:\n"
-                        f"{survey_context}\n\n"
-                        "Task: Propose a de-novo geological hypothesis from the available data."
-                    ),
+                    prompt=dataset_prompt,
                     raw_response=hypothesis_target,
                     pair_kind=PAIR_KIND_DATASET_HYPOTHESIS,
                     hypothesis=hypothesis,
                     provenance=provenance,
-                    extra_meta={"novelty_routed": True},
+                    extra_meta={
+                        "novelty_routed": True,
+                        "evidence_on_query": bool(evidence),
+                    },
                 )
             )
 
         data_spec = record.get("data_spec")
         if isinstance(data_spec, dict) and data_spec:
             files = self._data_spec_files(data_spec)
-            rows.append(
-                self._make_row(
-                    episode=episode,
-                    source_row=source_rows.get("hypothesise", {}),
-                    row_suffix=PAIR_KIND_ANALYSIS_PLAN,
-                    prompt=(
-                        f"Hypothesis: {hypothesis}\n\n"
-                        f"Available files: {', '.join(files) if files else 'see dataset context'}\n\n"
-                        "Task: Design the analysis plan for testing the hypothesis."
-                    ),
-                    raw_response=self._format_data_spec(data_spec),
-                    pair_kind=PAIR_KIND_ANALYSIS_PLAN,
-                    hypothesis=hypothesis,
-                    provenance=provenance,
-                    extra_meta={},
+            plan_target = self._format_data_spec_target(data_spec)
+            if plan_target.strip():
+                observation = str(record.get("observation") or "").strip()
+                evidence = str(record.get("source_evidence") or "").strip()
+                section = str(record.get("assigned_section") or "").strip()
+                query_parts = [f"Hypothesis: {hypothesis}"]
+                if observation:
+                    # The observation of what was read grounds the plan; it lives
+                    # on the query side, not in the target (boundary re-split).
+                    query_parts.append(f"Observations from source: {observation}")
+                if evidence:
+                    header = (
+                        f"Source examined — {section}:" if section else "Source examined:"
+                    )
+                    query_parts.append(f"{header}\n{evidence}")
+                query_parts.append(
+                    "Available files: "
+                    f"{', '.join(files) if files else 'see dataset context'}"
                 )
-            )
+                query_parts.append(
+                    "Task: Design the target feature and analysis plan for testing "
+                    "the hypothesis."
+                )
+                rows.append(
+                    self._make_row(
+                        episode=episode,
+                        source_row=source_rows.get("hypothesise", {}),
+                        row_suffix=PAIR_KIND_ANALYSIS_PLAN,
+                        prompt="\n\n".join(query_parts),
+                        raw_response=plan_target,
+                        pair_kind=PAIR_KIND_ANALYSIS_PLAN,
+                        hypothesis=hypothesis,
+                        provenance=provenance,
+                        extra_meta={"observation_on_query": bool(observation)},
+                    )
+                )
 
         narrative = str(record.get("narrative") or "").strip()
         if narrative:
@@ -1174,24 +1275,73 @@ class ExperimentReasoningRows:
             parts.append(line)
         return "\n".join(parts)
 
-    def _format_data_spec(self, data_spec: Any) -> str:
-        if isinstance(data_spec, dict):
-            steps = data_spec.get("analysis_steps", [])
-            files = data_spec.get("files", data_spec.get("required_files", []))
-            target = data_spec.get("target_feature", "")
+    def _format_data_spec_target(self, data_spec: Any) -> str:
+        """Render the analysis-plan TARGET (the planned feature + files + steps).
+
+        Understands both the merged-explore schema ``{analysis, files, output}``
+        (``output`` -> target feature) and the legacy
+        ``{target_feature, required_files, analysis_steps}`` schema. The
+        ``analysis`` observation is intentionally NOT rendered here: it is the
+        source-read content and is placed on the query side instead. Free-form
+        agent dicts fall back to a readable feature summary rather than a raw
+        JSON dump.
+        """
+        if not isinstance(data_spec, dict):
+            return str(data_spec)
+        target = self._data_spec_target_feature(data_spec)
+        files = self._data_spec_files(data_spec)
+        steps = data_spec.get("analysis_steps", [])
+        lines: list[str] = []
+        if target:
+            lines.append(f"Target feature: {target}")
+        if files:
+            lines.append(f"Required files: {', '.join(files)}")
+        if isinstance(steps, list) and steps:
+            lines.append("Analysis steps:")
+            for j, step in enumerate(steps, 1):
+                lines.append(f"  {j}. {step}")
+        if lines:
+            return "\n".join(lines)
+        summary = self._freeform_target_summary(data_spec)
+        if summary:
+            return summary
+        return json.dumps(data_spec, sort_keys=True)
+
+    @staticmethod
+    def _data_spec_target_feature(data_spec: dict[str, Any]) -> str:
+        for key in ("target_feature", "output", "feature_layer_name", "name"):
+            value = data_spec.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _freeform_target_summary(data_spec: dict[str, Any]) -> str:
+        """Best-effort readable target for free-form ``{features|feature_layers}``
+        dicts the agent sometimes emits instead of the prompted schema."""
+        for key in ("features", "feature_layers"):
+            value = data_spec.get(key)
+            if not isinstance(value, list) or not value:
+                continue
             lines: list[str] = []
-            if target:
-                lines.append(f"Target feature: {target}")
-            if files:
-                lines.append(f"Required files: {', '.join(files)}")
-            if steps:
-                lines.append("Analysis steps:")
-                for j, step in enumerate(steps, 1):
-                    lines.append(f"  {j}. {step}")
+            for item in value:
+                if isinstance(item, dict):
+                    name = str(
+                        item.get("name")
+                        or item.get("feature_layer_name")
+                        or ""
+                    ).strip()
+                    desc = str(item.get("description") or "").strip()
+                    rendered = " — ".join(part for part in (name, desc) if part)
+                    if rendered:
+                        prefix = "Target feature: " if not lines else "  - "
+                        lines.append(f"{prefix}{rendered}")
+                elif isinstance(item, str) and item.strip():
+                    prefix = "Target feature: " if not lines else "  - "
+                    lines.append(f"{prefix}{item.strip()}")
             if lines:
                 return "\n".join(lines)
-            return json.dumps(data_spec, sort_keys=True)
-        return str(data_spec)
+        return ""
 
     @staticmethod
     def _data_spec_files(data_spec: dict[str, Any]) -> list[str]:
@@ -1200,6 +1350,79 @@ class ExperimentReasoningRows:
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, str) and item]
         return []
+
+    # ------------------------------------------------------------------
+    # Source-read evidence (query-side grounding for explore rows)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_assigned_source(prompt: str) -> tuple[str, str]:
+        """Extract (section/path, pre-read sample) from an explore prompt."""
+        section = ""
+        match = _ASSIGNED_SECTION_RE.search(prompt)
+        if match:
+            section = match.group(1).strip()
+        sample = ""
+        sample_match = _SAMPLE_BLOCK_RE.search(prompt)
+        if sample_match:
+            sample = sample_match.group(1).strip()
+        return section, sample
+
+    def _read_dataset_excerpt(self, files: list[str]) -> str:
+        """Best-effort read of the assigned file from the on-disk dataset.
+
+        Maps a container path ``/workspace/input/X`` to ``dataset_dir/X``.
+        Returns "" if dataset_dir is unset or no file resolves; never raises.
+        """
+        dataset_dir = getattr(self, "_dataset_dir", "") or ""
+        if not dataset_dir:
+            return ""
+        base = Path(dataset_dir)
+        prefix = _ANALYSIS_INPUT.rstrip("/") + "/"
+        for file_path in files:
+            if not isinstance(file_path, str) or not file_path:
+                continue
+            rel = file_path
+            if rel.startswith(prefix):
+                rel = rel[len(prefix):]
+            elif rel.startswith(_ANALYSIS_INPUT):
+                rel = rel[len(_ANALYSIS_INPUT):]
+            rel = rel.lstrip("/")
+            if not rel:
+                continue
+            try:
+                candidate = base / rel
+                if candidate.is_file():
+                    return candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+        return ""
+
+    def _source_evidence(
+        self,
+        explore_prompt: str,
+        files: list[str],
+        captured_excerpt: str = "",
+        captured_section: str = "",
+    ) -> tuple[str, str]:
+        """Return (assigned_section, bounded sanitized evidence excerpt).
+
+        Source priority: the fuller on-disk file when ``dataset_dir`` is set,
+        then the source-side ``captured_excerpt`` persisted at record_phase
+        (P1, robust/portable), then the transcript SAMPLE CONTENT block parsed
+        from the explore prompt. The excerpt is BIC/outcome sanitized (leakage
+        guard) and length-capped.
+        """
+        parsed_section, parsed_sample = self._parse_assigned_source(explore_prompt)
+        section = captured_section or parsed_section
+        disk = self._read_dataset_excerpt(files)
+        excerpt = disk or captured_excerpt or parsed_sample
+        if not excerpt:
+            return section, ""
+        excerpt = self._sanitize_prompt_context(excerpt)
+        if len(excerpt) > self._max_evidence_chars:
+            excerpt = excerpt[: self._max_evidence_chars].rstrip() + " …"
+        return section, excerpt
 
     def _hypothesis_head(self, hypothesis: str) -> str:
         """Return a coarse lexical family key for balance capping."""
@@ -1470,16 +1693,14 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 crossbreed_ctx = self._get_crossbreed_context(variation)
             episode_context["crossbreed_context"] = crossbreed_ctx
 
-        # For survey episodes, assign a least-explored source file (file
-        # rotation) and pre-read a compact sample so the agent grounds in real
-        # data immediately rather than fixating on context-primed concepts.
-        if workflow_kind == "survey":
-            rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
-            episode_context["assigned_source"] = rotation["source"]
-            episode_context["source_coverage"] = rotation["all_counts"]
-            episode_context["source_sample"] = self._read_source_sample(
-                rotation["source"], variation.dataset_dir
-            )
+        # File rotation assigns a least-explored source file (+ pre-read sample)
+        # so the agent grounds in real data rather than fixating on context-primed
+        # concepts. This runs for BOTH survey and crossbreed episodes: crossbreed
+        # previously had NO diversity steering and collapsed to a single hypothesis
+        # family (Approach C — docs/design/sft-explore-boundary-resplit-2026-05-31.md).
+        # Crossbreed grounds in the rotated source IN ADDITION to its parents.
+        if workflow_kind in ("survey", "crossbreed"):
+            self._assign_rotation_source(episode_context, variation)
 
         # Survey (= bootstrap): block here until a slot permit is free so
         # the early generation runs at lower concurrency. The framework
@@ -1592,7 +1813,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         )
 
     def training_data_transforms(self) -> tuple[ExperimentReasoningRows, ...]:
-        return (ExperimentReasoningRows(),)
+        return (
+            ExperimentReasoningRows(
+                dataset_dir=str(getattr(self, "_dataset_dir", "") or "")
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Workflows
@@ -1613,9 +1838,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # prompt — grounding is preserved either way).
         #
         # NOTE: the novelty nudge (self._novelty_block_for) is intentionally NOT
-        # injected (deprecated 2026-05-31). File rotation now supplies diversity.
-        # The novelty machinery is left in place but UNUSED pending a later
-        # decision on whether to delete it — see _novelty_block_for.
+        # injected into the SURVEY prompt — file rotation supplies survey-episode
+        # diversity. It IS wired into the crossbreed prompt (Approach C,
+        # 2026-05-31), which had no diversity steering and collapsed to a single
+        # hypothesis family. See _crossbreed_workflow and _novelty_block_for.
         explore_prompt = self._generate_explore_prompt(episode_context)
 
         return Workflow(
@@ -1793,17 +2019,29 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         base_workflow = self._survey_workflow(variation, episode_context)
 
-        # Novelty nudge intentionally NOT injected here either (deprecated
-        # 2026-05-31); the dormant machinery stays in place pending a later
-        # decision — see _novelty_block_for.
+        # Approach C: restore diversity steering for crossbreed (it had none after
+        # the file-rotation pulldown and collapsed to a single hypothesis family —
+        # docs/design/sft-explore-boundary-resplit-2026-05-31.md). Two levers:
+        #  - the family-balance (novelty) block shows which families saturate the
+        #    pool so the agent diverges from the monoculture; and
+        #  - file rotation grounds the episode in a least-explored source
+        #    (assigned at populate()) IN ADDITION to the parents.
+        novelty_block = self._novelty_block_for(variation)
+        assigned_blocks = self._assigned_source_blocks(episode_context)
         crossbreed_prompt = (
             "Phase 1: Explore + Hypothesise (Crossbreed Mode)\n\n"
             f"Parent experiments: {parent_ids}\n\n"
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
-            "First, use analysis_shell to ground yourself in the dataset — open a\n"
-            "few relevant sources and confirm what the data actually shows.\n"
-            "Then, building on the parent findings above together with what you\n"
-            "observed, propose ONE hypothesis that combines or extends them.\n\n"
+            + (novelty_block + "\n\n" if novelty_block else "")
+            + assigned_blocks
+            + "\n"
+            "Use analysis_shell to ground yourself in the dataset — open the\n"
+            "assigned under-explored source above (and any other relevant sources)\n"
+            "and confirm what the data actually shows.\n"
+            "Then, building on the parent findings together with what you observed,\n"
+            "propose ONE hypothesis that combines or extends them — while taking a\n"
+            "genuinely different angle (a different geological mechanism, feature\n"
+            "family, or spatial scale) from the families already saturated above.\n\n"
             "Include a data_spec as before.\n\n"
             "Close with:\n"
             "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
@@ -2315,7 +2553,7 @@ except Exception as user_code_error:
         
         # Store in episode context
         phase_records = ctx.episode_context.setdefault("phase_records", {})
-        phase_records[phase] = {
+        record = {
             "candidates": args.get("candidates"),
             "corpora_sampled": args.get("corpora_sampled"),
             "hypothesis": args.get("hypothesis"),
@@ -2324,7 +2562,21 @@ except Exception as user_code_error:
             "parent_experiments": args.get("parent_experiments"),
             "timestamp": time.time(),
         }
-        
+        # Source-side evidence capture (P1): persist the assigned source and the
+        # pre-read excerpt alongside the hypothesise phase so the SFT export can
+        # place the read evidence on the query side WITHOUT regex-parsing the
+        # transcript or reading the dataset from disk. Survey episodes set these
+        # in episode_context at populate(); they are absent for crossbreed.
+        if phase == "hypothesise":
+            assigned = ctx.episode_context.get("assigned_source") or {}
+            source_sample = ctx.episode_context.get("source_sample")
+            if isinstance(source_sample, str) and source_sample.strip():
+                record["source_excerpt"] = source_sample
+            section = assigned.get("key") or assigned.get("path") or ""
+            if section:
+                record["assigned_section"] = section
+        phase_records[phase] = record
+
         return CapabilityResult(
             "record_phase",
             output={"phase": phase, "recorded": True},
@@ -3930,6 +4182,71 @@ finally:
         except Exception:
             return False
 
+    def _assign_rotation_source(
+        self,
+        episode_context: dict[str, Any],
+        variation: "FeatureHypothesisKazakhstanVariation",
+    ) -> None:
+        """Assign a least-explored source (file rotation) + pre-read sample into
+        ``episode_context``. Shared by survey and crossbreed episodes (C)."""
+        rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
+        episode_context["assigned_source"] = rotation["source"]
+        episode_context["source_coverage"] = rotation["all_counts"]
+        episode_context["source_sample"] = self._read_source_sample(
+            rotation["source"], variation.dataset_dir
+        )
+
+    def _assigned_source_blocks(self, episode_context: dict[str, Any]) -> str:
+        """ASSIGNED SOURCE + SAMPLE CONTENT blocks for an explore prompt, or ""
+        when no source is assigned.
+
+        Shared by the survey and crossbreed prompts so the SFT export extracts
+        the read evidence identically for both (the headers below are matched by
+        ExperimentReasoningRows._parse_assigned_source).
+        """
+        assigned = episode_context.get("assigned_source", {})
+        if not assigned:
+            return ""
+        glob_pattern = assigned.get("glob_pattern")
+        if glob_pattern:
+            patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
+            glob_lines = "\n".join(
+                f"    files += glob.glob(os.path.join(dataset_dir, '{assigned['path']}', '{p}'))"
+                for p in patterns
+            )
+            assignment_block = (
+                f"ASSIGNED SOURCE FOR THIS EPISODE\n"
+                f"  Section: {assigned['key']}\n"
+                f"  Details: {assigned['description']}\n\n"
+                f"To list the files in this section, run in analysis_shell:\n"
+                f"```python\n"
+                f"import glob, os\n"
+                f"dataset_dir = '/workspace/input'\n"
+                f"files = []\n"
+                f"{glob_lines}\n"
+                f"files = sorted(files)\n"
+                f"print(f'Found {{len(files)}} files:')\n"
+                f"for f in files: print(f)\n"
+                f"```\n"
+            )
+        else:
+            assignment_block = (
+                f"ASSIGNED SOURCE FOR THIS EPISODE\n"
+                f"  Path   : /workspace/input/{assigned['path']}\n"
+                f"  Details: {assigned['description']}\n"
+            )
+        sample = episode_context.get("source_sample", "")
+        if sample:
+            sample_block = (
+                "\nSAMPLE CONTENT FROM YOUR ASSIGNED SOURCE\n"
+                "─────────────────────────────────────────\n"
+                + sample
+                + "\n"
+            )
+        else:
+            sample_block = ""
+        return assignment_block + sample_block
+
     def _pick_assigned_source(
         self,
         kg_dir: str,
@@ -4074,59 +4391,18 @@ finally:
         Each episode is anchored to a specific source selected at populate() time.
         Sample content is pre-read and injected so the agent sees real data immediately.
         """
-        assigned = episode_context.get("assigned_source", {})
-
-        # --- Assignment + file access block ---
-        if assigned:
-            glob_pattern = assigned.get("glob_pattern")
-            if glob_pattern:
-                patterns = [glob_pattern] if isinstance(glob_pattern, str) else glob_pattern
-                glob_lines = "\n".join(
-                    f"    files += glob.glob(os.path.join(dataset_dir, '{assigned['path']}', '{p}'))"
-                    for p in patterns
-                )
-                assignment_block = (
-                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
-                    f"  Section: {assigned['key']}\n"
-                    f"  Details: {assigned['description']}\n\n"
-                    f"To list the files in this section, run in analysis_shell:\n"
-                    f"```python\n"
-                    f"import glob, os\n"
-                    f"dataset_dir = '/workspace/input'\n"
-                    f"files = []\n"
-                    f"{glob_lines}\n"
-                    f"files = sorted(files)\n"
-                    f"print(f'Found {{len(files)}} files:')\n"
-                    f"for f in files: print(f)\n"
-                    f"```\n"
-                )
-            else:
-                assignment_block = (
-                    f"ASSIGNED SOURCE FOR THIS EPISODE\n"
-                    f"  Path   : /workspace/input/{assigned['path']}\n"
-                    f"  Details: {assigned['description']}\n"
-                )
-        else:
-            assignment_block = (
+        # Assignment + pre-read sample blocks (shared with the crossbreed prompt
+        # via _assigned_source_blocks). Fall back to a generic explore line when
+        # no source is assigned.
+        blocks = self._assigned_source_blocks(episode_context)
+        if not blocks:
+            blocks = (
                 "Explore the Kazakhstan Teniz Basin dataset to identify a regional feature opportunity.\n"
             )
 
-        # --- Sample content block ---
-        sample = episode_context.get("source_sample", "")
-        if sample:
-            sample_block = (
-                "\nSAMPLE CONTENT FROM YOUR ASSIGNED SOURCE\n"
-                "─────────────────────────────────────────\n"
-                + sample
-                + "\n"
-            )
-        else:
-            sample_block = ""
-
         prompt = (
             "Phase 1: Explore and Hypothesise\n\n"
-            + assignment_block
-            + sample_block
+            + blocks
             + "\n"
             "Use analysis_shell to read and explore your assigned source.\n"
             "When you have identified a promising geological pattern, record ONE falsifiable hypothesis:\n\n"
@@ -4590,13 +4866,13 @@ finally:
     ) -> str:
         """Compute the novelty-nudge prompt block for a given variation.
 
-        ⚠️ DORMANT / UNUSED as of 2026-05-31. The novelty nudge is no longer
-        injected into any workflow prompt (file rotation now supplies episode
-        diversity). This method and its helpers (_recent_admitted_hypotheses,
-        _render_novelty_block, _classify_mechanism, _render_mechanism_summary)
-        plus the ``novelty_*`` knobs on the Variation are retained but unwired,
-        pending a decision on whether to remove them. Do not re-wire without
-        that decision.
+        Wired into the CROSSBREED explore prompt as of 2026-05-31 (Approach C,
+        docs/design/sft-explore-boundary-resplit-2026-05-31.md) to restore the
+        family-diversity steering crossbreed lost after the file-rotation
+        pulldown. It is deliberately NOT injected into the survey prompt, where
+        file rotation already supplies episode diversity. Helpers
+        (_recent_admitted_hypotheses, _render_novelty_block,
+        _render_mechanism_summary) and the ``novelty_*`` Variation knobs back it.
 
         Returns empty when the knob is disabled, K=0, or no admissions
         exist — callers can prepend the result unconditionally. Block now
