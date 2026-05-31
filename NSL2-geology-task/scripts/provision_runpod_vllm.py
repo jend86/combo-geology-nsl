@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Provision / inspect / tear down a RunPod L40S pod serving gemma-4-31B-AWQ via vLLM.
+
+Supplemental *external* inference endpoint for the Kazakhstan feature-hypothesis
+run (Approach C — one L40S, target 16 external slots). Companion to
+``docs/design/runpod-l40s-provisioning-2026-06-01.md`` and
+``docs/design/external-inference-endpoints-2026-05-31.md``.
+
+The pod runs the SAME pinned vLLM image as the local box for chat-template / tool
+parser parity, single-GPU (TP=1/PP=1 — no pipeline bubble), AWQ auto-detected,
+fp8 KV cache, prefix caching on. Port 8000 is exposed over **raw TCP** (not the
+RunPod HTTP proxy) so the no-streaming, uncapped-output request path is not
+capped by the proxy's ~100 s timeout. The vLLM bearer key is passed via the
+``VLLM_API_KEY`` env var (vLLM reads it natively) so it never appears in the
+pod's visible docker args.
+
+Usage (runpod SDK provided ephemerally by uv; secrets sourced out-of-repo):
+
+    source ~/.config/nsl-runpod/secrets.env
+    uv run --with runpod python scripts/provision_runpod_vllm.py up
+    uv run --with runpod python scripts/provision_runpod_vllm.py status <pod_id>
+    uv run --with runpod python scripts/provision_runpod_vllm.py down <pod_id>
+
+Reads RUNPOD_API_KEY (account, for provisioning) and RUNPOD_VLLM_KEY (the vLLM
+bearer the endpoint pool sends) from the environment. Secrets are never written
+to disk or echoed to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+PINNED_VLLM_IMAGE = "vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada"
+DEFAULT_MODEL = "QuantTrio/gemma-4-31B-it-AWQ"
+GPU_TYPE_L40S = "NVIDIA L40S"  # exact gpuTypeId from RunPod gpuTypes()
+
+
+def _bearer(vllm_key: str | None) -> dict[str, str]:
+    return {"Authorization": f"Bearer {vllm_key}"} if vllm_key else {}
+
+
+def _http_ok(url: str, headers: dict[str, str], timeout: float = 6.0) -> bool:
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers), timeout=timeout
+        ) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError:  # 401/403 => server up but auth mismatch
+        return False
+    except Exception:
+        return False
+
+
+def _public_tcp(pod: dict, private_port: int = 8000) -> tuple[str | None, int | None]:
+    """Return (ip, public_port) for the public TCP mapping of ``private_port``."""
+    runtime = pod.get("runtime") or {}
+    for port in runtime.get("ports") or []:
+        if (
+            port.get("privatePort") == private_port
+            and port.get("isIpPublic")
+            and str(port.get("type", "")).lower() == "tcp"
+        ):
+            return port.get("ip"), port.get("publicPort")
+    return None, None
+
+
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        sys.exit(
+            f"ERROR: {name} is not set. Run `source ~/.config/nsl-runpod/secrets.env` first."
+        )
+    return value
+
+
+def _docker_args(args: argparse.Namespace) -> str:
+    # Bare api_server args (the pinned image's entrypoint takes them directly,
+    # exactly like the local _build_container_command). No --api-key here: vLLM
+    # reads VLLM_API_KEY from the env we inject. No --tensor/pipeline-parallel:
+    # single L40S defaults to 1/1. AWQ is auto-detected from the repo config.
+    # --max-num-batched-tokens stays >= 2496 (gemma-4 multimodal floor) but is
+    # NOT the local box's crippled 4096 decode-starvation hack — the L40S has KV
+    # headroom for a healthy prefill budget.
+    return " ".join(
+        [
+            "--model", args.model,
+            "--host", "0.0.0.0",
+            "--port", "8000",
+            "--gpu-memory-utilization", str(args.gpu_mem_util),
+            "--max-model-len", str(args.max_model_len),
+            "--max-num-seqs", str(args.max_num_seqs),
+            "--max-num-batched-tokens", str(args.max_num_batched_tokens),
+            "--kv-cache-dtype", "fp8",
+            "--enable-prefix-caching",
+            "--enable-chunked-prefill",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "gemma4",
+        ]
+    )
+
+
+def cmd_up(args: argparse.Namespace) -> int:
+    import runpod  # type: ignore[import-not-found]  # provided via `uv run --with runpod`
+
+    runpod.api_key = _require_env("RUNPOD_API_KEY")
+    vllm_key = _require_env("RUNPOD_VLLM_KEY")
+
+    env = {"VLLM_API_KEY": vllm_key}
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if hf_token:
+        env["HF_TOKEN"] = hf_token
+        env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+    docker_args = _docker_args(args)
+    print(f"Creating pod '{args.name}' on {args.gpu_type} ({args.cloud})...")
+    print(f"  image      : {args.image}")
+    print(f"  vllm args  : {docker_args}")
+    print(f"  ports      : {args.ports}  (8000 = TCP, public)")
+    try:
+        pod = runpod.create_pod(
+            name=args.name,
+            image_name=args.image,
+            gpu_type_id=args.gpu_type,
+            cloud_type=args.cloud,
+            gpu_count=1,
+            container_disk_in_gb=args.container_disk,
+            min_vcpu_count=8,
+            min_memory_in_gb=32,
+            ports=args.ports,
+            docker_args=docker_args,
+            env=env,
+            support_public_ip=True,
+            start_ssh=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface RunPod stock/quota errors plainly
+        print(f"ERROR: create_pod failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print("  (L40S may be out of stock in the selected cloud — retry or try --cloud COMMUNITY)", file=sys.stderr)
+        return 1
+
+    pod_id = pod.get("id")
+    rate = 0.86 if args.cloud == "SECURE" else 0.79
+    print(f"\n  POD ID: {pod_id}   (~${rate:.2f}/hr while running — `down {pod_id}` to stop billing)\n")
+
+    # Phase 1: wait for the pod to be RUNNING with a public TCP mapping for 8000.
+    ip = port = None
+    deadline = time.time() + args.running_timeout
+    while time.time() < deadline:
+        full = runpod.get_pod(pod_id)
+        pod_obj = full.get("pod", full) if isinstance(full, dict) else {}
+        ip, port = _public_tcp(pod_obj)
+        if ip and port:
+            break
+        print(f"  ...waiting for public port (status={pod_obj.get('desiredStatus')})")
+        time.sleep(10)
+    if not (ip and port):
+        print("ERROR: pod did not expose a public TCP port for 8000 in time.", file=sys.stderr)
+        print(f"  Inspect with: scripts/provision_runpod_vllm.py status {pod_id}", file=sys.stderr)
+        return 1
+
+    base_url = f"http://{ip}:{port}"
+    print(f"  public endpoint: {base_url}  (TCP)")
+
+    # Phase 2: wait for vLLM to finish loading (~18 GB AWQ download + warmup).
+    models_url = f"{base_url}/v1/models"
+    headers = _bearer(vllm_key)
+    print("  ...waiting for vLLM /v1/models (model download + warmup, can take several minutes)")
+    deadline = time.time() + args.ready_timeout
+    ready = False
+    while time.time() < deadline:
+        if _http_ok(models_url, headers):
+            ready = True
+            break
+        time.sleep(15)
+    if not ready:
+        print(f"WARNING: {models_url} not ready yet; the pod is up — re-check shortly with `status {pod_id}`.", file=sys.stderr)
+
+    state = "READY" if ready else "STARTING"
+    print(f"\n=== {state} ===")
+    print(f"pod_id   : {pod_id}")
+    print(f"base_url : {base_url}")
+    print("\nPaste into the run config (key stays in env via api_key_env):\n")
+    print("[[vllm.endpoints]]")
+    print('id          = "runpod-l40s-1"')
+    print(f'base_url    = "{base_url}"')
+    print(f"capacity    = {args.capacity}")
+    print('api_key_env = "RUNPOD_VLLM_KEY"')
+    print(f"\nBake-off metrics:\n  uv run python scripts/inspect/vllm_live_metrics.py "
+          f"--url {base_url}/metrics --window 60 --count 10 --jsonl /tmp/bakeoff_l40s.jsonl")
+    print(f"\nTear down when done:\n  uv run --with runpod python scripts/provision_runpod_vllm.py down {pod_id}")
+    return 0 if ready else 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    import runpod  # type: ignore[import-not-found]  # provided via `uv run --with runpod`
+
+    runpod.api_key = _require_env("RUNPOD_API_KEY")
+    full = runpod.get_pod(args.pod_id)
+    pod_obj = full.get("pod", full) if isinstance(full, dict) else {}
+    if not pod_obj:
+        print(f"No pod found for id {args.pod_id}", file=sys.stderr)
+        return 1
+    ip, port = _public_tcp(pod_obj)
+    runtime = pod_obj.get("runtime") or {}
+    print(f"pod_id        : {args.pod_id}")
+    print(f"desiredStatus : {pod_obj.get('desiredStatus')}")
+    print(f"uptime (s)    : {runtime.get('uptimeInSeconds')}")
+    print(f"public 8000   : {f'http://{ip}:{port}' if ip and port else '(not exposed yet)'}")
+    vllm_key = os.environ.get("RUNPOD_VLLM_KEY")
+    if ip and port:
+        ok = _http_ok(f"http://{ip}:{port}/v1/models", _bearer(vllm_key))
+        print(f"/v1/models    : {'OK (vLLM ready)' if ok else 'not ready'}")
+    return 0
+
+
+def cmd_down(args: argparse.Namespace) -> int:
+    import runpod  # type: ignore[import-not-found]  # provided via `uv run --with runpod`
+
+    runpod.api_key = _require_env("RUNPOD_API_KEY")
+    runpod.terminate_pod(args.pod_id)
+    print(f"Terminated pod {args.pod_id} (billing stopped).")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    up = sub.add_parser("up", help="provision an L40S vLLM pod")
+    up.add_argument("--name", default="nsl-vllm-l40s")
+    up.add_argument("--image", default=PINNED_VLLM_IMAGE)
+    up.add_argument("--model", default=DEFAULT_MODEL)
+    up.add_argument("--gpu-type", default=GPU_TYPE_L40S)
+    up.add_argument("--cloud", default="SECURE", choices=["SECURE", "COMMUNITY", "ALL"],
+                    help="SECURE (~$0.86/hr, stable IP) vs COMMUNITY (~$0.79/hr, IP may change on restart)")
+    up.add_argument("--capacity", type=int, default=16, help="endpoint pool capacity to print in the TOML block")
+    up.add_argument("--max-num-seqs", type=int, default=18, help="vLLM concurrent seqs (>= capacity + slack)")
+    up.add_argument("--max-model-len", type=int, default=65536)
+    up.add_argument("--max-num-batched-tokens", type=int, default=8192,
+                    help=">= 2496 (gemma-4 multimodal floor); NOT the local 4096 decode hack")
+    up.add_argument("--gpu-mem-util", type=float, default=0.92)
+    up.add_argument("--container-disk", type=int, default=60, help="GB; holds image + ~18 GB AWQ weights")
+    up.add_argument("--ports", default="8000/tcp,22/tcp")
+    up.add_argument("--running-timeout", type=float, default=420.0, help="seconds to wait for a public port")
+    up.add_argument("--ready-timeout", type=float, default=1200.0, help="seconds to wait for /v1/models")
+    up.set_defaults(func=cmd_up)
+
+    st = sub.add_parser("status", help="show a pod's status + readiness")
+    st.add_argument("pod_id")
+    st.set_defaults(func=cmd_status)
+
+    dn = sub.add_parser("down", help="terminate a pod (stops billing)")
+    dn.add_argument("pod_id")
+    dn.set_defaults(func=cmd_down)
+
+    args = parser.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
