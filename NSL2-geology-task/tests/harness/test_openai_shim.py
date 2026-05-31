@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from result import Err, Ok
 
 from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
     Genner,
     INFERENCE_TIMEOUT_PREFIX,
     INFERENCE_UNAVAILABLE_PREFIX,
@@ -435,6 +436,33 @@ def test_shim_latches_timeout_into_separate_timeout_detail(tmp_path: Path) -> No
     # Timeout latches into its OWN field, and NOT into the outage field.
     assert shim.inference_timeout_detail is not None
     assert shim.inference_timeout_detail.startswith(INFERENCE_TIMEOUT_PREFIX)
+    assert shim.inference_unavailable_detail is None
+
+
+def test_shim_latches_context_overflow_as_non_retryable_client_error(
+    tmp_path: Path,
+) -> None:
+    shim, _recorder, inner = _build_shim(
+        tmp_path, token="abc", episode_id="ep-context-overflow"
+    )
+
+    def _overflow(messages, *, tools=None, tool_choice=None):
+        return Err(f"{CONTEXT_OVERFLOW_PREFIX} maximum context length exceeded")
+
+    inner.plist_completion = _overflow  # type: ignore[assignment]
+    client = TestClient(shim.app)
+    assert shim.context_overflow_detail is None
+
+    response = client.post(
+        "/v1/chat/completions",
+        json=_openai_body(),
+        headers={"Authorization": "Bearer abc"},
+    )
+
+    assert response.status_code == 400
+    assert shim.context_overflow_detail is not None
+    assert shim.context_overflow_detail.startswith(CONTEXT_OVERFLOW_PREFIX)
+    assert shim.inference_timeout_detail is None
     assert shim.inference_unavailable_detail is None
 
 

@@ -17,7 +17,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.genner.Base import INFERENCE_TIMEOUT_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.harness.container import ContainerHarness
 from src.harness.context import HarnessConfigView, HarnessContext
 from src.harness.recorder import EventRecorder
@@ -45,6 +49,36 @@ class _ExitFailContainer:
         return b"agent crashed"
 
     def kill(self) -> None: ...
+
+    def remove(self, **_kwargs) -> None:
+        self.removed = True
+
+
+class _BlockingContainer:
+    """Fake Docker container that runs until killed."""
+
+    def __init__(self) -> None:
+        self.id = "blocking"
+        self.killed = False
+        self.removed = False
+        self._done = threading.Event()
+
+    def wait(self, **_kwargs):
+        self._done.wait()
+        return {"StatusCode": 137 if self.killed else 0}
+
+    def reload(self) -> None: ...
+
+    @property
+    def status(self) -> str:
+        return "exited" if self._done.is_set() else "running"
+
+    def logs(self, **_kwargs) -> bytes:
+        return b"agent still retrying"
+
+    def kill(self) -> None:
+        self.killed = True
+        self._done.set()
 
     def remove(self, **_kwargs) -> None:
         self.removed = True
@@ -118,6 +152,7 @@ def _patch_harness_env(
     profile_mock: MagicMock,
     flag_shim: bool,
     timeout_shim: bool = False,
+    context_overflow_shim: bool = False,
 ) -> None:
     import src.harness.container as container_mod
 
@@ -155,16 +190,20 @@ def _patch_harness_env(
                 self.inference_timeout_detail = (
                     f"{INFERENCE_TIMEOUT_PREFIX} APITimeoutError: Request timed out."
                 )
+            if context_overflow_shim:
+                self.context_overflow_detail = (
+                    f"{CONTEXT_OVERFLOW_PREFIX} maximum context length exceeded"
+                )
 
     monkeypatch.setattr(container_mod, "OpenAiShim", _ShimWithFlag)
 
 
-def _harness() -> ContainerHarness:
+def _harness(max_wall_seconds: int = 5) -> ContainerHarness:
     return ContainerHarness(
         harness_config={
             "profile": "ms_agent",
             "image": "img",
-            "max_wall_seconds": 5,
+            "max_wall_seconds": max_wall_seconds,
         }
     )
 
@@ -212,3 +251,23 @@ def test_inference_timeout_is_its_own_category_not_endpoint_unavailable(
     assert transcript.termination_category == "inference_timeout"
     assert "inference request timed out" in transcript.termination_reason
     assert transcript.termination_category != "endpoint_unavailable"
+
+
+def test_context_overflow_kills_running_container_and_terminates_episode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_harness_env(
+        monkeypatch,
+        _profile_mock(),
+        flag_shim=False,
+        context_overflow_shim=True,
+    )
+    docker = MagicMock()
+    container = _BlockingContainer()
+    docker.containers.run.return_value = container
+
+    transcript = _harness(max_wall_seconds=1).run_episode(ctx=_ctx(tmp_path, docker))
+
+    assert container.killed is True
+    assert transcript.termination_category == "context_overflow"
+    assert CONTEXT_OVERFLOW_PREFIX in transcript.termination_reason

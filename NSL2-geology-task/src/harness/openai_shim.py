@@ -18,7 +18,11 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from result import Err, Ok
 
-from src.genner.Base import INFERENCE_TIMEOUT_PREFIX, INFERENCE_UNAVAILABLE_PREFIX
+from src.genner.Base import (
+    CONTEXT_OVERFLOW_PREFIX,
+    INFERENCE_TIMEOUT_PREFIX,
+    INFERENCE_UNAVAILABLE_PREFIX,
+)
 from src.harness.recorder import EventRecorder
 from src.harness.tool_contract import ToolResponseClassification, allowed_tool_names
 from src.harness.traced_genner import TracedGenner
@@ -474,6 +478,7 @@ class OpenAiShim:
         # (inference_timeout) are latched SEPARATELY: only the former quarantines
         # the endpoint; the latter is a benign, retryable episode failure (a
         # single timeout must not breach the capacity floor and abort the run).
+        self.context_overflow_detail: str | None = None
         self.inference_unavailable_detail: str | None = None
         self.inference_timeout_detail: str | None = None
         self.app = FastAPI()
@@ -573,6 +578,10 @@ class OpenAiShim:
                 # and quarantining the (possibly sole) endpoint on a timeout
                 # would breach the capacity floor and abort the whole run.
                 # Keep the first occurrence even if a later retry succeeds.
+                if error_str.startswith(CONTEXT_OVERFLOW_PREFIX):
+                    if self.context_overflow_detail is None:
+                        self.context_overflow_detail = error_str
+                    raise HTTPException(status_code=400, detail=error_str)
                 if error_str.startswith(INFERENCE_UNAVAILABLE_PREFIX):
                     if self.inference_unavailable_detail is None:
                         self.inference_unavailable_detail = error_str

@@ -66,6 +66,7 @@ class TestEndpointQuarantineDecision(unittest.TestCase):
 
         self.assertTrue(_episode_triggers_endpoint_quarantine("endpoint_unavailable"))
         self.assertFalse(_episode_triggers_endpoint_quarantine("inference_timeout"))
+        self.assertFalse(_episode_triggers_endpoint_quarantine("context_overflow"))
         self.assertFalse(_episode_triggers_endpoint_quarantine("agent_failure"))
         self.assertFalse(_episode_triggers_endpoint_quarantine("harness_error"))
         self.assertFalse(_episode_triggers_endpoint_quarantine("success"))

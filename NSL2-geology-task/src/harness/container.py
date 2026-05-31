@@ -31,7 +31,7 @@ import time
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from loguru import logger
 
@@ -169,6 +169,7 @@ def _wait_with_cancel(
     container: Any,
     cancel_event: threading.Event,
     max_wall: int,
+    fatal_probe: Callable[[], _Termination | None] | None = None,
 ) -> _Termination:
     """Wait for the container to exit, honoring ``cancel_event`` and
     ``max_wall``. On cancellation or wall-clock expiry the container is
@@ -191,6 +192,15 @@ def _wait_with_cancel(
 
     deadline = time.monotonic() + max_wall
     while waiter.is_alive():
+        if fatal_probe is not None:
+            fatal = fatal_probe()
+            if fatal is not None:
+                try:
+                    container.kill()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"container.kill failed: {exc}")
+                waiter.join(timeout=5)
+                return fatal
         if cancel_event.is_set():
             try:
                 container.kill()
@@ -450,6 +460,17 @@ class ContainerHarness(HarnessSpec):
                     container,
                     ctx.cancel_event,
                     max_wall=self.config.max_wall_seconds,
+                    fatal_probe=lambda: (
+                        _Termination(
+                            reason=(
+                                "context overflow: "
+                                f"{shim.context_overflow_detail}"
+                            ),
+                            category="context_overflow",
+                        )
+                        if shim.context_overflow_detail is not None
+                        else None
+                    ),
                 )
 
                 # If the inference endpoint went away mid-episode, the
@@ -459,7 +480,15 @@ class ContainerHarness(HarnessSpec):
                 # backend did. Give inference outages their own category so
                 # endpoint-level routing handles quarantine/failover instead
                 # of tripping the per-slot harness breaker.
-                if shim.inference_unavailable_detail is not None:
+                if shim.context_overflow_detail is not None:
+                    termination = _Termination(
+                        reason=(
+                            "context overflow: "
+                            f"{shim.context_overflow_detail}"
+                        ),
+                        category="context_overflow",
+                    )
+                elif shim.inference_unavailable_detail is not None:
                     termination = _Termination(
                         reason=(
                             "inference endpoint unavailable: "
