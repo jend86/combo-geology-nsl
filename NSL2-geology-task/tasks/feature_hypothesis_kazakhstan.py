@@ -1656,11 +1656,28 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         episode_id = f"ep_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
 
-        # Check existing features to decide workflow
+        # Check existing features to decide workflow. Crossbreeding is gated on
+        # FULL source coverage + greedy BIC initialisation (rabbit-hole-bias fix,
+        # ported from JenD86/file-rotation@72e3239): the -1.0 first-layer BIC
+        # sentinel used to flip the pipeline to crossbreed after only ~5/18
+        # sources, collapsing the pool to a single hypothesis family.
         n_features = self._count_features(variation)
+        all_sources_done = self._all_sources_visited(variation.kg_dir)
+
+        # Once all sources are visited, attempt greedy BIC init (no-op if already
+        # complete or another parallel episode beat us to it).
+        if all_sources_done:
+            self._run_greedy_bic_initialization(variation)
+
+        greedy_done = (
+            Path(variation.kg_dir) / "greedy_init_complete.json"
+        ).exists()
+
         workflow_kind = "crossbreed" if (
             variation.crossbreed_enabled and
             n_features >= variation.min_features and
+            all_sources_done and
+            greedy_done and
             self._has_crossbreed_pairs(variation)
         ) else "survey"
 
@@ -1837,11 +1854,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # run an explore step (see _crossbreed_workflow, which swaps only the
         # prompt — grounding is preserved either way).
         #
-        # NOTE: the novelty nudge (self._novelty_block_for) is intentionally NOT
-        # injected into the SURVEY prompt — file rotation supplies survey-episode
-        # diversity. It IS wired into the crossbreed prompt (Approach C,
-        # 2026-05-31), which had no diversity steering and collapsed to a single
-        # hypothesis family. See _crossbreed_workflow and _novelty_block_for.
+        # NOTE: the novelty nudge (self._novelty_block_for) is NOT injected into
+        # any prompt. It was briefly wired into crossbreed (Approach C, 2026-05-31)
+        # then REVERTED the same day — it backfired via negation-priming and did
+        # not diversify proposals. Diversity now relies on file rotation (which
+        # IS extended to crossbreed). See _crossbreed_workflow / _novelty_block_for.
         explore_prompt = self._generate_explore_prompt(episode_context)
 
         return Workflow(
@@ -2019,29 +2036,26 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         base_workflow = self._survey_workflow(variation, episode_context)
 
-        # Approach C: restore diversity steering for crossbreed (it had none after
-        # the file-rotation pulldown and collapsed to a single hypothesis family —
-        # docs/design/sft-explore-boundary-resplit-2026-05-31.md). Two levers:
-        #  - the family-balance (novelty) block shows which families saturate the
-        #    pool so the agent diverges from the monoculture; and
-        #  - file rotation grounds the episode in a least-explored source
-        #    (assigned at populate()) IN ADDITION to the parents.
-        novelty_block = self._novelty_block_for(variation)
+        # Crossbreed grounds in a least-explored rotated source (assigned at
+        # populate()) IN ADDITION to its parents. The explicit novelty / "be a
+        # different family" nudge was REVERTED 2026-05-31: it backfired via
+        # negation-priming (listing the saturated families primed them — the
+        # geochemical share rose, no diversity gain), and an explicit diversity
+        # instruction is the wrong lever regardless. Diversity must emerge
+        # organically from grounding in the rotated source, not from telling the
+        # agent to differ. File rotation on crossbreed is kept.
         assigned_blocks = self._assigned_source_blocks(episode_context)
         crossbreed_prompt = (
             "Phase 1: Explore + Hypothesise (Crossbreed Mode)\n\n"
             f"Parent experiments: {parent_ids}\n\n"
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
-            + (novelty_block + "\n\n" if novelty_block else "")
             + assigned_blocks
             + "\n"
             "Use analysis_shell to ground yourself in the dataset — open the\n"
             "assigned under-explored source above (and any other relevant sources)\n"
             "and confirm what the data actually shows.\n"
             "Then, building on the parent findings together with what you observed,\n"
-            "propose ONE hypothesis that combines or extends them — while taking a\n"
-            "genuinely different angle (a different geological mechanism, feature\n"
-            "family, or spatial scale) from the families already saturated above.\n\n"
+            "propose ONE hypothesis that combines or extends them.\n\n"
             "Include a data_spec as before.\n\n"
             "Close with:\n"
             "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
@@ -3875,8 +3889,12 @@ finally:
             if result.get("success"):
                 phase_records = ctx.episode_context.setdefault("phase_records", {})
                 
-                # Update translate phase record
-                layer_name = args.get("name", "")
+                # Update translate phase record. Use the scoring tool's returned
+                # layer_name (timestamped, e.g. copper_concentration_1780199863749)
+                # — the authoritative name of the .npy actually written — not the
+                # bare agent-supplied args["name"] (rabbit-hole-bias fix: the
+                # greedy init + crossbreed parent lookup must match real files).
+                layer_name = result.get("layer_name") or args.get("name", "")
                 if layer_name:
                     translate_record = phase_records.setdefault("translate", {})
                     translate_record["feature_layer_name"] = layer_name
@@ -4181,6 +4199,138 @@ finally:
             return admitted_count >= 5
         except Exception:
             return False
+
+    def _all_sources_visited(self, kg_dir: str) -> bool:
+        """Return True when every source in _KAZAKHSTAN_SOURCE_FILES has been
+        visited at least once according to file_rotation_state.json.
+
+        Gates crossbreeding so it cannot begin before the rotation has covered
+        the whole dataset (rabbit-hole-bias fix, JenD86/file-rotation@72e3239).
+        """
+        state_path = Path(kg_dir) / "file_rotation_state.json"
+        if not state_path.exists():
+            return False
+        try:
+            with open(state_path) as f:
+                counts = json.load(f).get("counts", {})
+        except Exception:  # noqa: BLE001
+            return False
+        return all(counts.get(s["key"], 0) >= 1 for s in _KAZAKHSTAN_SOURCE_FILES)
+
+    def _run_greedy_bic_initialization(
+        self, variation: "FeatureHypothesisKazakhstanVariation"
+    ) -> None:
+        """Forward greedy BIC selection over all admitted bootstrap layers.
+
+        Ported from JenD86/file-rotation@72e3239. Guarded by
+        greedy_init_complete.json + _kg_lock so only one parallel episode runs it
+        (O(N^2) evals). Round 1 picks the highest null-model BIC layer (most
+        spatially variable → richest single foundation); rounds 2+ greedily add
+        whichever remaining layer most reduces geological_coherence_score (most
+        complementary). Non-selected layers stay in the store but are excluded
+        from crossbreeding by the populate() flag check. Writes the selection to
+        greedy_init_complete.json.
+        """
+        kg_dir = Path(variation.kg_dir)
+        flag_path = kg_dir / "greedy_init_complete.json"
+        if flag_path.exists():
+            return
+
+        with self._kg_lock(kg_dir):
+            if flag_path.exists():
+                return
+
+            try:
+                import numpy as _np
+                from voxel_features.spatial import SpatialVoxelStore as _SVS
+                from voxel_features.store import GridSpec as _GridSpec
+                from voxel_features.scoring import (
+                    geological_coherence_score as _geo_score,
+                    _single_layer_null_bic as _null_bic,
+                )
+            except ImportError as exc:
+                logger.warning(f"greedy_bic_init: import failed: {exc}")
+                flag_path.write_text(json.dumps({"status": "skipped", "reason": str(exc)}))
+                return
+
+            admitted_dir = Path(variation.store_dir) / "admitted"
+            try:
+                grid = _GridSpec.from_dict(variation.grid_spec)
+                store = _SVS(admitted_dir, grid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"greedy_bic_init: store open failed: {exc}")
+                flag_path.write_text(json.dumps({"status": "skipped", "reason": str(exc)}))
+                return
+
+            layer_names = list(store.layer_names)
+            n = len(layer_names)
+            if n < 2:
+                logger.info(f"greedy_bic_init: {n} layers — skipping selection")
+                flag_path.write_text(json.dumps({
+                    "status": "skipped", "n": n, "reason": "too_few_layers",
+                    "selected": layer_names,
+                }))
+                return
+
+            values = [store.get_layer_values(name).flatten() for name in layer_names]
+            dtypes = [store.get_layer(name).dtype for name in layer_names]
+            shape = tuple(grid.shape)
+            logger.info(f"greedy_bic_init: forward greedy selection over {n} layers")
+
+            # Round 1: highest null-model BIC = most spatially variable layer.
+            null_bics: list[float] = []
+            for i in range(n):
+                try:
+                    r = _null_bic(values[i], dtypes[i], grid, shape)
+                    null_bics.append(r.get("bic", 0.0))
+                except Exception:  # noqa: BLE001
+                    null_bics.append(0.0)
+
+            first_idx = int(_np.argmax(null_bics))
+            selected: list[int] = [first_idx]
+            remaining: list[int] = [i for i in range(n) if i != first_idx]
+            bic_current = 0.0  # geo_coherence_score for a single layer = 0
+
+            # Rounds 2+: add whichever layer most reduces geological_coherence BIC.
+            while remaining:
+                best_j: int | None = None
+                best_delta = 0.0
+                bic_next = bic_current
+                for j in remaining:
+                    cand_vals = [values[i] for i in selected] + [values[j]]
+                    cand_dtypes = [dtypes[i] for i in selected] + [dtypes[j]]
+                    try:
+                        r = _geo_score(cand_vals, cand_dtypes, grid, shape)
+                        delta = r.get("bic", 0.0) - bic_current
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_j = j
+                            bic_next = r.get("bic", 0.0)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"greedy_bic_init: scoring failed for {layer_names[j]}: {exc}"
+                        )
+
+                if best_j is None:
+                    break
+                selected.append(best_j)
+                remaining.remove(best_j)
+                bic_current = bic_next
+
+            selected_names = [layer_names[i] for i in selected]
+            not_selected = [layer_names[i] for i in range(n) if i not in selected]
+            logger.info(
+                f"greedy_bic_init: selected {len(selected_names)}/{n} layers; "
+                f"final BIC {bic_current:.2f}; excluded: {not_selected}"
+            )
+            flag_path.write_text(json.dumps({
+                "status": "complete",
+                "n_total": n,
+                "n_selected": len(selected_names),
+                "selected": selected_names,
+                "not_selected": not_selected,
+                "final_bic": bic_current,
+            }, indent=2))
 
     def _assign_rotation_source(
         self,
@@ -4866,13 +5016,13 @@ finally:
     ) -> str:
         """Compute the novelty-nudge prompt block for a given variation.
 
-        Wired into the CROSSBREED explore prompt as of 2026-05-31 (Approach C,
-        docs/design/sft-explore-boundary-resplit-2026-05-31.md) to restore the
-        family-diversity steering crossbreed lost after the file-rotation
-        pulldown. It is deliberately NOT injected into the survey prompt, where
-        file rotation already supplies episode diversity. Helpers
-        (_recent_admitted_hypotheses, _render_novelty_block,
-        _render_mechanism_summary) and the ``novelty_*`` Variation knobs back it.
+        ⚠️ NOT WIRED into any prompt. Briefly injected into crossbreed (Approach C,
+        2026-05-31) then REVERTED the same day: it backfired via negation-priming
+        (listing the saturated families primed them — geochemical share rose, no
+        diversity gain). An explicit "be a different family" instruction is the
+        wrong lever; diversity is meant to emerge organically from file rotation.
+        Retained (with `_render_novelty_block`, `_render_mechanism_summary`,
+        `_classify_mechanism`, `novelty_*` knobs) for analysis use only.
 
         Returns empty when the knob is disabled, K=0, or no admissions
         exist — callers can prepend the result unconditionally. Block now

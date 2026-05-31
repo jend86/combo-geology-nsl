@@ -2014,37 +2014,9 @@ def evaluate_new_layer(
     
     # Flatten new layer values
     new_values_flat = layer_values.flatten()
-    
-    # First layer: no comparison is possible, admit unconditionally
-    if not existing_layers:
-        store.add_layer(
-            name=layer_name,
-            values=layer_values,
-            dtype=layer_dtype,
-        )
-        return {
-            "bic_before": 0.0,
-            "bic_after": 0.0,
-            "bic_delta": -1.0,
-            "bic_delta_raw": -1.0,
-            "n_effective_samples": 0,
-            "cv_mse_before": 0.0,
-            "cv_mse_after": 0.0,
-            "cv_mse_delta": 0.0,
-            "mutual_info": {},
-            "admitted": True,
-            "predicted_value": 1.0,
-            "masking_test_passed": True,
-            "masking_test_improvement": 0.0,
-            "masking_test_direction": "first_layer",
-            "stage_completed": "mae_bic_completed",
-        }
-    
-    # Get existing layer values and dtypes
-    existing_values = [store.get_layer_values(n).flatten() for n in existing_layers]
-    existing_dtypes = [store.get_layer(n).dtype for n in existing_layers]
-    
-    # Resolve the effective seed: explicit > VFM_EPISODE_ID env > default 42.
+
+    # Resolve the effective seed BEFORE any scoring so the first-layer null-model
+    # BIC below is reproducibly seeded too: explicit > VFM_EPISODE_ID env > 42.
     # When the env var is set by the framework (per-episode), each episode
     # produces a different but reproducible scoring. Without it we fall back
     # to a fixed seed so the rubber-stamp pre-fix behaviour cannot return
@@ -2061,6 +2033,47 @@ def evaluate_new_layer(
             effective_seed = int(_hashlib.sha256(env_eid.encode()).hexdigest()[:8], 16)
         else:
             effective_seed = 42
+
+    # First layer: no pairwise comparison is possible, admit unconditionally —
+    # but score it with a REAL predict-by-mean null model, not the old -1.0
+    # sentinel. The sentinel auto-satisfied admission and flipped the pipeline to
+    # crossbreed after only ~5/18 sources (rabbit-hole bias), and gave the greedy
+    # BIC init no signal to rank foundation layers. Higher null BIC = more
+    # spatially variable = more informative; bic_delta = -null_bic stays negative.
+    if not existing_layers:
+        null_result = _single_layer_null_bic(
+            new_values_flat, layer_dtype, store.grid, grid_shape,
+            seed=effective_seed,
+        )
+        store.add_layer(
+            name=layer_name,
+            values=layer_values,
+            dtype=layer_dtype,
+        )
+        null_bic = null_result.get("bic", 0.0)
+        n_eff = null_result.get("n_effective_samples", 0)
+        sys_mae = null_result.get("system_mae", 0.0)
+        return {
+            "bic_before": null_bic,
+            "bic_after": 0.0,
+            "bic_delta": -null_bic,
+            "bic_delta_raw": -null_bic,
+            "n_effective_samples": n_eff,
+            "cv_mse_before": sys_mae,
+            "cv_mse_after": 0.0,
+            "cv_mse_delta": -sys_mae,
+            "mutual_info": {},
+            "admitted": True,
+            "predicted_value": 1.0,
+            "masking_test_passed": True,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "null_model_baseline",
+            "stage_completed": "mae_bic_completed",
+        }
+
+    # Get existing layer values and dtypes
+    existing_values = [store.get_layer_values(n).flatten() for n in existing_layers]
+    existing_dtypes = [store.get_layer(n).dtype for n in existing_layers]
 
     # Score WITHOUT new layer (always call to get system_mae / n_effective_samples).
     # ``seed`` is reused for both before/after so the CV split, Moran sample,

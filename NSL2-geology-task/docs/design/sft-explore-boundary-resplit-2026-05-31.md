@@ -148,6 +148,29 @@ off-family material to diverge with. The novelty knobs were already enabled
 
 Tests: `tests/test_crossbreed_diversity_steering.py`. **Generation-side only** — it changes
 what future crossbreed episodes are *asked*, so the diversity gain shows up only in a new run;
-re-measure with `compare_diversity.py`. Deeper root (out of scope for C): crossbreed pairs are
-drawn from an already-monocultured pool, so diversity-aware **parent pairing** is the durable
-follow-up if C alone doesn't move the numbers.
+re-measure with `compare_diversity.py`.
+
+### 7.1 Result — novelty nudge REVERTED, file rotation kept (same day)
+
+The restarted run (process @16:09) picked up C. Dissecting the post-C crossbreed episodes:
+
+- **The nudge backfired.** Proposed-hypothesis mechanism mix went *more* monocultured, not
+  less: geochemical 62% → **71%**, drillhole 1% → **0%**; all 48 post-C proposals open with the
+  identical *"Copper mineralization in the Teniz Basin is preferentially concentrated…"*.
+  Cause: the block lists the saturated families verbatim → **negation-priming** (showing redox
+  examples primes redox). The rotated source couldn't override the parent anchor either.
+- **The real failure mode is saturation, not C.** Episodes don't crash — they reach
+  `stage_2_completed` and return `no_feature` (feature built but **not admitted**). Crossbreed
+  success declines monotonically across the run (17.5% → 0% by ep ~200, *before* the C restart):
+  the pool is saturated with copper-redox features, so new near-variants add no information and
+  fail the gate. 0% admission ⇒ no new training data.
+
+Action: the explicit novelty/"be a different family" nudge is **removed** from the crossbreed
+prompt (it was net-negative). `_novelty_block_for` + helpers/knobs are retained but unwired
+(analysis only). **File rotation on crossbreed is kept** — it may work better without the nudge
+priming against it.
+
+Diversity-aware **parent pairing is ruled out** (not viable). The goal instead: crossbreed
+hypotheses that are a *different family* yet *explain* the parents, emerging **organically**
+(no explicit "differ" instruction) — pursued via source-led/abductive prompt structure +
+reduced parent-prose priming, not an instruction. See the next design note.

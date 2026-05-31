@@ -79,9 +79,18 @@ def _crossbreed_ctx(**extra) -> dict:
 
 
 def test_populate_assigns_rotation_source_for_crossbreed(tmp_path: Path) -> None:
+    from tasks.feature_hypothesis_kazakhstan import _KAZAKHSTAN_SOURCE_FILES
+
     variation = _variation(tmp_path)
-    # >= 5 admitted experiments clears the crossbreed floor.
-    _seed_admits(Path(variation.kg_dir), [f"distinct hypothesis number {i}" for i in range(5)])
+    kg = Path(variation.kg_dir)
+    # >= 5 admits clears the crossbreed floor; the rabbit-hole-bias gate also
+    # requires every source visited + greedy init complete before crossbreed.
+    _seed_admits(kg, [f"distinct hypothesis number {i}" for i in range(5)])
+    kg.mkdir(parents=True, exist_ok=True)
+    (kg / "file_rotation_state.json").write_text(
+        json.dumps({"counts": {s["key"]: 1 for s in _KAZAKHSTAN_SOURCE_FILES}})
+    )
+    (kg / "greedy_init_complete.json").write_text(json.dumps({"status": "complete"}))
 
     outcome = _task(tmp_path).populate([], variation)
 
@@ -114,19 +123,23 @@ def test_crossbreed_prompt_includes_assigned_source(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# (3) crossbreed prompt carries the family-balance (novelty) signal
+# (3) novelty nudge is REVERTED — no explicit "be a different family" steering
+#     (it backfired via negation-priming; diversity must emerge organically).
 # ---------------------------------------------------------------------------
 
 
-def test_crossbreed_prompt_includes_family_balance_block(tmp_path: Path) -> None:
+def test_crossbreed_prompt_has_no_explicit_novelty_nudge(tmp_path: Path) -> None:
     kg = tmp_path / "kg" / "teniz_basin"
     _seed_admits(kg, [f"copper redox reduced facies variant {i}" for i in range(6)])
     variation = _variation(tmp_path, kg_dir=str(kg))
 
     wf = _task(tmp_path)._crossbreed_workflow(variation, _crossbreed_ctx())
     prompt = _explore_step(wf).prompt
-    assert "DO NOT propose variants" in prompt, (
-        "crossbreed prompt must carry the family-balance signal (novelty block)"
+    assert "DO NOT propose variants" not in prompt, (
+        "novelty nudge was reverted — it must not be injected into the crossbreed prompt"
+    )
+    assert "different angle" not in prompt and "saturated" not in prompt, (
+        "no explicit diversity instruction — diversity must emerge organically"
     )
 
 

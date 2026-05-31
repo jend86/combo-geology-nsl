@@ -141,8 +141,13 @@ def test_first_layer_returns_stage1_fields(tmp_path: Path) -> None:
         assert key in result, f"missing key {key} in first-layer admit"
 
     assert result["admitted"] is True
-    assert result["masking_test_direction"] == "first_layer"
+    # Rabbit-hole-bias fix: the first layer is scored with a real predict-by-mean
+    # null model, not the old -1.0 sentinel. Direction renamed accordingly and
+    # bic_delta is now a genuine negative score.
+    assert result["masking_test_direction"] == "null_model_baseline"
     assert result["stage_completed"] == "mae_bic_completed"
+    assert result["bic_delta"] != -1.0
+    assert result["bic_delta"] < 0.0
 
 
 # ---------------------------------------------------------------------------
