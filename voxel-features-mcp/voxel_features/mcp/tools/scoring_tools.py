@@ -192,6 +192,19 @@ def scoring_create_feature_layer(
         
         # Update result to reflect the unique name used
         result["layer_name"] = unique_name
+
+        # Rejected layers are intentionally not in the store index, but keep a
+        # scratch .npy so the task layer can quarantine scored failures before
+        # per-episode scratch cleanup removes them.
+        if not bool(result.get("admitted")):
+            layers_dir = getattr(store, "_layers_dir", None)
+            if layers_dir is not None:
+                try:
+                    np.save(layers_dir / f"{unique_name}.npy", arr)
+                    result["candidate_layer_preserved"] = True
+                except Exception as save_err:  # noqa: BLE001
+                    result["candidate_layer_preserved"] = False
+                    result["candidate_layer_preserve_error"] = str(save_err)
         
         return {
             "success": True,

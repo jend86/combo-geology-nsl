@@ -51,6 +51,10 @@ if TYPE_CHECKING:
     from voxel_features.store import VoxelStore, GridSpec
 
 
+_STAGE1_MAE_TOLERANCE = 1e-5
+_STAGE1_BIC_RESCUE_THRESHOLD = -1.0
+
+
 def _entropy_continuous(values: np.ndarray, n_bins: int = 50) -> float:
     """Estimate entropy of continuous values using histogram binning."""
     # Remove NaN values
@@ -2014,6 +2018,12 @@ def evaluate_new_layer(
     
     # Flatten new layer values
     new_values_flat = layer_values.flatten()
+    candidate_nonzero_voxels = int(np.count_nonzero(new_values_flat))
+    candidate_fill_fraction = (
+        float(candidate_nonzero_voxels) / float(new_values_flat.size)
+        if new_values_flat.size
+        else 0.0
+    )
 
     # Resolve the effective seed BEFORE any scoring so the first-layer null-model
     # BIC below is reproducibly seeded too: explicit > VFM_EPISODE_ID env > 42.
@@ -2059,6 +2069,11 @@ def evaluate_new_layer(
             "bic_delta": -null_bic,
             "bic_delta_raw": -null_bic,
             "n_effective_samples": n_eff,
+            "n_effective_samples_before": 0,
+            "n_effective_samples_after": n_eff,
+            "n_effective_samples_delta": n_eff,
+            "candidate_nonzero_voxels": candidate_nonzero_voxels,
+            "candidate_fill_fraction": candidate_fill_fraction,
             "cv_mse_before": sys_mae,
             "cv_mse_after": 0.0,
             "cv_mse_delta": -sys_mae,
@@ -2068,6 +2083,9 @@ def evaluate_new_layer(
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
             "masking_test_direction": "null_model_baseline",
+            "stage_1_tolerance_used": False,
+            "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
+            "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
             "stage_completed": "mae_bic_completed",
         }
 
@@ -2105,7 +2123,10 @@ def evaluate_new_layer(
     bic_delta_raw = bic_after - bic_before
     
     # Normalize BIC delta by effective sample count to remove grid-size artifact
-    n_eff = max(score_after.get("n_effective_samples", 1), 1)
+    n_eff_before = int(score_before.get("n_effective_samples", 0) or 0)
+    n_eff_after = int(score_after.get("n_effective_samples", 0) or 0)
+    n_eff_delta = n_eff_after - n_eff_before
+    n_eff = max(n_eff_after, 1)
     bic_delta = bic_delta_raw / n_eff  # per-sample BIC delta; range ~[-0.5, 0] for good layers
     
     cv_mse_before = score_before["total_cv_mse"]
@@ -2123,9 +2144,14 @@ def evaluate_new_layer(
         # Not enough layers to compute a meaningful before-MAE; let Stage 2 decide
         stage1_passed = True
         mae_improvement = 0.0
+        stage1_tolerance_used = False
     else:
         mae_improvement = mae_before - mae_after  # positive = system MAE improved
-        stage1_passed = mae_improvement > 0
+        stage1_tolerance_used = (
+            mae_improvement >= -_STAGE1_MAE_TOLERANCE
+            and bic_delta <= _STAGE1_BIC_RESCUE_THRESHOLD
+        )
+        stage1_passed = mae_improvement > 0 or stage1_tolerance_used
     
     # -----------------------------------------------------------------------
     # Stage 2: Normalized BIC must improve (negative per-sample delta)
@@ -2144,6 +2170,9 @@ def evaluate_new_layer(
         "masking_test_passed": stage1_passed,
         "masking_test_improvement": mae_improvement,
         "masking_test_direction": "mae_delta" if len(existing_layers) >= 2 else "auto_pass",
+        "stage_1_tolerance_used": stage1_tolerance_used,
+        "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
+        "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
         "stage_completed": "mae_bic_completed",
     }
     
@@ -2176,6 +2205,11 @@ def evaluate_new_layer(
         "bic_delta": bic_delta,          # normalized per-sample; range ~[-0.5, 0] for good layers
         "bic_delta_raw": bic_delta_raw,  # raw (grid-size-dependent); diagnostic only
         "n_effective_samples": n_eff,
+        "n_effective_samples_before": n_eff_before,
+        "n_effective_samples_after": n_eff_after,
+        "n_effective_samples_delta": n_eff_delta,
+        "candidate_nonzero_voxels": candidate_nonzero_voxels,
+        "candidate_fill_fraction": candidate_fill_fraction,
         "cv_mse_before": cv_mse_before,
         "cv_mse_after": cv_mse_after,
         "cv_mse_delta": cv_mse_delta,
