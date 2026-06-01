@@ -1,0 +1,144 @@
+# DUAL-ENDPOINT variant of config-feature-hypothesis-kazakhstan-vllm.toml.
+#
+# Supplements the local 2x4090 box with one external RunPod A40 48GB vLLM endpoint
+# to lift throughput (Approach C, gone-dual). A pipeline diagnostic (opt-125m on an A40)
+# proved the image + `vllm serve` + RunPod-TCP-proxy path works; the A100 was dropped on
+# cost ($1.39/hr) once its only failures turned out to be download/load time, not anything
+# structural. A40 ($0.44/hr SECURE) ~matches the local box's 48GB KV budget (the local
+# config proves 8 episodes fit 48GB), so it roughly DOUBLES throughput: 8 local + 8 A40.
+# FRESH run: the prior live run (u605vp) was killed + archived and the active KG/store were
+# cleared, so generation_0 has no checkpoint -> starts clean. resume_from_checkpoint stays
+# true for interruption-resilience: it checkpoints to generation_0 and resumes from there
+# only if THIS run is interrupted (no checkpoint now => no resume, no recipe-hash guard trip).
+#
+# endpoints-mode => the framework launches NO local vLLM. It connects to the two
+# URLs below and probes them. The old [vllm] engine flags (PP=2, max_model_len,
+# kv parser, ...) NO LONGER apply here -- they live in each box's launch command:
+#   - local-4090 : the existing `nsl-vllm-8000` container (keep it alive across
+#                  the cutover by SIGKILLing the old orchestrator, whose vLLM
+#                  teardown sits in a `finally` a kill skips).
+#   - runpod-a40-1 : single A40 48GB, vllm serve (TP1/PP1, fp8 KV, prefix caching,
+#                  chunked prefill, gemma4 tool parser, max_model_len 65536,
+#                  max-num-seqs 18, --enforce-eager to skip torch.compile at startup).
+#
+# Cutover + run (generation-only, matches the live run's entrypoint):
+#   source ~/.config/nsl-runpod/secrets.env        # RUNPOD_VLLM_KEY for the pool
+#   nix develop -c uv run python scripts/run_generation_only.py \
+#     config/config-feature-hypothesis-kazakhstan-dual.toml
+#
+# The A40 is measured in-situ: watch its /metrics (preempt ~0 + pfx_hit climbing
+# => 8 fits the card). If preemptions stay ~0 there's headroom to raise capacity;
+# if they climb, lower runpod-a40-1 capacity and parallel_episodes together, then
+# resume again. (64K peak contexts make KV the ceiling, same as the local box.)
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+timeout = 300
+
+[vllm]
+# endpoints-mode: NO local container is launched; the pool connects to + probes
+# the URLs below. Capacity-floor abort fires only if healthy capacity drops below
+# this. 4 => survive on either box alone (local 8 >= 4, A100 24 >= 4); abort only
+# if BOTH collapse. Deliberately low: a floor set too high vs capacity caused a
+# spurious capacity-floor abort before (see endpoint-timeout-not-outage).
+min_healthy_endpoint_capacity = 4
+
+[[vllm.endpoints]]
+id       = "local-4090"
+base_url = "http://127.0.0.1:8000"
+capacity = 8                          # the existing nsl-vllm-8000 box; no api_key (it runs without --api-key)
+
+[[vllm.endpoints]]
+id          = "runpod-a40-1"
+base_url    = "http://194.68.245.114:22043"   # A40 pod 571sc1lvcopuy6 (v0.20.2, --kv-cache-dtype auto)
+capacity    = 6                           # A40 runs fp16 KV (auto): fp8 unusable on Ampere -- e4m3 arch-gated, e5m2 trips an attention assert (see docs/design/runpod-a40-vllm-crash-investigation-2026-06-01.md). Measured num_gpu_blocks=8064 => ~129K KV tokens (~half an fp8 setup) => 6 @ ~21K ctx. Tune from /metrics preemptions.
+api_key_env = "RUNPOD_VLLM_KEY"           # pod injects VLLM_API_KEY; bearer confirmed serving (tool-calls OK)
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 8 local + 6 external = 14 slots. Capacity-weighted home map: 8/14 to local-4090,
+# 6/14 to runpod-a40-1. Host is 32 cores / 125 GB RAM, external agents I/O-bound on the
+# A40, so 14 harness containers fit easily. The A40 runs fp16 KV (auto) -- fp8 is unusable
+# on Ampere (e4m3 arch-gated; e5m2 trips an attention assert) -- so it holds ~half the KV
+# of an fp8 setup (~129K tokens, num_gpu_blocks=8064). 6 is conservative; tune from the
+# A40's /metrics preemptions (raise if ~0, lower if they climb).
+parallel_episodes = 14
+target_training_rows = 4500
+max_episodes = 10000
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+# Fresh start (no generation_0 checkpoint exists); true only to resume THIS run if interrupted.
+resume_from_checkpoint = true
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[training]
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
+wandb_project = "feature-hypothesis-kazakhstan"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+# Generation-only (no finetuning), same as the live run.
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "regional-analysis", "bic-scoring", "gemma4", "dedup-gate", "bootstrap-ramp", "dual-endpoint", "runpod-a40"]

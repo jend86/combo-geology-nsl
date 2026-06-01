@@ -254,25 +254,27 @@ def _load_self_generated_sft_rows(
                 if not isinstance(prompt, str) or not isinstance(raw_response, str):
                     continue
 
-                prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": prompt}],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                completion_text = tokenizer.apply_chat_template(
+                # Emit a single full-conversation `text` field (user+assistant
+                # templated together). This is the format the proven nsl2 finetune
+                # used. The earlier prompt/completion split — two apply_chat_template
+                # calls sliced by character length, fed to TRL's prompt-completion
+                # path — index-asserted in the gemma-4 forward (ATen IndexKernel.cu:111)
+                # regardless of completion_only_loss; full-sequence `text` does not.
+                text = tokenizer.apply_chat_template(
                     [
                         {"role": "user", "content": prompt},
                         {"role": "assistant", "content": raw_response},
                     ],
                     tokenize=False,
                     add_generation_prompt=False,
-                )[len(prompt_text):]
-                rows.append({"prompt": prompt_text, "completion": completion_text})
+                )
+                rows.append({"text": text})
     return rows
 
 
 def _load_rehearsal_sft_rows(
     *,
+    tokenizer: Any,
     dataset_name: str,
     split: str,
     text_field: str,
@@ -316,7 +318,17 @@ def _load_rehearsal_sft_rows(
                 prompt += f":\n\n{excerpt}"
             else:
                 prompt += "."
-            epoch_rows.append({"prompt": prompt, "completion": text})
+            # Same single-`text` chat format as the self-generated rows so both
+            # share one SFTConfig(dataset_text_field="text") full-sequence path.
+            templated = tokenizer.apply_chat_template(
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": text},
+                ],
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+            epoch_rows.append({"text": templated})
         rows_by_epoch.append(epoch_rows)
 
     return rows_by_epoch
@@ -348,6 +360,7 @@ def _load_sft_dataset(
     rehearsal_rows_by_epoch: list[list[dict[str, str]]]
     if rehearsal_dataset:
         rehearsal_rows_by_epoch = _load_rehearsal_sft_rows(
+            tokenizer=tokenizer,
             dataset_name=rehearsal_dataset,
             split=rehearsal_split,
             text_field=rehearsal_text_field,
@@ -447,6 +460,26 @@ def train_sft(
     row_count = len(dataset)
     effective_warmup_steps = 0 if warmup_ratio > 0 else warmup_steps
 
+    # TRL's _prepare_dataset tokenizes via dataset.map(tokenize_fn); tokenize_fn is a closure
+    # over `self` (the trainer). datasets runs that map under a process Pool for ANY num_proc
+    # >= 1 (arrow_dataset: `if num_proc is not None and num_proc >= 1`), and Unsloth/TRL default
+    # num_proc to os.cpu_count() -- so it dill-pickles the closure to ship to workers and dies
+    # with "cannot pickle 'ConfigModuleInstance'" (a torch dynamo/inductor config object
+    # reachable from the trainer) on the torch 2.10 stack. Force every map here to run
+    # in-process (num_proc=None takes datasets' non-Pool branch); the dataset is small, so
+    # single-process tokenization costs only seconds.
+    import datasets.arrow_dataset as _hf_arrow
+
+    if not getattr(_hf_arrow.Dataset.map, "_nsl_inproc", False):
+        _orig_dataset_map = _hf_arrow.Dataset.map
+
+        def _inproc_map(self, *map_args, **map_kwargs):
+            map_kwargs["num_proc"] = None
+            return _orig_dataset_map(self, *map_args, **map_kwargs)
+
+        _inproc_map._nsl_inproc = True
+        _hf_arrow.Dataset.map = _inproc_map
+
     trainer = SFTTrainer(
         model=model,
         args=SFTConfig(
@@ -464,7 +497,10 @@ def train_sft(
             save_strategy="no",
             report_to=report_to,
             max_length=max_seq_length,
-            completion_only_loss=True,
+            # Full-sequence language-modeling on a single `text` column (both self-
+            # generated and rehearsal rows carry it). This is the proven nsl2 format;
+            # TRL's prompt/completion path index-asserted in the gemma-4 forward.
+            dataset_text_field="text",
             seed=seed,
             **_mixed_precision_kwargs(),
             optim="paged_adamw_8bit",
