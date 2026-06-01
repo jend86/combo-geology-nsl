@@ -69,6 +69,9 @@ def test_external_aiq_config_uses_shorter_iteration_cap() -> None:
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
 
     assert config["harness"]["container"]["tool_output_max_chars"] == 2500
+    assert config["harness"]["container"]["context_compaction_enabled"] is True
+    assert config["harness"]["container"]["context_compaction_trigger_tokens"] == 52000
+    assert config["harness"]["container"]["context_compaction_target_tokens"] == 45000
     assert config["harness"]["container"]["profile_config"]["max_iterations"] == 28
 
 

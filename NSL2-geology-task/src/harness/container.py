@@ -38,6 +38,7 @@ from loguru import logger
 from src.framework.capability_bridge import BridgeHandle, CapabilityMcpBridge
 from src.harness.base import HarnessError, HarnessSpec
 from src.harness.context import HarnessContext, project_step_constraints
+from src.harness.context_compaction import ContextCompactionSettings
 from src.harness.openai_shim import OpenAiShim
 from src.harness.profiles import resolve_profile
 from src.harness.recorder import EventRecorder
@@ -381,6 +382,18 @@ class ContainerHarness(HarnessSpec):
                     token=token,
                     episode_id=ctx.episode_id,
                     recorder=ctx.recorder,
+                    context_compaction=ContextCompactionSettings(
+                        enabled=self.config.context_compaction_enabled,
+                        trigger_tokens=self.config.context_compaction_trigger_tokens,
+                        target_tokens=self.config.context_compaction_target_tokens,
+                        keep_recent_tool_outputs=(
+                            self.config.context_compaction_keep_recent_tool_outputs
+                        ),
+                        keep_recent_assistant_reasoning=(
+                            self.config.context_compaction_keep_recent_assistant_reasoning
+                        ),
+                        chars_per_token=self.config.context_compaction_chars_per_token,
+                    ),
                 )
                 shim_handle = _serve_on_loopback(shim.app)
                 stack.callback(shim_handle.stop)

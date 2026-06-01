@@ -67,6 +67,11 @@ max_wall_seconds = 7200
 mem_limit = "2g"
 network_mode = "host"
 inference_transport = "tcp"
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
 
 [harness.container.build]
 context = "docker/aiq"

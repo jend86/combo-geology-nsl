@@ -1,0 +1,167 @@
+# HYBRID local-4090 + external-Ada(48GB) variant (RESUME 2026-06-02, continues 20260601).
+# NOTE: filename still says "-local-h100" for continuity, but the external GPU is now a
+# right-sized 48GB Ada card (L40S), NOT an H100 -- see the respec rationale below.
+#
+# Topology (6 local + 28 external = 34):
+#   - local-4090    : the 2x RTX 4090 box (PP=2), brought up SEPARATELY via
+#                     scripts/start_local_vllm.py (container nsl-vllm-8000) and left
+#                     running; endpoints-mode does NOT launch it (vllm.py:960). 6 slots.
+#   - runpod-l40s-1 : ONE 48GB Ada card -- L40S preferred, RTX 6000 Ada as availability
+#                     fallback (both Ada/sm_89 so fp8 KV works). vLLM v0.20.2, fp8 KV,
+#                     TP1/PP1, max_model_len 65536, --max-num-seqs 32, --enforce-eager.
+#                     28 slots. base_url + exact card filled in post-provision. ~$0.8-1/hr
+#                     SECURE (~3.5x cheaper than the H100 it replaces).
+#
+# WHY RESPEC OFF THE H100: host RAM -- NOT GPU VRAM -- is the binding ceiling. Each episode
+# = 4 local containers (agent+vfm+analysis + a code-exec sandbox, all nsl/aiq:0.1.0) plus
+# the analysis container's in-RAM voxel dataset. EMPIRICAL (2026-06-01): 52 eps thrashed
+# (5G avail/swap full); even 40 eps slowly bled 24G->6G avail over the run (container-memory
+# accumulation -- a separate issue to chase). So total episodes are capped well below what
+# an 80GB H100 can serve; the external endpoint only ever needs ~28 gemma-4-AWQ slots
+# (17GB weights + fp8 KV ~= 31GB on a 48GB Ada card -- comfortable; the H100's 80GB was
+# ~half idle). fp8 KV REQUIRES Ada (sm_89): on Ampere (A40/A6000/A100) vLLM falls back to
+# fp16 KV which halves capacity (A40 topped out ~6 slots) -- hence an Ada 48GB card, not a
+# cheaper Ampere one. 6 + 28 = 34 keeps headroom vs the 40-eps bleed. MONITOR steady-state
+# `free -g` (NOT startup); dial parallel_episodes to 30 if avail < 8G / swap climbs. The
+# local slots OFFLOAD prefill, and in-loop context compaction (below, chars_per_token=3.0)
+# caps per-turn prompt growth.
+#
+# max_iterations = 40 (NOT the vetoed 28): turn caps are deliberately unchanged --
+# the overflow leak is per-turn context growth, not turn count (see the recovery-plan
+# doc + survey-admission-rate-deep-dive §11). Per-turn context is curbed via
+# tool_output_max_chars=2500 + the kill-stuck-loop commits, not budget clamps.
+#
+# Run (generation-only):
+#   source ~/.config/nsl-runpod/secrets.env          # RUNPOD_VLLM_KEY for the pool
+#   nix develop -c uv run python scripts/run_generation_only.py \
+#     config/config-feature-hypothesis-kazakhstan-local-h100.toml
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+timeout = 300
+
+[vllm]
+# endpoints-mode: NO local container is launched by the framework (the local 4090
+# vLLM is started out-of-band and reused). Capacity-floor abort fires only if healthy
+# capacity drops below this. 4 => survive on either endpoint alone (local 6 >= 4,
+# L40S 28 >= 4); abort only if BOTH collapse (see endpoint-timeout-not-outage).
+min_healthy_endpoint_capacity = 4
+
+[[vllm.endpoints]]
+id       = "local-4090"
+base_url = "http://127.0.0.1:8000"
+capacity = 6                          # nsl-vllm-8000 (PP=2, fp8 KV, max_num_seqs=10); runs without --api-key
+
+[[vllm.endpoints]]
+id          = "runpod-l40s-1"
+base_url    = "http://PENDING-PROVISION:0"    # OVERWRITTEN post-provision with the fresh Ada-48GB pod IP:port
+capacity    = 28                              # host-RAM-capped (NOT GPU-capped); vLLM --max-num-seqs 32 (4 slack). Tune from /metrics preemptions.
+api_key_env = "RUNPOD_VLLM_KEY"               # pod injects VLLM_API_KEY (bearer); same secret as before
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+# Tool-output truncation cap (chars) read by the capability bridge
+# (src/framework/capability_bridge.py:406). Tightened below the 4000 default to curb
+# per-turn context growth on long flailing episodes; full output stays available via
+# artifact paths. This (not a lower iteration cap) is the overflow lever.
+tool_output_max_chars = 2500
+# In-loop context compaction catches cumulative growth across tool-call turns.
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
+# bytes->tokens calibration. 4.0 (generic English) undercounts gemma-4 on dense JSON tool
+# outputs (~2.8-3.2 real) by ~30% => prior run still overflowed AFTER compaction fired
+# (compaction-fired episodes peaked at 65135). 3.0 makes 52k/45k meaningful in REAL tokens
+# (~56k trigger / ~48k target real, ~10-17k headroom under the 65536 window).
+context_compaction_chars_per_token = 3.0
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 6 local + 28 external = 34 slots. Capacity-weighted home map: 6/34 to local-4090,
+# 28/34 to runpod-l40s-1. Host runs ALL episodes' harness+sandbox containers
+# (~4/episode = ~136 at 34); inference is remote for 28, local-GPU for 6. Lowered from
+# 40 (which bled 24G->6G avail over the run) for headroom vs the container-memory creep.
+# MONITOR steady-state `free -g`; dial to 30 if avail < 8G / swap climbs.
+parallel_episodes = 34
+target_training_rows = 4500
+max_episodes = 10000
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+# RESUME: generation_0 checkpoint exists (264 episodes, 7 admits, recipe ee073501) --
+# continues the run. Compaction/capacity/chars_per_token live under [harness.container]
+# + [[vllm.endpoints]], which are NOT in the export recipe hash, so the resume guard
+# (generation.py:221) still matches. Set false only to force a clean restart.
+resume_from_checkpoint = true
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[training]
+# Inert under num_generations=1 (generation-only; no finetune in this run).
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
+wandb_project = "feature-hypothesis-kazakhstan"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+# Generation-only (no finetuning).
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "regional-analysis", "bic-scoring", "gemma4", "dedup-gate", "bootstrap-ramp", "hybrid-local-h100sxm", "runpod-h100"]

@@ -1773,13 +1773,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 crossbreed_ctx = self._get_crossbreed_context(variation)
             episode_context["crossbreed_context"] = crossbreed_ctx
 
-        # File rotation assigns a least-explored source file (+ pre-read sample)
-        # so the agent grounds in real data rather than fixating on context-primed
-        # concepts. This runs for BOTH survey and crossbreed episodes: crossbreed
-        # previously had NO diversity steering and collapsed to a single hypothesis
-        # family (Approach C — docs/design/sft-explore-boundary-resplit-2026-05-31.md).
-        # Crossbreed grounds in the rotated source IN ADDITION to its parents.
-        if workflow_kind in ("survey", "crossbreed"):
+        # File rotation is survey-only. Crossbreed follows numpy-slices parity:
+        # parent experiments plus a generic instruction to inspect relevant
+        # sources, without injecting an assigned source/sample block.
+        if workflow_kind == "survey":
             self._assign_rotation_source(episode_context, variation)
 
         # Survey (= bootstrap): cap at the configured full slot count from the
@@ -1918,8 +1915,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # NOTE: the novelty nudge (self._novelty_block_for) is NOT injected into
         # any prompt. It was briefly wired into crossbreed (Approach C, 2026-05-31)
         # then REVERTED the same day — it backfired via negation-priming and did
-        # not diversify proposals. Diversity now relies on file rotation (which
-        # IS extended to crossbreed). See _crossbreed_workflow / _novelty_block_for.
+        # not diversify proposals. Survey diversity relies on file rotation; the
+        # crossbreed prompt intentionally follows numpy-slices generic grounding.
         explore_prompt = self._generate_explore_prompt(episode_context)
 
         return Workflow(
@@ -2097,26 +2094,20 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
         base_workflow = self._survey_workflow(variation, episode_context)
 
-        # Crossbreed grounds in a least-explored rotated source (assigned at
-        # populate()) IN ADDITION to its parents. The explicit novelty / "be a
-        # different family" nudge was REVERTED 2026-05-31: it backfired via
-        # negation-priming (listing the saturated families primed them — the
-        # geochemical share rose, no diversity gain), and an explicit diversity
-        # instruction is the wrong lever regardless. Diversity must emerge
-        # organically from grounding in the rotated source, not from telling the
-        # agent to differ. File rotation on crossbreed is kept.
-        assigned_blocks = self._assigned_source_blocks(episode_context)
+        # Crossbreed stays parent-driven and uses generic dataset grounding, not
+        # survey assigned-source/sample anchoring. This matches numpy-slices and
+        # avoids giving the crossbreed phase a second, unrelated hard anchor.
+        crossbreed_grounding = (
+            "First, use analysis_shell to ground yourself in the dataset — open a\n"
+            "few relevant sources and confirm what the data actually shows.\n"
+            "Then, building on the parent findings above together with what you\n"
+            "observed, propose ONE hypothesis that combines or extends them.\n\n"
+        )
         crossbreed_prompt = (
             "Phase 1: Explore + Hypothesise (Crossbreed Mode)\n\n"
             f"Parent experiments: {parent_ids}\n\n"
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
-            + assigned_blocks
-            + "\n"
-            "Use analysis_shell to ground yourself in the dataset — open the\n"
-            "assigned under-explored source above (and any other relevant sources)\n"
-            "and confirm what the data actually shows.\n"
-            "Then, building on the parent findings together with what you observed,\n"
-            "propose ONE hypothesis that combines or extends them.\n\n"
+            f"{crossbreed_grounding}"
             "Include a data_spec as before.\n\n"
             "Close with:\n"
             "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
@@ -4574,7 +4565,7 @@ finally:
         variation: "FeatureHypothesisKazakhstanVariation",
     ) -> None:
         """Assign a least-explored source (file rotation) + pre-read sample into
-        ``episode_context``. Shared by survey and crossbreed episodes (C)."""
+        ``episode_context`` for survey prompts."""
         rotation = self._pick_assigned_source(variation.kg_dir, _KAZAKHSTAN_SOURCE_FILES)
         episode_context["assigned_source"] = rotation["source"]
         episode_context["source_coverage"] = rotation["all_counts"]
@@ -4586,9 +4577,8 @@ finally:
         """ASSIGNED SOURCE + SAMPLE CONTENT blocks for an explore prompt, or ""
         when no source is assigned.
 
-        Shared by the survey and crossbreed prompts so the SFT export extracts
-        the read evidence identically for both (the headers below are matched by
-        ExperimentReasoningRows._parse_assigned_source).
+        Used by survey prompts so the SFT export extracts read evidence from the
+        stable headers below (matched by ExperimentReasoningRows._parse_assigned_source).
         """
         assigned = episode_context.get("assigned_source", {})
         if not assigned:

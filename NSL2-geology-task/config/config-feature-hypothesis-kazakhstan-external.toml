@@ -77,10 +77,14 @@ network_mode = "host"
 inference_transport = "tcp"
 # Tool-output truncation cap (chars) read by the capability bridge
 # (src/framework/capability_bridge.py:406, key on config.harness.container). Tightened
-# below the 4000 default to curb per-turn context growth on long flailing episodes that
-# balloon to the 65536 ceiling; full output stays available via artifact paths. Pair with
-# a lower AIQ iteration cap so flailing episodes terminate before context overflow.
+# below the 4000 default to curb per-turn context growth; full output stays
+# available via artifact paths. Context compaction below handles cumulative growth.
 tool_output_max_chars = 2500
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
 
 [harness.container.build]
 context = "docker/aiq"

@@ -142,6 +142,18 @@ class ContainerHarnessConfig(BaseModel):
     # Default matches the bridge's prior hardcoded fallback (_MCP_TOOL_OUTPUT_MAX_CHARS=4000);
     # lower it to curb per-turn context growth on long episodes. Full output stays in artifacts.
     tool_output_max_chars: int = 4000
+    # In-loop context compaction for OpenAI-compatible external harnesses.
+    # The shim estimates the full outbound request and elides old tool outputs
+    # when the cumulative prompt approaches the model window.
+    context_compaction_enabled: bool = False
+    context_compaction_trigger_tokens: int = 52_000
+    context_compaction_target_tokens: int = 45_000
+    context_compaction_keep_recent_tool_outputs: int = 3
+    context_compaction_keep_recent_assistant_reasoning: int = 3
+    # bytes->tokens heuristic for the prompt-size estimate; calibrate to model+content.
+    # gemma-4 on dense JSON tool outputs is ~2.8-3.2, not the generic ~4 (which undercounts
+    # ~30% and lets episodes overflow the window even after compaction fired).
+    context_compaction_chars_per_token: float = 3.0
     profile_config: Dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -190,6 +202,33 @@ class ContainerHarnessConfig(BaseModel):
         if self.profile_config:
             profile_cls = REGISTRY[self.profile]
             profile_cls.profile_config_class.model_validate(self.profile_config)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_context_compaction(self) -> "ContainerHarnessConfig":
+        if self.context_compaction_trigger_tokens <= 0:
+            raise ValueError("context_compaction_trigger_tokens must be positive")
+        if self.context_compaction_target_tokens <= 0:
+            raise ValueError("context_compaction_target_tokens must be positive")
+        if (
+            self.context_compaction_enabled
+            and self.context_compaction_target_tokens
+            >= self.context_compaction_trigger_tokens
+        ):
+            raise ValueError(
+                "context_compaction_target_tokens must be below "
+                "context_compaction_trigger_tokens when compaction is enabled"
+            )
+        if self.context_compaction_keep_recent_tool_outputs < 0:
+            raise ValueError(
+                "context_compaction_keep_recent_tool_outputs must be non-negative"
+            )
+        if self.context_compaction_keep_recent_assistant_reasoning < 0:
+            raise ValueError(
+                "context_compaction_keep_recent_assistant_reasoning must be non-negative"
+            )
+        if self.context_compaction_chars_per_token <= 0:
+            raise ValueError("context_compaction_chars_per_token must be positive")
         return self
 
 

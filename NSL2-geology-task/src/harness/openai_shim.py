@@ -23,6 +23,11 @@ from src.genner.Base import (
     INFERENCE_TIMEOUT_PREFIX,
     INFERENCE_UNAVAILABLE_PREFIX,
 )
+from src.harness.context_compaction import (
+    ContextCompactionReport,
+    ContextCompactionSettings,
+    compact_messages_with_report,
+)
 from src.harness.recorder import EventRecorder
 from src.harness.tool_contract import ToolResponseClassification, allowed_tool_names
 from src.harness.traced_genner import TracedGenner
@@ -465,11 +470,13 @@ class OpenAiShim:
         token: str,
         episode_id: str,
         recorder: EventRecorder,
+        context_compaction: ContextCompactionSettings | None = None,
     ) -> None:
         self.genner = genner
         self.token = token
         self.episode_id = episode_id
         self._recorder = recorder
+        self._context_compaction = context_compaction or ContextCompactionSettings()
         self._phase_counters: defaultdict[str, int] = defaultdict(int)
         self._phase_lock = threading.Lock()
         self.last_tool_response_classification: ToolResponseClassification | None = None
@@ -549,6 +556,14 @@ class OpenAiShim:
             self._recorder.bump_counter("tool_requests_total")
         phase = self._resolve_phase(req, headers)
         messages = [_openai_message_to_framework(m) for m in req.messages]
+        compaction_report = compact_messages_with_report(
+            messages,
+            settings=self._context_compaction,
+            tools=req.tools,
+            tool_choice=req.tool_choice,
+        )
+        messages = compaction_report.messages
+        self._record_context_compaction(compaction_report)
         result = self.genner.plist_completion(
             messages,
             phase=phase,
@@ -590,6 +605,25 @@ class OpenAiShim:
                         self.inference_timeout_detail = error_str
                 raise HTTPException(status_code=502, detail=error_str)
         raise HTTPException(status_code=500, detail="unreachable result branch")
+
+    def _record_context_compaction(self, report: ContextCompactionReport) -> None:
+        if not report.compacted:
+            return
+        self._recorder.bump_counter("context_compactions_total")
+        if report.compacted_tool_messages:
+            self._recorder.bump_counter(
+                "context_compacted_tool_messages_total",
+                report.compacted_tool_messages,
+            )
+        if report.compacted_reasoning_messages:
+            self._recorder.bump_counter(
+                "context_compacted_reasoning_messages_total",
+                report.compacted_reasoning_messages,
+            )
+        self._recorder.set_label(
+            "context_compaction_tokens",
+            f"{report.original_tokens}->{report.compacted_tokens}",
+        )
 
     def _record_tool_response_classification(
         self,

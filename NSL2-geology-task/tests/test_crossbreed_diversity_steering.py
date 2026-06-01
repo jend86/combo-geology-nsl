@@ -1,16 +1,8 @@
-"""Approach C: restore diversity steering on crossbreed episodes.
+"""Crossbreed prompt parity with numpy-slices.
 
-Pre-pulldown, crossbreed ran the survey step (with the novelty/family nudge) as
-its entry, so crossbreed proposals were steered toward diversity. The merge
-deprecated the novelty nudge AND scoped file rotation to survey-only, leaving
-crossbreed — the dominant episode type — with NO diversity steering. Measured
-result: crossbreed hypotheses collapsed to a single family (see
-docs/design/sft-explore-boundary-resplit-2026-05-31.md follow-up).
-
-C restores both levers for crossbreed:
-  1. file rotation also assigns a least-explored source (+ pre-read sample) to
-     crossbreed episodes, and the crossbreed prompt grounds in it; and
-  2. the family-balance (novelty) block is injected into the crossbreed prompt.
+Crossbreed episodes should be grounded by parent experiment context plus a
+generic instruction to inspect relevant sources. They must not receive the
+survey-only assigned-source/sample anchoring block.
 """
 
 from __future__ import annotations
@@ -74,11 +66,11 @@ def _crossbreed_ctx(**extra) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# (1) file rotation now reaches crossbreed
+# (1) file rotation remains survey-only
 # ---------------------------------------------------------------------------
 
 
-def test_populate_assigns_rotation_source_for_crossbreed(tmp_path: Path) -> None:
+def test_populate_does_not_assign_rotation_source_for_crossbreed(tmp_path: Path) -> None:
     from tasks.feature_hypothesis_kazakhstan import _KAZAKHSTAN_SOURCE_FILES
 
     variation = _variation(tmp_path)
@@ -95,18 +87,16 @@ def test_populate_assigns_rotation_source_for_crossbreed(tmp_path: Path) -> None
     outcome = _task(tmp_path).populate([], variation)
 
     assert outcome.episode_context["workflow_kind"] == "crossbreed"
-    assert outcome.episode_context.get("assigned_source"), (
-        "crossbreed episodes must receive a rotated least-explored source "
-        "(C: diversity steering) — currently survey-only"
-    )
+    assert "assigned_source" not in outcome.episode_context
+    assert "source_sample" not in outcome.episode_context
 
 
 # ---------------------------------------------------------------------------
-# (2) crossbreed prompt grounds in the assigned source
+# (2) crossbreed prompt uses generic dataset grounding, not assigned-source grounding
 # ---------------------------------------------------------------------------
 
 
-def test_crossbreed_prompt_includes_assigned_source(tmp_path: Path) -> None:
+def test_crossbreed_prompt_excludes_assigned_source(tmp_path: Path) -> None:
     ctx = _crossbreed_ctx(
         assigned_source={
             "key": "smolianova_devonian",
@@ -118,8 +108,11 @@ def test_crossbreed_prompt_includes_assigned_source(tmp_path: Path) -> None:
     )
     wf = _task(tmp_path)._crossbreed_workflow(_variation(tmp_path), ctx)
     prompt = _explore_step(wf).prompt
-    assert "smolianova_devonian" in prompt
-    assert "XSAMPLE_CROSS_77" in prompt
+    assert "smolianova_devonian" not in prompt
+    assert "XSAMPLE_CROSS_77" not in prompt
+    assert "ASSIGNED SOURCE FOR THIS EPISODE" not in prompt
+    assert "SAMPLE CONTENT FROM YOUR ASSIGNED SOURCE" not in prompt
+    assert "open a\nfew relevant sources" in prompt
 
 
 # ---------------------------------------------------------------------------

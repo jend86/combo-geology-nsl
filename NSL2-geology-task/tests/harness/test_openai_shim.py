@@ -21,6 +21,7 @@ from src.genner.Base import (
     INFERENCE_TIMEOUT_PREFIX,
     INFERENCE_UNAVAILABLE_PREFIX,
 )
+from src.harness.context_compaction import ContextCompactionSettings
 from src.harness.openai_shim import OpenAiShim, _extract_pseudo_tool_calls
 from src.harness.recorder import EventRecorder
 from src.harness.traced_genner import TracedGenner
@@ -73,7 +74,11 @@ class _DummyGenner(Genner):
 
 
 def _build_shim(
-    tmp_path: Path, *, token: str, episode_id: str
+    tmp_path: Path,
+    *,
+    token: str,
+    episode_id: str,
+    context_compaction: ContextCompactionSettings | None = None,
 ) -> tuple[OpenAiShim, EventRecorder, _DummyGenner]:
     recorder = EventRecorder(
         episode_id=episode_id,
@@ -86,7 +91,13 @@ def _build_shim(
         cancel_event=threading.Event(),
         episode_id=episode_id,
     )
-    shim = OpenAiShim(traced, token=token, episode_id=episode_id, recorder=recorder)
+    shim = OpenAiShim(
+        traced,
+        token=token,
+        episode_id=episode_id,
+        recorder=recorder,
+        context_compaction=context_compaction,
+    )
     return shim, recorder, inner
 
 
@@ -382,6 +393,85 @@ def test_shim_counts_required_tool_choice_missing_response(tmp_path: Path) -> No
     counters = recorder.snapshot_counters()
     assert counters["tool_requests_total"] == 1
     assert counters["tool_responses_missing_total"] == 1
+
+
+def test_shim_compacts_messages_before_traced_genner(tmp_path: Path) -> None:
+    shim, recorder, inner = _build_shim(
+        tmp_path,
+        token="abc",
+        episode_id="ep-compact",
+        context_compaction=ContextCompactionSettings(
+            enabled=True,
+            trigger_tokens=1,
+            target_tokens=100,
+            keep_recent_tool_outputs=1,
+        ),
+    )
+    client = TestClient(shim.app)
+    old_tool_content = json.dumps(
+        {
+            "output": {"execution_id": "exec-1", "stdout": "x" * 2000},
+            "success": True,
+            "error": None,
+        }
+    )
+    recent_tool_content = json.dumps({"output": "recent", "success": True})
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "nsl-test",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "nsl---run_python", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "name": "nsl---run_python",
+                    "content": old_tool_content,
+                },
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_2",
+                            "type": "function",
+                            "function": {"name": "nsl---score", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_2",
+                    "name": "nsl---score",
+                    "content": recent_tool_content,
+                },
+            ],
+        },
+        headers={"Authorization": "Bearer abc"},
+    )
+
+    assert response.status_code == 200
+    assert inner.last_messages is not None
+    compacted_payload = json.loads(inner.last_messages[2]["content"])
+    assert "context compaction" in compacted_payload["output"]["stdout"]
+    assert compacted_payload["output"]["execution_id"] == "exec-1"
+    assert inner.last_messages[4]["content"] == recent_tool_content
+    assert recorder.inference_records[0].messages[2] == inner.last_messages[2]
+    counters = recorder.snapshot_counters()
+    assert counters["context_compactions_total"] == 1
+    assert counters["context_compacted_tool_messages_total"] == 1
 
 
 def test_shim_latches_inference_unavailable_flag(tmp_path: Path) -> None:
