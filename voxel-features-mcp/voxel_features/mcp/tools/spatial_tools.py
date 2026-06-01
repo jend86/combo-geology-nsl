@@ -147,6 +147,81 @@ def spatial_add_line(
         }
 
 
+def spatial_add_box(
+    store: SpatialVoxelStore,
+    name: str,
+    lon_min: float,
+    lat_min: float,
+    depth_min_m: float,
+    lon_max: float,
+    lat_max: float,
+    depth_max_m: float,
+    value: float,
+    dtype: Literal["float", "categorical", "boolean"] = "float",
+    combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+    metadata: dict[str, Any] | None = None,
+    hypothesis_uri: str | None = None,
+    experiment_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Fill a 3D axis-aligned bounding box with a feature value.
+
+    Use this instead of point/line for any feature with areal or volumetric extent:
+    - Stratigraphic horizons / redox fronts (thin in depth, wide in lat/lon)
+    - Formation volumes (moderate extent in all dimensions)
+    - Alteration halos around intrusions
+    - Basin depocentres
+
+    Args:
+        name: Unique layer name (e.g., "lower_carboniferous_redox_front")
+        lon_min/lon_max: Longitude bounds in degrees
+        lat_min/lat_max: Latitude bounds in degrees
+        depth_min_m/depth_max_m: Depth bounds in meters (positive = below surface)
+        value: Feature value (e.g., 0.8 for 80% copper potential)
+        dtype: Data type - "float", "categorical", or "boolean"
+        combination_rule: How to combine with existing values
+        metadata: Optional metadata dict
+        hypothesis_uri: Optional URI linking to hypothesis
+        experiment_id: Optional experiment ID
+
+    Returns:
+        Dictionary with success status, affected_voxels count, and voxel_box indices
+
+    Example:
+        # Fill a stratigraphic redox horizon across the basin at 20-40m depth
+        spatial_add_box(
+            store, "redox_front_horizon",
+            lon_min=67.0, lat_min=50.0, depth_min_m=20,
+            lon_max=70.5, lat_max=52.0, depth_max_m=40,
+            value=0.75, dtype="float"
+        )
+    """
+    try:
+        result = store.add_box_feature(
+            name=name,
+            lon_min=lon_min,
+            lat_min=lat_min,
+            depth_min_m=depth_min_m,
+            lon_max=lon_max,
+            lat_max=lat_max,
+            depth_max_m=depth_max_m,
+            value=value,
+            dtype=dtype,
+            combination_rule=combination_rule,
+            metadata=metadata,
+            hypothesis_uri=hypothesis_uri,
+            experiment_id=experiment_id,
+        )
+        return result
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "operation": "spatial_add_box",
+        }
+
+
 def spatial_query_region(
     store: SpatialVoxelStore,
     center_longitude: float,

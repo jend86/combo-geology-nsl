@@ -1714,6 +1714,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
                         "   **For geological structures (faults, anticlines, basins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
+                        "   **For any feature with areal or volumetric extent (PREFERRED for stratigraphy):**\n"
+                        "   spatial_add_box(name='string', lon_min=float, lat_min=float, depth_min_m=float, lon_max=float, lat_max=float, depth_max_m=float, value=float)\n"
+                        "   Use this for: stratigraphic horizons, redox fronts, formation volumes, alteration halos, basin depocentres.\n"
+                        "   Example: a Carboniferous redox front spanning the basin → lon 66.5-71.5, lat 49.5-52.5, depth 20-40m, value=0.8.\n\n"
                         "   **For text-based locations without coordinates:**\n"
                         "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
                         "   2. Use search tools with 3-call budget:\n"
@@ -1746,6 +1750,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "get_experiment_summary",
                         "spatial_add_point",
                         "spatial_add_line",
+                        "spatial_add_box",
                         "spatial_query_region",
                         "spatial_coord_to_voxel",
                         "spatial_get_operations_log",
@@ -2048,6 +2053,27 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     },
                     "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
                                 "end_longitude", "end_latitude", "end_depth_m", "value"],
+                },
+            ),
+            Capability(
+                name="spatial_add_box",
+                description="Fill a 3D axis-aligned bounding box with a feature value. Use for stratigraphic horizons, redox fronts, formation volumes, alteration halos — any feature with areal or volumetric extent. Far more geologically realistic than stacking points or lines.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "lon_min": {"type": "number", "description": "West longitude bound in degrees"},
+                        "lat_min": {"type": "number", "description": "South latitude bound in degrees"},
+                        "depth_min_m": {"type": "number", "description": "Shallow depth bound in meters"},
+                        "lon_max": {"type": "number", "description": "East longitude bound in degrees"},
+                        "lat_max": {"type": "number", "description": "North latitude bound in degrees"},
+                        "depth_max_m": {"type": "number", "description": "Deep depth bound in meters"},
+                        "value": {"type": "number", "description": "Feature value to assign"},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["name", "lon_min", "lat_min", "depth_min_m", "lon_max", "lat_max", "depth_max_m", "value"],
                 },
             ),
             Capability(
@@ -3453,8 +3479,8 @@ finally:
             from voxel_features.spatial import SpatialVoxelStore
             from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.spatial_tools import (
-                spatial_add_point, spatial_add_line, spatial_query_region,
-                spatial_coord_to_voxel, spatial_get_operations_log
+                spatial_add_point, spatial_add_line, spatial_add_box,
+                spatial_query_region, spatial_coord_to_voxel, spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
 
@@ -3491,7 +3517,7 @@ finally:
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
             
             # Validate coordinates if this is a spatial operation with coordinates
-            if capability_name in ["spatial_add_point", "spatial_add_line"]:
+            if capability_name in ["spatial_add_point", "spatial_add_line", "spatial_add_box"]:
                 if "longitude" in args and "latitude" in args:
                     lon, lat = args["longitude"], args["latitude"]
                     in_bounds = (store.grid.origin[0] <= lon <= store.grid.maximum[0] and 
@@ -3513,6 +3539,9 @@ finally:
             elif capability_name == "spatial_add_line":
                 print("🔧 DEBUG: Calling spatial_add_line...")
                 result = spatial_add_line(store, **args)
+            elif capability_name == "spatial_add_box":
+                print("🔧 DEBUG: Calling spatial_add_box...")
+                result = spatial_add_box(store, **args)
             elif capability_name == "spatial_query_region":
                 print("🔧 DEBUG: Calling spatial_query_region...")
                 result = spatial_query_region(store, **args)

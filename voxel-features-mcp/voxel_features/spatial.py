@@ -20,8 +20,14 @@ class SpatialVoxelStore(VoxelStore):
     while maintaining compatibility with existing BIC scoring system.
     """
     
-    def __init__(self, store_path: Path | str, grid: GridSpec | None = None):
-        super().__init__(store_path, grid)
+    def __init__(
+        self,
+        store_path: Path | str,
+        grid: GridSpec | None = None,
+        *,
+        read_only_overlay: Path | str | None = None,
+    ):
+        super().__init__(store_path, grid, read_only_overlay=read_only_overlay)
         self._spatial_db_path = self.store_path / "spatial.db"
         self._init_spatial_database()
     
@@ -324,6 +330,112 @@ class SpatialVoxelStore(VoxelStore):
                 "operation": "line_feature",
             }
     
+    def add_box_feature(
+        self,
+        name: str,
+        lon_min: float,
+        lat_min: float,
+        depth_min_m: float,
+        lon_max: float,
+        lat_max: float,
+        depth_max_m: float,
+        value: float,
+        dtype: Literal["float", "categorical", "boolean"] = "float",
+        combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+        **kwargs
+    ) -> dict[str, Any]:
+        """
+        Fill a 3D axis-aligned bounding box with a feature value.
+
+        Ideal for stratigraphic horizons, formation volumes, alteration halos and
+        any geologically meaningful block that can be approximated as a cuboid in
+        lon/lat/depth space.  Much more efficient than stacking point/line calls
+        for areal features — fills the sub-array in a single numpy slice operation.
+
+        Args:
+            name: Feature layer name
+            lon_min/lon_max: Longitude bounds in degrees
+            lat_min/lat_max: Latitude bounds in degrees
+            depth_min_m/depth_max_m: Depth bounds in meters (positive = below surface)
+            value: Feature value to assign
+            dtype: Data type for the layer
+            combination_rule: How to combine with existing values
+
+        Returns:
+            Dictionary with operation results
+        """
+        try:
+            grid = self.grid
+
+            # Clamp bounds to grid extents before converting to indices
+            lon_min_c = max(lon_min, grid.origin[0])
+            lat_min_c = max(lat_min, grid.origin[1])
+            dep_min_c = max(depth_min_m, grid.origin[2])
+            lon_max_c = min(lon_max, grid.maximum[0])
+            lat_max_c = min(lat_max, grid.maximum[1])
+            dep_max_c = min(depth_max_m, grid.maximum[2])
+
+            if lon_min_c >= lon_max_c or lat_min_c >= lat_max_c or dep_min_c >= dep_max_c:
+                return {
+                    "success": False,
+                    "error": "Box is entirely outside grid bounds or has zero volume after clamping",
+                    "operation": "box_feature",
+                }
+
+            # Convert corners to voxel indices
+            ix0, iy0, iz0 = self.coord_to_voxel_indices(lon_min_c, lat_min_c, dep_min_c)
+            ix1, iy1, iz1 = self.coord_to_voxel_indices(lon_max_c, lat_max_c, dep_max_c)
+
+            # Make upper bound inclusive by adding 1 (slice semantics)
+            ix1 = min(ix1 + 1, grid.shape[0])
+            iy1 = min(iy1 + 1, grid.shape[1])
+            iz1 = min(iz1 + 1, grid.shape[2])
+
+            # Get or create layer
+            if name in self.layer_names:
+                layer_values = self.get_layer_values(name).copy()
+            else:
+                layer_values = np.zeros(grid.shape, dtype=float)
+
+            # Apply value to the entire sub-array in one numpy operation
+            box = layer_values[ix0:ix1, iy0:iy1, iz0:iz1]
+            if combination_rule == "replace":
+                layer_values[ix0:ix1, iy0:iy1, iz0:iz1] = value
+            elif combination_rule == "max":
+                layer_values[ix0:ix1, iy0:iy1, iz0:iz1] = np.maximum(box, value)
+            elif combination_rule == "add":
+                layer_values[ix0:ix1, iy0:iy1, iz0:iz1] = box + value
+            elif combination_rule == "mean":
+                layer_values[ix0:ix1, iy0:iy1, iz0:iz1] = (box + value) / 2
+
+            affected_voxels = (ix1 - ix0) * (iy1 - iy0) * (iz1 - iz0)
+
+            if name in self.layer_names:
+                self.remove_layer(name)
+
+            self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
+
+            coords_str = f"{lon_min},{lat_min},{depth_min_m};{lon_max},{lat_max},{depth_max_m}"
+            self._log_spatial_operation(
+                "box", name, coords_str,
+                f"value={value},combination_rule={combination_rule}"
+            )
+
+            return {
+                "success": True,
+                "operation": "box_feature",
+                "affected_voxels": affected_voxels,
+                "voxel_box": {"ix": [ix0, ix1], "iy": [iy0, iy1], "iz": [iz0, iz1]},
+                "layer_name": name,
+            }
+
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": "box_feature",
+            }
+
     def _log_spatial_operation(self, operation_type: str, feature_name: str, coordinates: str, parameters: str):
         """Log spatial operation to database for debugging/tracing."""
         cursor = self._spatial_conn.cursor()
