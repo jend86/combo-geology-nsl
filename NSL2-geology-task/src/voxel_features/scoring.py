@@ -51,6 +51,10 @@ if TYPE_CHECKING:
     from voxel_features.store import VoxelStore, GridSpec
 
 
+_STAGE1_MAE_TOLERANCE = 1e-5
+_STAGE1_BIC_RESCUE_THRESHOLD = -1.0
+
+
 def _entropy_continuous(values: np.ndarray, n_bins: int = 50) -> float:
     """Estimate entropy of continuous values using histogram binning."""
     # Remove NaN values
@@ -2048,6 +2052,9 @@ def evaluate_new_layer(
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
             "masking_test_direction": "first_layer",
+            "stage_1_tolerance_used": False,
+            "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
+            "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
             "stage_completed": "mae_bic_completed",
         }
     
@@ -2124,9 +2131,14 @@ def evaluate_new_layer(
         # Not enough layers to compute a meaningful before-MAE; let Stage 2 decide
         stage1_passed = True
         mae_improvement = 0.0
+        stage1_tolerance_used = False
     else:
         mae_improvement = mae_before - mae_after  # positive = system MAE improved
-        stage1_passed = mae_improvement > 0
+        stage1_tolerance_used = (
+            mae_improvement >= -_STAGE1_MAE_TOLERANCE
+            and bic_delta <= _STAGE1_BIC_RESCUE_THRESHOLD
+        )
+        stage1_passed = mae_improvement > 0 or stage1_tolerance_used
     
     # -----------------------------------------------------------------------
     # Stage 2: Normalized BIC must improve (negative per-sample delta)
@@ -2145,6 +2157,9 @@ def evaluate_new_layer(
         "masking_test_passed": stage1_passed,
         "masking_test_improvement": mae_improvement,
         "masking_test_direction": "mae_delta" if len(existing_layers) >= 2 else "auto_pass",
+        "stage_1_tolerance_used": stage1_tolerance_used,
+        "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
+        "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
         "stage_completed": "mae_bic_completed",
     }
     

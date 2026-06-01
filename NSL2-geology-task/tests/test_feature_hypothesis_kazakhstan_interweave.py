@@ -100,10 +100,43 @@ def _finalize_crossbreed(
     task.finalize_episode([], initial, episode_context, EpisodeArtifacts())
 
 
+def _finalize_interweave_survey(
+    task: FeatureHypothesisKazakhstanTask,
+    variation: FeatureHypothesisKazakhstanVariation,
+    *,
+    episode_id: str,
+    admitted: bool,
+):
+    episode_context: dict = {
+        "episode_id": episode_id,
+        "workflow_kind": "survey",
+        "interweave_bootstrap": True,
+        "kg_dir": variation.kg_dir,
+        "store_dir": variation.store_dir,
+        "phase_records": {
+            "evaluate": {
+                "admitted": admitted,
+                "bic_delta": -1.5 if admitted else 0.5,
+                "masking_test_passed": True,
+                "masking_test_improvement": 0.001,
+                "masking_test_direction": "mae_delta",
+                "stage_completed": "mae_bic_completed",
+            }
+        },
+    }
+    initial = FeatureHypothesisKazakhstanState(
+        episode_id=episode_id,
+        workflow_kind="survey",
+    )
+    return task.finalize_episode([], initial, episode_context, EpisodeArtifacts())
+
+
 def test_below_plateau_threshold_keeps_crossbreed(tmp_path: Path) -> None:
     variation = _variation(tmp_path)
     _seed_crossbreed_ready(variation)
-    _write_interweave_state(Path(variation.kg_dir), failures=49)
+    assert variation.interweave_failed_episode_threshold == 30
+    assert variation.interweave_survey_burst_episodes == 15
+    _write_interweave_state(Path(variation.kg_dir), failures=29)
 
     outcome = _task(tmp_path).populate([], variation)
 
@@ -111,20 +144,69 @@ def test_below_plateau_threshold_keeps_crossbreed(tmp_path: Path) -> None:
     assert outcome.episode_context.get("interweave_bootstrap") is not True
 
 
-def test_plateau_threshold_forces_one_survey_interweave(tmp_path: Path) -> None:
+def test_plateau_threshold_enters_survey_burst(tmp_path: Path) -> None:
     variation = _variation(tmp_path)
     _seed_crossbreed_ready(variation)
     kg = Path(variation.kg_dir)
-    _write_interweave_state(kg, failures=50)
+    _write_interweave_state(kg, failures=30)
 
     first = _task(tmp_path).populate([], variation)
     state_after_claim = json.loads((kg / "interweave_state.json").read_text())
     second = _task(tmp_path).populate([], variation)
+    state_after_second = json.loads((kg / "interweave_state.json").read_text())
 
     assert first.episode_context["workflow_kind"] == "survey"
     assert first.episode_context["interweave_bootstrap"] is True
     assert first.episode_context["interweave_reason"] == "crossbreed_plateau"
     assert state_after_claim["consecutive_failed_crossbreed"] == 0
+    assert state_after_claim["interweave_survey_remaining"] == 14
+    assert second.episode_context["workflow_kind"] == "survey"
+    assert second.episode_context.get("interweave_bootstrap") is True
+    assert state_after_second["interweave_survey_remaining"] == 13
+
+
+def test_failed_interweave_survey_continues_burst(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    variation = _variation(tmp_path)
+    _seed_crossbreed_ready(variation)
+    kg = Path(variation.kg_dir)
+    _write_interweave_state(kg, failures=30)
+
+    first = task.populate([], variation)
+    reward = _finalize_interweave_survey(
+        task,
+        variation,
+        episode_id=first.episode_context["episode_id"],
+        admitted=False,
+    )
+    second = task.populate([], variation)
+    state_after_second = json.loads((kg / "interweave_state.json").read_text())
+
+    assert reward.breakdown["bootstrap_active"] is False
+    assert reward.breakdown["interweave_bootstrap"] is True
+    assert second.episode_context["workflow_kind"] == "survey"
+    assert second.episode_context.get("interweave_bootstrap") is True
+    assert state_after_second["interweave_survey_remaining"] == 13
+
+
+def test_successful_interweave_survey_ends_burst(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    variation = _variation(tmp_path)
+    _seed_crossbreed_ready(variation)
+    kg = Path(variation.kg_dir)
+    _write_interweave_state(kg, failures=30)
+
+    first = task.populate([], variation)
+    _finalize_interweave_survey(
+        task,
+        variation,
+        episode_id=first.episode_context["episode_id"],
+        admitted=True,
+    )
+    state_after_success = json.loads((kg / "interweave_state.json").read_text())
+    second = task.populate([], variation)
+
+    assert state_after_success["interweave_survey_remaining"] == 0
     assert second.episode_context["workflow_kind"] == "crossbreed"
     assert second.episode_context.get("interweave_bootstrap") is not True
 

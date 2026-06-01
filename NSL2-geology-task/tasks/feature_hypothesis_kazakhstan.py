@@ -429,11 +429,12 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     # rendering uses an ellipsis when exceeded.
     novelty_max_chars_per_hypothesis: int = 280
     # Once steady-state crossbreed has stalled for this many completed attempts
-    # without a fresh KG admit, inject one survey episode before returning to
+    # without a fresh KG admit, enter a short survey burst before returning to
     # crossbreed. This interweaves fresh data-grounded hypotheses without
     # changing scoring or adding an explicit novelty prompt.
     interweave_bootstrap_enabled: bool = True
-    interweave_failed_episode_threshold: int = 50
+    interweave_failed_episode_threshold: int = 30
+    interweave_survey_burst_episodes: int = 15
 
 
 @dataclass
@@ -466,6 +467,9 @@ class FeatureHypothesisKazakhstanState:
     masking_test_passed: bool = True
     masking_test_improvement: float = 0.0
     masking_test_direction: str = "not_applicable"
+    stage_1_tolerance_used: bool = False
+    stage_1_mae_tolerance: float | None = None
+    stage_1_bic_rescue_threshold: float | None = None
     stage_completed: str = "stage_2_completed"
     
     # Crossbreeding context
@@ -1725,13 +1729,18 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             self._has_crossbreed_pairs(variation)
         )
         interweave_bootstrap = False
+        interweave_state_after_claim: dict[str, Any] | None = None
         if crossbreed_ready:
+            kg_dir_path = Path(variation.kg_dir)
             interweave_bootstrap = self._claim_interweave_bootstrap(
-                Path(variation.kg_dir),
+                kg_dir_path,
                 threshold=int(getattr(variation, "interweave_failed_episode_threshold", 0) or 0),
                 episode_id=episode_id,
                 enabled=bool(getattr(variation, "interweave_bootstrap_enabled", True)),
+                burst_episodes=int(getattr(variation, "interweave_survey_burst_episodes", 1) or 1),
             )
+            if interweave_bootstrap:
+                interweave_state_after_claim = self._read_interweave_state(kg_dir_path)
         workflow_kind = "survey" if interweave_bootstrap else (
             "crossbreed" if crossbreed_ready else "survey"
         )
@@ -1749,11 +1758,22 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         if interweave_bootstrap:
             episode_context.update({
                 "interweave_bootstrap": True,
-                "interweave_reason": "crossbreed_plateau",
+                "interweave_reason": str(
+                    (interweave_state_after_claim or {}).get(
+                        "last_interweave_reason", "crossbreed_plateau"
+                    )
+                ),
                 "interweave_failed_episode_threshold": int(
                     getattr(variation, "interweave_failed_episode_threshold", 0) or 0
                 ),
+                "interweave_survey_burst_episodes": int(
+                    getattr(variation, "interweave_survey_burst_episodes", 1) or 1
+                ),
             })
+            if interweave_state_after_claim is not None:
+                episode_context["interweave_survey_remaining"] = int(
+                    interweave_state_after_claim.get("interweave_survey_remaining", 0)
+                )
 
         # Crossbreed: serve a distinct ordered (parent_a, parent_b) pair from
         # the queue so concurrent slots do not collide on the same parents.
@@ -3193,6 +3213,9 @@ finally:
         masking_test_passed = evaluate.get('masking_test_passed', True)
         masking_test_improvement = evaluate.get('masking_test_improvement', 0.0)
         masking_test_direction = evaluate.get('masking_test_direction', 'not_applicable')
+        stage_1_tolerance_used = bool(evaluate.get('stage_1_tolerance_used', False))
+        stage_1_mae_tolerance = evaluate.get('stage_1_mae_tolerance')
+        stage_1_bic_rescue_threshold = evaluate.get('stage_1_bic_rescue_threshold')
         stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
         
         training_record = {
@@ -3207,6 +3230,9 @@ finally:
             'masking_test_passed': masking_test_passed,
             'masking_test_improvement': masking_test_improvement,
             'masking_test_direction': masking_test_direction,
+            'stage_1_tolerance_used': stage_1_tolerance_used,
+            'stage_1_mae_tolerance': stage_1_mae_tolerance,
+            'stage_1_bic_rescue_threshold': stage_1_bic_rescue_threshold,
             'stage_completed': stage_completed,
             'metadata': {
                 'hypothesis': hypothesise.get('hypothesis', ''),
@@ -3218,8 +3244,10 @@ finally:
                     'stage_1_passed': masking_test_passed,
                     'stage_1_improvement': masking_test_improvement,
                     'stage_1_direction': masking_test_direction,
+                    'stage_1_tolerance_used': stage_1_tolerance_used,
+                    'stage_1_mae_tolerance': stage_1_mae_tolerance,
+                    'stage_1_bic_rescue_threshold': stage_1_bic_rescue_threshold,
                     'stage_completed': stage_completed,
-                    'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
                     'scoring_version': 'two_stage_v2'
                 }
             }
@@ -3302,6 +3330,9 @@ finally:
                     "masking_test_passed": masking_test_passed,
                     "masking_test_improvement": masking_test_improvement,
                     "masking_test_direction": masking_test_direction,
+                    "stage_1_tolerance_used": stage_1_tolerance_used,
+                    "stage_1_mae_tolerance": stage_1_mae_tolerance,
+                    "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_completed": stage_completed,
                     "scoring_version": "two_stage_v2",
                     "artifact_links": {
@@ -4179,6 +4210,9 @@ finally:
             masking_test_passed=evaluate.get("masking_test_passed", True),
             masking_test_improvement=evaluate.get("masking_test_improvement", 0.0),
             masking_test_direction=evaluate.get("masking_test_direction", "not_applicable"),
+            stage_1_tolerance_used=bool(evaluate.get("stage_1_tolerance_used", False)),
+            stage_1_mae_tolerance=evaluate.get("stage_1_mae_tolerance"),
+            stage_1_bic_rescue_threshold=evaluate.get("stage_1_bic_rescue_threshold"),
             stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
             prompt_response_pair=terminal_record.get("training_pair", {}),
         )
@@ -4196,6 +4230,9 @@ finally:
         masking_test_passed = final.masking_test_passed
         masking_test_improvement = final.masking_test_improvement
         masking_test_direction = final.masking_test_direction
+        stage_1_tolerance_used = final.stage_1_tolerance_used
+        stage_1_mae_tolerance = final.stage_1_mae_tolerance
+        stage_1_bic_rescue_threshold = final.stage_1_bic_rescue_threshold
         admitted = final.admitted
         stage_completed = final.stage_completed
 
@@ -4227,6 +4264,9 @@ finally:
                 breakdown={
                     "stage_1_passed": True,
                     "stage_1_improvement": masking_test_improvement,
+                    "stage_1_tolerance_used": stage_1_tolerance_used,
+                    "stage_1_mae_tolerance": stage_1_mae_tolerance,
+                    "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_2_passed": True,
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
@@ -4249,6 +4289,9 @@ finally:
                 breakdown={
                     "stage_1_passed": True,
                     "stage_1_improvement": masking_test_improvement,
+                    "stage_1_tolerance_used": stage_1_tolerance_used,
+                    "stage_1_mae_tolerance": stage_1_mae_tolerance,
+                    "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_2_passed": False,
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
@@ -4263,6 +4306,9 @@ finally:
                 breakdown={
                     "stage_1_passed": False,
                     "stage_1_improvement": masking_test_improvement,
+                    "stage_1_tolerance_used": stage_1_tolerance_used,
+                    "stage_1_mae_tolerance": stage_1_mae_tolerance,
+                    "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
                     "no_predictive_value": True,
@@ -4290,7 +4336,10 @@ finally:
             # task_breakdown["bootstrap_active"] (src/execution/generation.py).
             # For feature_hypothesis, "bootstrap" == the early phase before
             # the feature pool reaches min_features (workflow_kind="survey").
-            breakdown["bootstrap_active"] = final.workflow_kind == "survey"
+            breakdown["bootstrap_active"] = (
+                final.workflow_kind == "survey"
+                and not bool(episode_context.get("interweave_bootstrap"))
+            )
             if episode_context.get("duplicate_rejected"):
                 breakdown["duplicate_rejected"] = True
             kg_dir_ctx = episode_context.get("kg_dir")
@@ -4308,6 +4357,9 @@ finally:
                     if interweave_state:
                         breakdown["interweave_failed_crossbreed_streak"] = int(
                             interweave_state.get("consecutive_failed_crossbreed", 0)
+                        )
+                        breakdown["interweave_survey_remaining"] = int(
+                            interweave_state.get("interweave_survey_remaining", 0)
                         )
                         if episode_context.get("interweave_bootstrap"):
                             breakdown["interweave_bootstrap"] = True
@@ -5382,6 +5434,18 @@ finally:
             )
         except (TypeError, ValueError):
             data["interweave_bootstraps_claimed"] = 0
+        try:
+            data["interweave_bursts_claimed"] = max(
+                0, int(data.get("interweave_bursts_claimed", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            data["interweave_bursts_claimed"] = 0
+        try:
+            data["interweave_survey_remaining"] = max(
+                0, int(data.get("interweave_survey_remaining", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            data["interweave_survey_remaining"] = 0
         return data
 
     def _claim_interweave_bootstrap(
@@ -5391,25 +5455,44 @@ finally:
         threshold: int,
         episode_id: str,
         enabled: bool = True,
+        burst_episodes: int = 1,
     ) -> bool:
-        """Atomically claim one survey interweave after a crossbreed plateau.
+        """Atomically claim survey interweave after a crossbreed plateau.
 
-        The counter resets on claim, not on survey completion, so a plateau
-        injects exactly one bootstrap before returning to crossbreed attempts.
+        The counter resets when a survey burst starts. Each claim consumes one
+        survey slot from the burst, including the first threshold-crossing slot.
         """
         if not enabled or threshold <= 0:
             return False
+        burst_size = max(1, int(burst_episodes or 1))
         kg_path = Path(kg_dir)
         with self._kg_lock(kg_path):
             state = self._read_interweave_state(kg_path)
+            remaining = int(state.get("interweave_survey_remaining", 0))
+            if remaining > 0:
+                state["interweave_survey_remaining"] = remaining - 1
+                state["interweave_bootstraps_claimed"] = (
+                    int(state.get("interweave_bootstraps_claimed", 0)) + 1
+                )
+                state["last_interweave_claimed_at"] = time.time()
+                state["last_interweave_reason"] = "active_survey_burst"
+                if episode_id:
+                    state["last_interweave_episode_id"] = episode_id
+                self._atomic_write_json(kg_path / _KG_INTERWEAVE_STATE, state)
+                return True
             failures = int(state.get("consecutive_failed_crossbreed", 0))
             if failures < threshold:
                 return False
             state["consecutive_failed_crossbreed"] = 0
+            state["interweave_survey_remaining"] = burst_size - 1
+            state["interweave_bursts_claimed"] = (
+                int(state.get("interweave_bursts_claimed", 0)) + 1
+            )
             state["interweave_bootstraps_claimed"] = (
                 int(state.get("interweave_bootstraps_claimed", 0)) + 1
             )
             state["last_interweave_claimed_at"] = time.time()
+            state["last_interweave_reason"] = "crossbreed_plateau"
             if episode_id:
                 state["last_interweave_episode_id"] = episode_id
             self._atomic_write_json(kg_path / _KG_INTERWEAVE_STATE, state)
@@ -5432,12 +5515,18 @@ finally:
             if workflow_kind == "crossbreed":
                 if produced_new_admit:
                     state["consecutive_failed_crossbreed"] = 0
+                    state["interweave_survey_remaining"] = 0
+                elif int(state.get("interweave_survey_remaining", 0)) > 0:
+                    state["consecutive_failed_crossbreed"] = int(
+                        state.get("consecutive_failed_crossbreed", 0)
+                    )
                 else:
                     state["consecutive_failed_crossbreed"] = (
                         int(state.get("consecutive_failed_crossbreed", 0)) + 1
                     )
             elif interweave_bootstrap and produced_new_admit:
                 state["consecutive_failed_crossbreed"] = 0
+                state["interweave_survey_remaining"] = 0
             state["last_recorded_at"] = time.time()
             state["last_recorded_workflow_kind"] = workflow_kind
             state["last_recorded_produced_new_admit"] = bool(produced_new_admit)

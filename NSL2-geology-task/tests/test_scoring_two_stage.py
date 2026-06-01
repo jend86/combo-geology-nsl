@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+import voxel_features.scoring as scoring
 from voxel_features.scoring import evaluate_new_layer
 from voxel_features.store import GridSpec, VoxelStore
 
@@ -49,6 +51,71 @@ def _seed_two_layers(store: VoxelStore, base: np.ndarray) -> None:
     related = (base * 0.6 + np.random.default_rng(11).random(base.shape) * 0.05).astype(np.float32)
     result = evaluate_new_layer(store, "related", related, "float", seed=7)
     assert result["admitted"], "second-layer seed failed"
+
+
+class _ControlledStore:
+    def __init__(self) -> None:
+        self.grid = SimpleNamespace(shape=(2, 2, 1))
+        self.values = {
+            "base": np.ones(self.grid.shape, dtype=np.float32),
+            "related": np.full(self.grid.shape, 0.9, dtype=np.float32),
+        }
+        self.dtypes = {"base": "float", "related": "float"}
+        self.added_layers: list[str] = []
+
+    @property
+    def layer_names(self) -> list[str]:
+        return list(self.values)
+
+    def get_layer_values(self, name: str) -> np.ndarray:
+        return self.values[name]
+
+    def get_layer(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(dtype=self.dtypes[name])
+
+    def add_layer(self, name: str, values: np.ndarray, dtype: str) -> None:
+        self.values[name] = values
+        self.dtypes[name] = dtype
+        self.added_layers.append(name)
+
+    def update_layer_scores(self, layer_name: str, bic_delta: float, mi_scores: dict) -> None:
+        pass
+
+
+def _controlled_stage1_result(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mae_improvement: float,
+    bic_delta: float,
+) -> dict:
+    calls = iter(
+        [
+            {
+                "bic": 0.0,
+                "total_cv_mse": 1.0,
+                "system_mae": 1.0,
+                "n_effective_samples": 100,
+            },
+            {
+                "bic": bic_delta * 100.0,
+                "total_cv_mse": 1.0,
+                "system_mae": 1.0 - mae_improvement,
+                "n_effective_samples": 100,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(scoring, "geological_coherence_score", lambda *args, **kwargs: next(calls))
+    monkeypatch.setattr(scoring, "mutual_information", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(scoring, "pairwise_distance", lambda *args, **kwargs: 0.0)
+
+    return scoring.evaluate_new_layer(
+        _ControlledStore(),
+        "candidate",
+        np.full((2, 2, 1), 0.8, dtype=np.float32),
+        "float",
+        seed=7,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +188,44 @@ def test_informative_layer_passes_stage1(tmp_path: Path) -> None:
         f"expected real Stage 1 gate to fire, got {result['masking_test_direction']}"
     )
     assert result["masking_test_passed"] is True
+
+
+def test_stage1_tolerance_rescues_material_bic_gain(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _controlled_stage1_result(
+        monkeypatch,
+        mae_improvement=-7.5e-6,
+        bic_delta=-1.2,
+    )
+
+    assert result["masking_test_passed"] is True
+    assert result["admitted"] is True
+    assert result["stage_1_tolerance_used"] is True
+    assert result["stage_1_mae_tolerance"] == pytest.approx(1e-5)
+    assert result["stage_1_bic_rescue_threshold"] == pytest.approx(-1.0)
+
+
+def test_stage1_tolerance_does_not_rescue_tiny_bic_gain(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _controlled_stage1_result(
+        monkeypatch,
+        mae_improvement=-7.5e-6,
+        bic_delta=-0.5,
+    )
+
+    assert result["masking_test_passed"] is False
+    assert result["admitted"] is False
+    assert result["stage_1_tolerance_used"] is False
+
+
+def test_stage1_tolerance_does_not_rescue_large_mae_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _controlled_stage1_result(
+        monkeypatch,
+        mae_improvement=-2e-5,
+        bic_delta=-1.2,
+    )
+
+    assert result["masking_test_passed"] is False
+    assert result["admitted"] is False
+    assert result["stage_1_tolerance_used"] is False
 
 
 # ---------------------------------------------------------------------------
