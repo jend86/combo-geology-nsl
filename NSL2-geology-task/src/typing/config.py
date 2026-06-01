@@ -137,6 +137,11 @@ class ContainerHarnessConfig(BaseModel):
     mem_limit: str = "2g"
     network_mode: Literal["bridge", "none", "host"] = "bridge"
     inference_transport: Literal["tcp"] = "tcp"
+    # Per-tool-call output char cap read by the capability bridge
+    # (src/framework/capability_bridge.py:406, via the HarnessConfigView over this model).
+    # Default matches the bridge's prior hardcoded fallback (_MCP_TOOL_OUTPUT_MAX_CHARS=4000);
+    # lower it to curb per-turn context growth on long episodes. Full output stays in artifacts.
+    tool_output_max_chars: int = 4000
     profile_config: Dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

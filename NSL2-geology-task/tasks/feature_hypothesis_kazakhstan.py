@@ -159,7 +159,11 @@ _SYSTEM_PROMPT = """You are analyzing Kazakhstan mineral prospects.
 
 Grid: lon 66.5–71.5°E, lat 49.5–52.5°N, depth 0–80m (200×200×8 voxels, ~1.75km/voxel).
 
-A feature layer is admitted if bic_delta < 0.
+Feature admission uses the real two-stage gate:
+- Stage 1: once at least two admitted layers exist, adding the candidate must improve system-wide MAE.
+- Stage 2: the candidate must improve normalized BIC (`bic_delta < 0`).
+
+Optimize for both gates. Prefer a dense prospectivity surface that grades geological favourability across the basin; avoid sparse point mark layers that only light known prospects unless the sparse support is geologically justified and broad enough to improve MAE.
 """
 
 
@@ -1882,7 +1886,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         episode_context: dict[str, Any],
     ) -> EpisodeConstraints:
         return EpisodeConstraints(
-            budgets=BudgetConstraints(max_task_tool_calls=100, max_llm_turns=120),
+            budgets=BudgetConstraints(max_task_tool_calls=60, max_llm_turns=45),
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
 
@@ -3280,6 +3284,20 @@ finally:
         parent_node_2 = parent_experiments[1] if len(parent_experiments) > 1 else None
 
         duplicate_rejected = False
+        rejected_quarantine = None
+        if not both_stages_passed:
+            rejected_quarantine = ctx.episode_context.get("rejected_candidate_quarantine")
+            if not isinstance(rejected_quarantine, dict):
+                rejected_quarantine = self._quarantine_rejected_candidate(
+                    store_dir=store_dir,
+                    episode_id=episode_id,
+                    layer_name=translate.get('feature_layer_name', '') or evaluate.get('layer_name', ''),
+                    evaluate=evaluate,
+                    phase_records=phase_records,
+                )
+            if rejected_quarantine is not None:
+                ctx.episode_context["rejected_candidate_quarantine"] = rejected_quarantine
+
         if both_stages_passed:
             try:
                 knowledge_dir.mkdir(parents=True, exist_ok=True)
@@ -3366,6 +3384,8 @@ finally:
                 "training_saved": True,
                 "knowledge_saved": both_stages_passed and not duplicate_rejected,
                 "duplicate_rejected": duplicate_rejected,
+                "rejected_candidate_quarantined": rejected_quarantine is not None,
+                "rejected_candidate_quarantine": rejected_quarantine,
                 "two_stage_results": {
                     "stage_1_passed": masking_test_passed,
                     "stage_1_improvement": masking_test_improvement,
@@ -4085,6 +4105,17 @@ finally:
                 
                 # Store evaluation results
                 phase_records["evaluate"] = result
+                quarantine_info = self._quarantine_rejected_candidate(
+                    store_dir=store_dir,
+                    episode_id=episode_id,
+                    layer_name=str(layer_name or ""),
+                    evaluate=result,
+                    phase_records=phase_records,
+                )
+                if quarantine_info is not None:
+                    result["rejected_candidate_quarantined"] = True
+                    result["rejected_candidate_quarantine"] = quarantine_info
+                    ctx.episode_context["rejected_candidate_quarantine"] = quarantine_info
                 print(f"🎯 DEBUG: Stored evaluation data in phase records")
             
             # Return result
@@ -5060,6 +5091,99 @@ finally:
         if bic_delta is None or bic_delta >= 0:
             return False
         return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
+
+    @classmethod
+    def _should_quarantine_rejected_candidate(cls, evaluate: dict[str, Any]) -> bool:
+        """True for scored candidates that failed canonical KG admission.
+
+        This is evidence capture only. It deliberately mirrors the strict KG
+        gate and never turns a rejected layer into a canonical admit.
+        """
+        bic_delta = evaluate.get("bic_delta")
+        stage_completed = str(evaluate.get("stage_completed", ""))
+        if bic_delta is None or stage_completed not in cls._STAGE_COMPLETED_ALLOWLIST:
+            return False
+        return not cls._should_persist_to_kg(
+            masking_test_passed=bool(evaluate.get("masking_test_passed", True)),
+            admitted=bool(evaluate.get("admitted", False)),
+            bic_delta=bic_delta,
+            stage_completed=stage_completed,
+        )
+
+    @staticmethod
+    def _rejection_stage(evaluate: dict[str, Any]) -> str:
+        if not bool(evaluate.get("masking_test_passed", True)):
+            return "stage_1"
+        if not bool(evaluate.get("admitted", False)):
+            return "stage_2"
+        return "kg_gate"
+
+    def _quarantine_rejected_candidate(
+        self,
+        *,
+        store_dir: str,
+        episode_id: str,
+        layer_name: str,
+        evaluate: dict[str, Any],
+        phase_records: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not store_dir or not episode_id or not layer_name:
+            return None
+        if not self._should_quarantine_rejected_candidate(evaluate):
+            return None
+
+        import shutil
+
+        safe_episode = _safe_artifact_component(episode_id)
+        safe_layer = _safe_artifact_component(layer_name)
+        store_path = Path(store_dir)
+        quarantine_dir = store_path / "rejected" / safe_episode
+        metadata_path = quarantine_dir / "metadata.json"
+        layer_dest = quarantine_dir / f"{safe_layer}.npy"
+        layer_src = store_path / "scratch" / episode_id / "layers" / f"{layer_name}.npy"
+
+        if metadata_path.exists():
+            try:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+                return {
+                    "path": str(quarantine_dir),
+                    "metadata_file": str(metadata_path),
+                    "layer_file": existing.get("layer_file"),
+                    "layer_file_copied": bool(existing.get("layer_file_copied", False)),
+                    "rejection_stage": existing.get("rejection_stage"),
+                }
+            except json.JSONDecodeError:
+                pass
+
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        layer_file_copied = False
+        if layer_src.exists():
+            shutil.copy2(layer_src, layer_dest)
+            layer_file_copied = True
+
+        hypothesise = phase_records.get("hypothesise", {})
+        code = phase_records.get("code", {})
+        metadata = {
+            "episode_id": episode_id,
+            "layer_name": layer_name,
+            "timestamp": time.time(),
+            "rejection_stage": self._rejection_stage(evaluate),
+            "layer_file": str(layer_dest) if layer_file_copied else None,
+            "layer_file_copied": layer_file_copied,
+            "source_layer_file": str(layer_src),
+            "hypothesis": hypothesise.get("hypothesis", ""),
+            "data_spec": hypothesise.get("data_spec", {}),
+            "experiment_summary": code.get("result_summary", ""),
+            "evaluate": _to_jsonable(evaluate),
+        }
+        self._atomic_write_json(metadata_path, metadata)
+        return {
+            "path": str(quarantine_dir),
+            "metadata_file": str(metadata_path),
+            "layer_file": str(layer_dest) if layer_file_copied else None,
+            "layer_file_copied": layer_file_copied,
+            "rejection_stage": metadata["rejection_stage"],
+        }
 
     def _recent_admitted_hypotheses(
         self,

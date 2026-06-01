@@ -265,3 +265,25 @@ def test_scoring_deterministic_with_seed(tmp_path: Path) -> None:
     # We accept equality here as well — we only care that seeded determinism
     # holds, not that different seeds always diverge.
     _ = other  # touch to keep pytest happy
+
+
+def test_scoring_reports_effective_sample_confound_diagnostics(tmp_path: Path) -> None:
+    store = _store(tmp_path / "n_eff_diagnostics")
+    rng = np.random.default_rng(123)
+    base = rng.random((20, 20, 4)).astype(np.float32)
+    _seed_two_layers(store, base)
+
+    candidate = (base * 0.5 + rng.random(base.shape) * 0.1).astype(np.float32)
+    result = evaluate_new_layer(store, "candidate", candidate, "float", seed=7)
+
+    assert "n_effective_samples_before" in result
+    assert "n_effective_samples_after" in result
+    assert "n_effective_samples_delta" in result
+    assert result["n_effective_samples_after"] == result["n_effective_samples"]
+    assert result["n_effective_samples_delta"] == (
+        result["n_effective_samples_after"] - result["n_effective_samples_before"]
+    )
+    assert result["candidate_nonzero_voxels"] == int(np.count_nonzero(candidate))
+    assert result["candidate_fill_fraction"] == pytest.approx(
+        float(np.count_nonzero(candidate)) / candidate.size
+    )

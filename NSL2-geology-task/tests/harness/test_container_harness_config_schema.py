@@ -40,6 +40,38 @@ def test_container_defaults_and_minimum_fields() -> None:
     assert cfg.inference_transport == "tcp"
     assert cfg.env == {}
     assert cfg.profile_config == {}
+    assert cfg.context_compaction_enabled is False
+    assert cfg.context_compaction_trigger_tokens == 52_000
+    assert cfg.context_compaction_target_tokens == 45_000
+    assert cfg.context_compaction_keep_recent_tool_outputs == 3
+
+
+def test_container_accepts_context_compaction_knobs() -> None:
+    cfg = ContainerHarnessConfig(
+        profile="ms_agent",
+        image="nsl/ms-agent:0.1.0",
+        context_compaction_enabled=True,
+        context_compaction_trigger_tokens=1_000,
+        context_compaction_target_tokens=700,
+        context_compaction_keep_recent_tool_outputs=2,
+        context_compaction_keep_recent_assistant_reasoning=1,
+    )
+
+    assert cfg.context_compaction_enabled is True
+    assert cfg.context_compaction_trigger_tokens == 1_000
+    assert cfg.context_compaction_target_tokens == 700
+    assert cfg.context_compaction_keep_recent_tool_outputs == 2
+
+
+def test_container_rejects_invalid_context_compaction_thresholds() -> None:
+    with pytest.raises(ValidationError):
+        ContainerHarnessConfig(
+            profile="ms_agent",
+            image="nsl/ms-agent:0.1.0",
+            context_compaction_enabled=True,
+            context_compaction_trigger_tokens=1_000,
+            context_compaction_target_tokens=1_000,
+        )
 
 
 def test_container_rejects_unknown_network_mode() -> None:

@@ -46,7 +46,7 @@ min_healthy_endpoint_capacity = 4
 [[vllm.endpoints]]
 id          = "runpod-h100-1"
 base_url    = "http://216.81.245.97:19053"   # H100 PCIe pod dmf60ieqi9ffz1 (v0.20.2, fp8 KV)
-capacity    = 18                              # ~26 fp8 KV slots on 80GB; started conservative. Tune from /metrics preemptions.
+capacity    = 32                              # bumped 18->32 (KV was ~23% @ 18, 0 preempt). ~26 fp8 KV slots est. was conservative; 80GB has room. Tune from /metrics preemptions.
 api_key_env = "RUNPOD_VLLM_KEY"               # pod injects VLLM_API_KEY; bearer confirmed serving
 
 [[vllm.endpoints]]
@@ -75,6 +75,12 @@ max_wall_seconds = 7200
 mem_limit = "2g"
 network_mode = "host"
 inference_transport = "tcp"
+# Tool-output truncation cap (chars) read by the capability bridge
+# (src/framework/capability_bridge.py:406, key on config.harness.container). Tightened
+# below the 4000 default to curb per-turn context growth on long flailing episodes that
+# balloon to the 65536 ceiling; full output stays available via artifact paths. Pair with
+# a lower AIQ iteration cap so flailing episodes terminate before context overflow.
+tool_output_max_chars = 2500
 
 [harness.container.build]
 context = "docker/aiq"
@@ -83,7 +89,7 @@ build_args = {}
 [harness.container.profile_config]
 model = "nsl-feature-hypothesis-kazakhstan"
 agent_type = "tool_calling_agent"
-max_iterations = 40
+max_iterations = 28
 tool_call_timeout_s = 600
 function_group_name = "capabilities"
 force_tool_choice = true
@@ -93,11 +99,11 @@ variation_strategy = "round_robin"
 generation_timeout_s = 172800  # 48 hrs
 max_consecutive_verification_failures = 2
 container_rebuild_interval = 10
-# 18 H100 + 6 A40 = 24 slots. Capacity-weighted home map: 18/24 to runpod-h100-1,
-# 6/24 to runpod-a40-1. Host runs only the harness containers (inference is remote) and
-# SFT is GPU-bound, so 24 harness sets fit easily on 32 cores / 125 GB. Raise the H100
-# capacity + parallel_episodes together if host load stays low and H100 preempt ~0.
-parallel_episodes = 24
+# 32 H100 + 6 A40 = 38 slots. Capacity-weighted home map: 32/38 to runpod-h100-1,
+# 6/38 to runpod-a40-1. Host runs only the harness containers (inference is remote) and
+# SFT is GPU-bound, so 38 harness sets (~114 containers) fit on 32 cores / 125 GB. Raise the
+# H100 capacity + parallel_episodes together if host load stays low and H100 preempt ~0.
+parallel_episodes = 38
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20

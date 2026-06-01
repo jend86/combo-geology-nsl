@@ -500,16 +500,27 @@ def _build_pool_smoke_test(
     pool: EndpointPool,
     sessions_by_endpoint: dict[str, BackendSession],
 ):
+    # Snapshot each endpoint's OWN smoke test NOW. The caller assigns the returned pool
+    # smoke test onto the primary session's `.smoke_test`, and the primary session is
+    # itself a value in `sessions_by_endpoint` -- so resolving `session.smoke_test` at
+    # call time would point back at this pool test and recurse until RecursionError
+    # ("maximum recursion depth exceeded"). Binding the per-endpoint callables here,
+    # before that reassignment, avoids the self-reference.
+    per_endpoint_smoke = {
+        endpoint_id: session.smoke_test
+        for endpoint_id, session in sessions_by_endpoint.items()
+    }
+
     def run_smoke_test() -> str:
         errors: list[str] = []
         for endpoint_id in pool.endpoint_ids():
             if not pool.is_healthy(endpoint_id):
                 continue
-            session = sessions_by_endpoint[endpoint_id]
-            if session.smoke_test is None:
+            smoke = per_endpoint_smoke.get(endpoint_id)
+            if smoke is None:
                 return f"{endpoint_id}: smoke test unavailable"
             try:
-                return f"{endpoint_id}: {session.smoke_test()}"
+                return f"{endpoint_id}: {smoke()}"
             except Exception as exc:
                 pool.mark_unhealthy(endpoint_id, str(exc))
                 errors.append(f"{endpoint_id}: {exc}")
