@@ -13,7 +13,6 @@ Architecture:
 from __future__ import annotations
 
 import base64
-import fcntl
 import hashlib
 import json
 import math
@@ -21,10 +20,9 @@ import os
 import re
 import time
 import uuid
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from docker.models.containers import Container
 from loguru import logger
@@ -50,7 +48,17 @@ from src.task.types import (
     Workflow,
     WorkflowStep,
 )
+from tasks.common.dedup_ledger import JsonDedupLedger
+from tasks.common.file_coordination import (
+    atomic_write_json,
+    atomic_write_jsonl,
+    locked_dir,
+    read_json_or,
+    read_jsonl_records,
+)
 from tasks.common.foundry_exec import coerce_exec_result, exec_run_with_timeout
+from tasks.common.ordered_pair_queue import OrderedPairQueue
+from tasks.common.ramp_permit import SlotRampPermit, ramp_target_active
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -64,16 +72,17 @@ def _to_jsonable(obj: Any) -> Any:
     MCP bridge. Coercing at the scoring source keeps every downstream consumer
     clean.
     """
-    import numpy as np
-
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, np.generic):  # any numpy scalar (bool_, float64, int64, …)
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
+    if type(obj).__module__.startswith("numpy"):
+        import numpy as np
+
+        if isinstance(obj, np.generic):  # any numpy scalar (bool_, float64, int64, …)
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
     return obj
 
 
@@ -1765,7 +1774,10 @@ finally:
                 duplicate_rejected = not admitted_to_kg
                 if admitted_to_kg:
                     self._update_crossbreed_index(
-                        knowledge_dir, node_id, evaluate.get('mutual_info', {})
+                        knowledge_dir,
+                        node_id,
+                        feature_layer_name,
+                        evaluate.get('mutual_info', {}),
                     )
                     self._update_pairwise_distance_index(
                         knowledge_dir,
@@ -3012,65 +3024,27 @@ finally:
     # worker threads that share a single TaskSpec instance. Mirrors the
     # `_pool_lock`/`_read_pool_index` pattern from `tasks/geology_graph.py`.
 
-    @contextmanager
-    def _kg_lock(self, kg_dir: Path | str) -> Iterator[None]:
-        kg_path = Path(kg_dir)
-        kg_path.mkdir(parents=True, exist_ok=True)
-        lock_path = kg_path / _KG_LOCK
-        with lock_path.open("a+") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    @staticmethod
+    def _kg_lock(kg_dir: Path | str):
+        return locked_dir(kg_dir, _KG_LOCK)
 
     @staticmethod
     def _atomic_write_json(path: Path, obj: Any) -> None:
         """Tmp-then-replace JSON writer. Unique tmp per pid+uuid prevents
         cross-process ENOENT races (see `geology_graph._write_pool_index`)."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-        tmp.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
+        atomic_write_json(path, obj)
 
     @staticmethod
     def _atomic_write_jsonl(path: Path, entries: list[dict[str, Any]]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(f"{path.suffix}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-        with tmp.open("w", encoding="utf-8") as fh:
-            for entry in entries:
-                fh.write(json.dumps(entry) + "\n")
-        tmp.replace(path)
+        atomic_write_jsonl(path, entries)
 
     @staticmethod
     def _read_json_or(path: Path, default: dict[str, Any]) -> dict[str, Any]:
-        if not path.exists():
-            return dict(default)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return dict(default)
-        if not isinstance(data, dict):
-            return dict(default)
-        return data
+        return read_json_or(path, default)
 
     @staticmethod
     def _read_jsonl_records(path: Path) -> list[dict[str, Any]]:
-        if not path.exists():
-            return []
-        out: list[dict[str, Any]] = []
-        with path.open("r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(rec, dict):
-                    out.append(rec)
-        return out
+        return read_jsonl_records(path)
 
     @staticmethod
     def _fingerprint(parent_experiments: list[str] | None, hypothesis: str) -> str:
@@ -3109,25 +3083,26 @@ finally:
         kg_path = Path(kg_dir)
         fp = self._fingerprint(parents, hypothesis)
 
-        with self._kg_lock(kg_path):
-            ledger = self._read_json_or(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": []})
-            seen: list[str] = list(ledger.get("fingerprints", []))
-            if fp in seen:
-                return False
-            if (
-                scratch_dir is not None
-                and admitted_dir is not None
-                and isinstance(layer_name, str)
-                and layer_name
-            ):
+        on_admit = None
+        if (
+            scratch_dir is not None
+            and admitted_dir is not None
+            and isinstance(layer_name, str)
+            and layer_name
+        ):
+            def promote_layer() -> None:
                 self._promote_scratch_layer(
                     Path(scratch_dir), Path(admitted_dir), layer_name
                 )
-            with (kg_path / _KG_EXPERIMENTS).open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(kg_record) + "\n")
-            seen.append(fp)
-            self._atomic_write_json(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": seen})
-        return True
+
+            on_admit = promote_layer
+
+        return JsonDedupLedger(
+            kg_path,
+            ledger_filename=_KG_ADMITTED_INDEX,
+            records_filename=_KG_EXPERIMENTS,
+            lock_filename=_KG_LOCK,
+        ).admit(kg_record, fingerprint=fp, on_admit=on_admit)
 
     @staticmethod
     def _promote_scratch_layer(
@@ -3138,9 +3113,6 @@ finally:
         """Move ``scratch/layers/<name>.npy`` into ``admitted/layers/`` and
         register it in ``admitted/index.json``. Called inside the kg lock.
         """
-        from voxel_features.spatial import SpatialVoxelStore
-        from voxel_features.store import GridSpec
-
         scratch_npy = scratch_dir / "layers" / f"{layer_name}.npy"
         if not scratch_npy.exists():
             logger.warning(
@@ -3161,6 +3133,10 @@ finally:
                 f"feature_hypothesis: promote skipped — bad scratch index: {exc}"
             )
             return
+
+        from voxel_features.spatial import SpatialVoxelStore
+        from voxel_features.store import GridSpec
+
         grid = GridSpec.from_dict(scratch_data["grid"])
 
         import numpy as np
@@ -3201,20 +3177,19 @@ finally:
 
         window_size <= 0 means "no ramp" — every slot is allowed.
         """
-        if window_size <= 0 or configured_slots <= 0:
-            return max(0, configured_slots)
-        progress = min(max(bootstrap_episodes_seen / window_size, 0.0), 1.0)
-        fraction = min_fraction + (1.0 - min_fraction) * progress
-        return max(1, math.ceil(configured_slots * fraction))
+        return ramp_target_active(
+            bootstrap_episodes_seen,
+            configured_slots,
+            window_size,
+            min_fraction,
+        )
 
     def _read_bootstrap_state(self, kg_dir: Path) -> dict[str, Any]:
-        data = self._read_json_or(
-            kg_dir / _KG_BOOTSTRAP_STATE,
-            {"bootstrap_episodes_seen": 0, "in_flight": []},
-        )
-        data.setdefault("bootstrap_episodes_seen", 0)
-        data.setdefault("in_flight", [])
-        return data
+        return SlotRampPermit(
+            kg_dir,
+            state_filename=_KG_BOOTSTRAP_STATE,
+            lock_filename=_KG_LOCK,
+        ).read_state()
 
     def _acquire_bootstrap_permit(
         self,
@@ -3236,70 +3211,26 @@ finally:
         unit is "episodes", not subseconds, so faster polling just burns
         lock contention with no scheduling benefit.
         """
-        kg_path = Path(kg_dir)
-        state_path = kg_path / _KG_BOOTSTRAP_STATE
-        deadline = time.monotonic() + max(timeout_s, 0.0)
-
-        while True:
-            with self._kg_lock(kg_path):
-                state = self._read_bootstrap_state(kg_path)
-                now = time.time()
-                raw_in_flight = list(state.get("in_flight", []))
-                # Reap stale entries: a crashed slot leaves its permit
-                # behind; without this the run deadlocks.
-                in_flight = [
-                    entry
-                    for entry in raw_in_flight
-                    if isinstance(entry, dict)
-                    and isinstance(entry.get("acquired_at"), (int, float))
-                    and (now - float(entry["acquired_at"])) < stale_after_s
-                ]
-                target = self._bootstrap_target_active(
-                    bootstrap_episodes_seen=int(state.get("bootstrap_episodes_seen", 0)),
-                    configured_slots=configured_slots,
-                    window_size=window_size,
-                    min_fraction=min_fraction,
-                )
-                if len(in_flight) < target:
-                    in_flight.append({"slot_id": slot_id, "acquired_at": now})
-                    state["in_flight"] = in_flight
-                    # `bootstrap_episodes_seen` increments on RELEASE, not
-                    # acquire — otherwise the ramp accelerates with raw
-                    # parallelism and lets configured concurrency in before
-                    # any episode has actually completed.
-                    self._atomic_write_json(state_path, state)
-                    return True
-                # Persist the reap so other slots benefit when they next
-                # acquire — but only if we actually changed anything.
-                if in_flight != raw_in_flight:
-                    state["in_flight"] = in_flight
-                    self._atomic_write_json(state_path, state)
-
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(poll_interval_s)
+        return SlotRampPermit(
+            kg_dir,
+            state_filename=_KG_BOOTSTRAP_STATE,
+            lock_filename=_KG_LOCK,
+        ).acquire(
+            slot_id,
+            configured_slots=configured_slots,
+            window_size=window_size,
+            min_fraction=min_fraction,
+            timeout_s=timeout_s,
+            stale_after_s=stale_after_s,
+            poll_interval_s=poll_interval_s,
+        )
 
     def _release_bootstrap_permit(self, kg_dir: Path | str, slot_id: str) -> None:
-        kg_path = Path(kg_dir)
-        state_path = kg_path / _KG_BOOTSTRAP_STATE
-        if not state_path.exists():
-            return
-        with self._kg_lock(kg_path):
-            state = self._read_bootstrap_state(kg_path)
-            before = state.get("in_flight", [])
-            after = [
-                entry
-                for entry in before
-                if not (isinstance(entry, dict) and entry.get("slot_id") == slot_id)
-            ]
-            state["in_flight"] = after
-            # Each *completed* episode (release) advances the ramp. Acquires
-            # that never complete (stale, reaped) do not bump the counter.
-            if len(after) != len(before):
-                state["bootstrap_episodes_seen"] = (
-                    int(state.get("bootstrap_episodes_seen", 0)) + 1
-                )
-            self._atomic_write_json(state_path, state)
+        SlotRampPermit(
+            kg_dir,
+            state_filename=_KG_BOOTSTRAP_STATE,
+            lock_filename=_KG_LOCK,
+        ).release(slot_id)
 
     # ----- Crossbreed queue -------------------------------------------
 
@@ -3421,8 +3352,11 @@ finally:
         introduce new pairs that take their place in score order.
         """
         kg_path = Path(kg_dir)
-        with self._kg_lock(kg_path):
-            self._write_queue(kg_path, self._merge_new_pairs(kg_path, self._read_queue(kg_path)))
+        OrderedPairQueue(
+            kg_path,
+            queue_filename=_KG_QUEUE,
+            lock_filename=_KG_LOCK,
+        ).refill(lambda existing: self._merge_new_pairs(kg_path, existing))
 
     def _queue_pop_pair(self, kg_dir: Path | str) -> tuple[str, str] | None:
         """Pop the next pair under the kg lock.
@@ -3443,41 +3377,28 @@ finally:
         experiments exist.
         """
         kg_path = Path(kg_dir)
-        # Cheap pre-check outside the lock — if there are <2 experiments,
-        # there is no way to pop. Inside the lock we may still re-check after
-        # acquiring the queue, but this avoids the lock overhead in the
-        # common steady-state survey-only case.
-        if len(self._load_successful_experiments(kg_path)) < 2:
-            return None
+        queue = OrderedPairQueue(
+            kg_path,
+            queue_filename=_KG_QUEUE,
+            lock_filename=_KG_LOCK,
+        )
 
-        with self._kg_lock(kg_path):
-            entries = self._read_queue(kg_path)
-            # Only re-enumerate (the O(N²) hot path) when experiments.jsonl
-            # has grown since the last queue write. In the steady state this
-            # skips the enumeration entirely.
-            if not entries or self._experiments_changed_since_queue(kg_path):
-                entries = self._merge_new_pairs(kg_path, entries)
-
-            if not entries:
-                return None
-
+        def choose_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
             consummated = self._consummated_pairs(kg_path)
             parent_uses = self._parent_use_counts(entries)
-            chosen = max(
+            return max(
                 entries,
                 key=lambda entry: self._effective_pair_score(
                     entry, consummated, parent_uses
                 ),
             )
 
-            chosen["attempt_count"] = int(chosen.get("attempt_count", 0)) + 1
-            chosen["popped_at"] = time.time()
-            self._write_queue(kg_path, entries)
-
-            parents = chosen.get("parents") or []
-            if len(parents) != 2:
-                return None
-            return str(parents[0]), str(parents[1])
+        return queue.pop_pair(
+            can_pop=lambda: len(self._load_successful_experiments(kg_path)) >= 2,
+            should_refresh=lambda _entries: self._experiments_changed_since_queue(kg_path),
+            merge_entries=lambda entries: self._merge_new_pairs(kg_path, entries),
+            choose_entry=choose_entry,
+        )
 
     @classmethod
     def _consummated_pairs(cls, kg_dir: Path) -> set[frozenset[str]]:
@@ -3539,4 +3460,3 @@ finally:
         if len(parents) == 2 and frozenset(parents) in consummated:
             decayed *= _CONSUMMATED_DISCOUNT
         return decayed
-

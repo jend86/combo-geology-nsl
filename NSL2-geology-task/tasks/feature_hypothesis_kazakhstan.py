@@ -55,7 +55,9 @@ from src.task.types import (
     Workflow,
     WorkflowStep,
 )
+from tasks.common.dedup_ledger import JsonDedupLedger
 from tasks.common.foundry_exec import coerce_exec_result, exec_run_with_timeout
+from tasks.common.ordered_pair_queue import OrderedPairQueue
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -69,16 +71,17 @@ def _to_jsonable(obj: Any) -> Any:
     MCP bridge. Coercing at the scoring source keeps every downstream consumer
     clean.
     """
-    import numpy as np
-
     if isinstance(obj, dict):
         return {k: _to_jsonable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_to_jsonable(v) for v in obj]
-    if isinstance(obj, np.generic):  # any numpy scalar (bool_, float64, int64, …)
-        return obj.item()
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
+    if type(obj).__module__.startswith("numpy"):
+        import numpy as np
+
+        if isinstance(obj, np.generic):  # any numpy scalar (bool_, float64, int64, …)
+            return obj.item()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
     return obj
 
 
@@ -3372,7 +3375,10 @@ finally:
                 duplicate_rejected = not admitted_to_kg
                 if admitted_to_kg:
                     self._update_crossbreed_index(
-                        knowledge_dir, node_id, evaluate.get('mutual_info', {})
+                        knowledge_dir,
+                        node_id,
+                        feature_layer_name,
+                        evaluate.get('mutual_info', {}),
                     )
                     self._update_pairwise_distance_index(
                         knowledge_dir,
@@ -3488,6 +3494,7 @@ finally:
         self,
         knowledge_dir: Path,
         new_node_id: str,
+        new_layer_name: str,
         new_mutual_info: dict[str, float]
     ) -> None:
         """Update legacy crossbreed MI index for record audit.
@@ -3530,8 +3537,8 @@ finally:
                 # Look for cross-references in mutual info dictionaries
                 if existing_exp.get('layer_name') in new_layer:
                     mi_score = new_layer[existing_exp['layer_name']]
-                elif 'layer_name' in locals() and locals()['layer_name'] in existing_layer:
-                    mi_score = existing_layer[locals()['layer_name']]
+                elif new_layer_name in existing_layer:
+                    mi_score = existing_layer[new_layer_name]
 
                 # Create pair record
                 pair_id = f"{min(new_node_id, existing_exp['node_id'])}_{max(new_node_id, existing_exp['node_id'])}"
@@ -5573,25 +5580,26 @@ finally:
         kg_path = Path(kg_dir)
         fp = self._fingerprint(parents, hypothesis)
 
-        with self._kg_lock(kg_path):
-            ledger = self._read_json_or(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": []})
-            seen: list[str] = list(ledger.get("fingerprints", []))
-            if fp in seen:
-                return False
-            if (
-                scratch_dir is not None
-                and admitted_dir is not None
-                and isinstance(layer_name, str)
-                and layer_name
-            ):
+        on_admit = None
+        if (
+            scratch_dir is not None
+            and admitted_dir is not None
+            and isinstance(layer_name, str)
+            and layer_name
+        ):
+            def promote_layer() -> None:
                 self._promote_scratch_layer(
                     Path(scratch_dir), Path(admitted_dir), layer_name
                 )
-            with (kg_path / _KG_EXPERIMENTS).open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(kg_record) + "\n")
-            seen.append(fp)
-            self._atomic_write_json(kg_path / _KG_ADMITTED_INDEX, {"fingerprints": seen})
-        return True
+
+            on_admit = promote_layer
+
+        return JsonDedupLedger(
+            kg_path,
+            ledger_filename=_KG_ADMITTED_INDEX,
+            records_filename=_KG_EXPERIMENTS,
+            lock_filename=_KG_LOCK,
+        ).admit(kg_record, fingerprint=fp, on_admit=on_admit)
 
     @staticmethod
     def _promote_scratch_layer(
@@ -5607,9 +5615,6 @@ finally:
         ``SpatialVoxelStore`` so the layer metadata format stays consistent
         with the rest of the codebase (e.g. content hashes, dtypes).
         """
-        from voxel_features.spatial import SpatialVoxelStore
-        from voxel_features.store import GridSpec
-
         scratch_npy = scratch_dir / "layers" / f"{layer_name}.npy"
         if not scratch_npy.exists():
             logger.warning(
@@ -5633,6 +5638,10 @@ finally:
                 f"feature_hypothesis: promote skipped — bad scratch index: {exc}"
             )
             return
+
+        from voxel_features.spatial import SpatialVoxelStore
+        from voxel_features.store import GridSpec
+
         grid = GridSpec.from_dict(scratch_data["grid"])
 
         # Build / open the admitted store and add the layer there. Use
@@ -5891,8 +5900,11 @@ finally:
         introduce new pairs that take their place in score order.
         """
         kg_path = Path(kg_dir)
-        with self._kg_lock(kg_path):
-            self._write_queue(kg_path, self._merge_new_pairs(kg_path, self._read_queue(kg_path)))
+        OrderedPairQueue(
+            kg_path,
+            queue_filename=_KG_QUEUE,
+            lock_filename=_KG_LOCK,
+        ).refill(lambda existing: self._merge_new_pairs(kg_path, existing))
 
     def _queue_pop_pair(self, kg_dir: Path | str) -> tuple[str, str] | None:
         """Pop the next pair under the kg lock.
@@ -5913,41 +5925,28 @@ finally:
         experiments exist.
         """
         kg_path = Path(kg_dir)
-        # Cheap pre-check outside the lock — if there are <2 experiments,
-        # there is no way to pop. Inside the lock we may still re-check after
-        # acquiring the queue, but this avoids the lock overhead in the
-        # common steady-state survey-only case.
-        if len(self._load_successful_experiments(kg_path)) < 2:
-            return None
+        queue = OrderedPairQueue(
+            kg_path,
+            queue_filename=_KG_QUEUE,
+            lock_filename=_KG_LOCK,
+        )
 
-        with self._kg_lock(kg_path):
-            entries = self._read_queue(kg_path)
-            # Only re-enumerate (the O(N²) hot path) when experiments.jsonl
-            # has grown since the last queue write. In the steady state this
-            # skips the enumeration entirely.
-            if not entries or self._experiments_changed_since_queue(kg_path):
-                entries = self._merge_new_pairs(kg_path, entries)
-
-            if not entries:
-                return None
-
+        def choose_entry(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
             consummated = self._consummated_pairs(kg_path)
             parent_uses = self._parent_use_counts(entries)
-            chosen = max(
+            return max(
                 entries,
                 key=lambda entry: self._effective_pair_score(
                     entry, consummated, parent_uses
                 ),
             )
 
-            chosen["attempt_count"] = int(chosen.get("attempt_count", 0)) + 1
-            chosen["popped_at"] = time.time()
-            self._write_queue(kg_path, entries)
-
-            parents = chosen.get("parents") or []
-            if len(parents) != 2:
-                return None
-            return str(parents[0]), str(parents[1])
+        return queue.pop_pair(
+            can_pop=lambda: len(self._load_successful_experiments(kg_path)) >= 2,
+            should_refresh=lambda _entries: self._experiments_changed_since_queue(kg_path),
+            merge_entries=lambda entries: self._merge_new_pairs(kg_path, entries),
+            choose_entry=choose_entry,
+        )
 
     @classmethod
     def _consummated_pairs(cls, kg_dir: Path) -> set[frozenset[str]]:
