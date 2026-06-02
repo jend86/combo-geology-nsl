@@ -1095,21 +1095,14 @@ def _single_layer_null_bic(
             "stage_completed": "mae_bic_completed",
             "system_mae": 0.0,
             "n_effective_samples": n_eff,
+            "single_layer_null_mad": 0.0,
         }
 
     layer_mean = float(np.nanmean(non_zero))
     mad = float(np.mean(np.abs(non_zero - layer_mean)))
-    if mad <= 1e-10:
-        log_likelihood = n_eff * 10.0
-    else:
-        log_likelihood = -n_eff * float(np.log(2 * mad)) - n_eff
-
     moran_rng = np.random.default_rng(seed) if seed is not None else None
     spatial_correction = compute_moran_correction([layer_values], grid, rng=moran_rng)
-    corrected_log_likelihood = log_likelihood * spatial_correction
-
-    # 1 parameter: the layer's mean
-    bic = -2.0 * corrected_log_likelihood + 1.0 * float(np.log(max(n_eff, 1)))
+    bic = _single_layer_null_bic_from_mad(mad, n_eff, spatial_correction)
 
     return {
         "system_coherence": float(np.exp(-mad)),
@@ -1124,7 +1117,59 @@ def _single_layer_null_bic(
         "stage_completed": "mae_bic_completed",
         "system_mae": mad,
         "n_effective_samples": n_eff,
+        "single_layer_null_mad": mad,
     }
+
+
+def _single_layer_null_bic_from_mad(
+    mad: float,
+    n_effective_samples: int,
+    spatial_correction: float,
+) -> float:
+    """Compute one-layer predict-by-mean BIC for a supplied sample count."""
+    n_eff = int(max(n_effective_samples, 1))
+    if mad <= 1e-10:
+        log_likelihood = n_eff * 10.0
+    else:
+        log_likelihood = -n_eff * float(np.log(2 * mad)) - n_eff
+
+    corrected_log_likelihood = log_likelihood * spatial_correction
+    # 1 parameter: the layer's mean.
+    bic = -2.0 * corrected_log_likelihood + float(np.log(n_eff))
+    return float(bic)
+
+
+def _bic_with_common_effective_samples(
+    score: dict,
+    n_layers: int,
+    n_effective_samples: int,
+) -> float:
+    """Recompute BIC using a comparison-wide effective sample count.
+
+    ``geological_coherence_score`` computes each model with its own
+    ``n_effective_samples``. That is useful telemetry, but before/after BIC
+    deltas must compare the same sample universe; otherwise adding a sparse
+    candidate can look better or worse simply because the effective ``n`` moved.
+    """
+    n_eff = int(max(n_effective_samples, 1))
+    spatial_correction = float(score.get("spatial_correction", 1.0) or 1.0)
+
+    if n_layers == 1:
+        mad = score.get("single_layer_null_mad", score.get("system_mae"))
+        if mad is not None and np.isfinite(float(mad)):
+            return _single_layer_null_bic_from_mad(float(mad), n_eff, spatial_correction)
+
+    mae_matrix = score.get("coherence_matrix")
+    if isinstance(mae_matrix, np.ndarray) and mae_matrix.size:
+        return compute_geological_bic(
+            mae_matrix=mae_matrix,
+            n_layers=n_layers,
+            n_effective_samples=n_eff,
+            spatial_correction=spatial_correction,
+        )
+
+    # Test doubles and legacy callers may only provide a scalar BIC.
+    return float(score.get("bic", 0.0))
 
 
 def system_mae_to_coherence(
@@ -2068,6 +2113,9 @@ def evaluate_new_layer(
             "bic_after": 0.0,
             "bic_delta": -null_bic,
             "bic_delta_raw": -null_bic,
+            "bic_before_observed": null_bic,
+            "bic_after_observed": 0.0,
+            "bic_comparison_n_effective_samples": n_eff,
             "n_effective_samples": n_eff,
             "n_effective_samples_before": 0,
             "n_effective_samples_after": n_eff,
@@ -2117,17 +2165,34 @@ def evaluate_new_layer(
         all_values, all_dtypes, store.grid, grid_shape, seed=effective_seed
     )
     
-    # Raw BIC values
-    bic_before = score_before["bic"]
-    bic_after = score_after["bic"]
-    bic_delta_raw = bic_after - bic_before
-    
-    # Normalize BIC delta by effective sample count to remove grid-size artifact
+    # Raw BIC values from each independently-scored model. These are retained
+    # for audit, but the admission delta below is recomputed with a common
+    # effective-sample count so the candidate cannot win or lose purely because
+    # the before/after sample universe moved.
+    bic_before_observed = score_before["bic"]
+    bic_after_observed = score_after["bic"]
+
     n_eff_before = int(score_before.get("n_effective_samples", 0) or 0)
     n_eff_after = int(score_after.get("n_effective_samples", 0) or 0)
     n_eff_delta = n_eff_after - n_eff_before
+    bic_comparison_n_eff = max(n_eff_before, n_eff_after, 1)
+
+    bic_before = _bic_with_common_effective_samples(
+        score_before,
+        len(existing_values),
+        bic_comparison_n_eff,
+    )
+    bic_after = _bic_with_common_effective_samples(
+        score_after,
+        len(all_values),
+        bic_comparison_n_eff,
+    )
+    bic_delta_raw = bic_after - bic_before
+
+    # Normalize BIC delta by the comparison sample count to remove grid-size
+    # artifacts without reintroducing the before/after n_eff confound.
     n_eff = max(n_eff_after, 1)
-    bic_delta = bic_delta_raw / n_eff  # per-sample BIC delta; range ~[-0.5, 0] for good layers
+    bic_delta = bic_delta_raw / bic_comparison_n_eff  # per-sample BIC delta
     
     cv_mse_before = score_before["total_cv_mse"]
     cv_mse_after = score_after["total_cv_mse"]
@@ -2204,6 +2269,9 @@ def evaluate_new_layer(
         "bic_after": bic_after,
         "bic_delta": bic_delta,          # normalized per-sample; range ~[-0.5, 0] for good layers
         "bic_delta_raw": bic_delta_raw,  # raw (grid-size-dependent); diagnostic only
+        "bic_before_observed": bic_before_observed,
+        "bic_after_observed": bic_after_observed,
+        "bic_comparison_n_effective_samples": bic_comparison_n_eff,
         "n_effective_samples": n_eff,
         "n_effective_samples_before": n_eff_before,
         "n_effective_samples_after": n_eff_after,
