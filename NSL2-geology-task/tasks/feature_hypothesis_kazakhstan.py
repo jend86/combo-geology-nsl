@@ -1662,8 +1662,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Performs statistical analysis, correlation, classification\n"
                         "   - Creates filtered DataFrames, computed arrays, summary statistics\n"
                         "   - Tests geological relationships and patterns\n"
-                        "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
-                        "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
+                        "   - Saves results to files: df.to_csv('/workspace/out/results.csv'), np.save('/workspace/out/arr.npy', arr)\n"
+                        "   NOTE: ONLY files written to /workspace/out/ become artifacts. In-memory variables are discarded.\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -3414,6 +3414,11 @@ finally:
             
             # Call the tool function directly
             tool_func = tool_functions[capability_name]
+            # Inject analysis container for execution_submit so code runs in Docker
+            if capability_name == "execution_submit":
+                analysis = self._pick_container(containers, "analysis")
+                if analysis is not None:
+                    args = {**args, "container": analysis}
             result = tool_func(**args)
             
             # Special handling for execution_submit to store the original code

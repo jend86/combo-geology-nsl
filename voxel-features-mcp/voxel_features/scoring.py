@@ -934,7 +934,7 @@ def compute_out_of_sample_mae(
     n_test = np.sum(test_mask)
     
     if n_test == 0:
-        return 0.0  # No test data
+        return 1.0  # No test data - treat as neutral (no improvement over baseline)
     
     # Fit model on training data
     model_params = fit_continuous_predictor(target_layer, predictor_layers, train_mask)
@@ -950,10 +950,16 @@ def compute_out_of_sample_mae(
         test_predictors = np.column_stack([layer[test_mask] for layer in predictor_layers])
         predictions = test_predictors @ model_params['coefficients'] + model_params['intercept']
     
-    # Compute Mean Absolute Error
-    mae = np.mean(np.abs(test_target - predictions))
+    mae_predicted = float(np.mean(np.abs(test_target - predictions)))
     
-    return float(mae)
+    # Null model: predict by training mean
+    train_mean = float(np.mean(target_layer[train_mask])) if np.sum(train_mask) > 0 else 0.0
+    mae_null = float(np.mean(np.abs(test_target - train_mean)))
+    
+    # Return relative MAE: < 1.0 = better than baseline, 1.0 = neutral, > 1.0 = worse
+    if mae_null < 1e-10:
+        return 1.0  # Constant target: no improvement possible
+    return float(np.clip(mae_predicted / mae_null, 1e-6, 2.0))
 
 
 # =============================================================================
@@ -961,42 +967,41 @@ def compute_out_of_sample_mae(
 # =============================================================================
 
 def mae_to_laplace_likelihood(
-    mae_values: np.ndarray, 
+    mae_values: np.ndarray,
     n_samples: int
 ) -> float:
     """
-    Convert Mean Absolute Error to Laplace likelihood.
-    
-    MAE corresponds exactly to the maximum likelihood estimation
-    for the Laplace (double exponential) distribution, making this
-    the theoretically correct likelihood for MAE-based predictions.
-    
+    Compute log-likelihood from relative MAE values.
+
+    Input is *relative* MAE (output of compute_out_of_sample_mae): values in
+    (0, 2] where 1.0 = same as mean predictor, <1.0 = improvement.
+
+    Uses log-likelihood ratio formulation:
+        log_likelihood = -n * mean(log(relative_mae))
+
+    log(relative_mae) <= 0 for values <= 1.0 (improvement over baseline), so
+    log_likelihood is non-negative for good predictors. Combined with
+    BIC = -2*LL + k*log(n), good predictors (relative_mae < 1) yield negative
+    BIC; neutral (relative_mae = 1) yields small positive; bad (> 1) large
+    positive. The Laplace formula was replaced because it is calibrated for
+    absolute geological units and breaks when input is dimensionless in (0, 1].
+
     Args:
-        mae_values: Array of MAE values from pairwise predictions
+        mae_values: Array of relative MAE values from pairwise predictions
         n_samples: Number of effective samples used in predictions
-        
+
     Returns:
-        Log-likelihood under Laplace distribution
+        Log-likelihood (non-negative for improving layers)
     """
     if len(mae_values) == 0 or n_samples <= 0:
         return 0.0
-    
-    # System-wide MAE (average of pairwise MAEs)
-    system_mae = np.mean(mae_values)
-    
-    # Handle edge case of perfect prediction (MAE = 0)
-    if system_mae <= 1e-10:
-        # Perfect prediction gets very high likelihood
-        return n_samples * 10.0  # Arbitrary large positive value
-    
-    # Laplace likelihood: L = (1/(2*b))^n * exp(-sum(|x_i - mu_i|)/b)
-    # where b = MAE for maximum likelihood estimation
-    # Log-likelihood: log(L) = -n*log(2*MAE) - sum(|errors|)/MAE
-    # Since sum(|errors|) = n*MAE for our case:
-    # log(L) = -n*log(2*MAE) - n*MAE/MAE = -n*log(2*MAE) - n
-    
-    log_likelihood = -n_samples * np.log(2 * system_mae) - n_samples
-    
+
+    # Clip to valid range: 1e-6 floor prevents log(0), 2.0 cap limits outliers
+    clipped = np.clip(mae_values, 1e-6, 2.0)
+
+    # Log-likelihood ratio: positive when relative_mae < 1 (improvement)
+    log_likelihood = -n_samples * float(np.mean(np.log(clipped)))
+
     return float(log_likelihood)
 
 
@@ -1657,7 +1662,7 @@ def geological_coherence_score(
     
     # Calculate effective samples based on non-zero values in interpolated data
     total_non_zero = sum(np.count_nonzero(layer) for layer in interpolated_layers)
-    effective_samples = max(total_non_zero, n_layers * 10)  # At least 10 samples per layer
+    effective_samples = min(max(total_non_zero, n_layers * 10), 10_000)  # At least 10 per layer, capped for BIC stability
     
     # Handle case where no geological data exists
     if all(np.count_nonzero(layer) == 0 for layer in interpolated_layers):
@@ -2028,39 +2033,31 @@ def evaluate_new_layer(
         else:
             effective_seed = 42
 
-    # First layer: compute real null-model BIC so the greedy BIC initialisation
-    # step (run after all sources are visited) has genuine information-theoretic
-    # signal to rank layers with. The -1.0 sentinel was replaced because it
-    # triggered has_admission immediately and caused premature crossbreeding.
-    # Admission is still unconditional — the first layer always enters the store.
+    # First layer: always admitted unconditionally. No cross-layer scoring
+    # possible yet. Fixed bic_delta=-1.0 gives a small training reward without
+    # spurious magnitude from intra-layer null-model calculations (which break
+    # for constant box layers).
     if not existing_layers:
-        null_result = _single_layer_null_bic(
-            new_values_flat, layer_dtype, store.grid, grid_shape,
-            seed=effective_seed,
-        )
         store.add_layer(
             name=layer_name,
             values=layer_values,
             dtype=layer_dtype,
         )
-        null_bic = null_result.get("bic", 0.0)
-        n_eff = null_result.get("n_effective_samples", 0)
-        sys_mae = null_result.get("system_mae", 0.0)
         return {
             "bic_before": 0.0,
-            "bic_after": null_bic,
-            "bic_delta": null_bic,
-            "bic_delta_raw": null_bic,
-            "n_effective_samples": n_eff,
-            "cv_mse_before": sys_mae,
+            "bic_after": 0.0,
+            "bic_delta": -1.0,
+            "bic_delta_raw": -1.0,
+            "n_effective_samples": 0,
+            "cv_mse_before": 0.0,
             "cv_mse_after": 0.0,
-            "cv_mse_delta": -sys_mae,
+            "cv_mse_delta": 0.0,
             "mutual_info": {},
             "admitted": True,
             "predicted_value": 1.0,
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
-            "masking_test_direction": "null_model_baseline",
+            "masking_test_direction": "first_layer",
             "stage_completed": "mae_bic_completed",
         }
 
@@ -2071,19 +2068,12 @@ def evaluate_new_layer(
     # Score WITHOUT new layer (always call to get system_mae / n_effective_samples).
     # ``seed`` is reused for both before/after so the CV split, Moran sample,
     # and interpolation sources are identical between the two calls.
-    # When there is exactly one existing layer, geological_coherence_score
-    # returns bic=0 (no pairwise predictions possible). Using zero as the
-    # baseline produces an artefactual bic_delta. Substitute a predict-by-mean
-    # null model so the 2-layer BIC delta measures actual predictive gain.
-    if len(existing_values) == 1:
-        score_before = _single_layer_null_bic(
-            existing_values[0], existing_dtypes[0], store.grid, grid_shape,
-            seed=effective_seed,
-        )
-    else:
-        score_before = geological_coherence_score(
-            existing_values, existing_dtypes, store.grid, grid_shape, seed=effective_seed
-        )
+    # With relative MAE, bic=0 for n_layers==1 is the correct baseline:
+    # a good second layer produces negative BIC; a constant/noisy second layer
+    # produces BIC = k*log(n) > 0, correctly rejected at Stage 2.
+    score_before = geological_coherence_score(
+        existing_values, existing_dtypes, store.grid, grid_shape, seed=effective_seed
+    )
 
     # Score WITH new layer
     all_values = existing_values + [new_values_flat]
@@ -2099,7 +2089,7 @@ def evaluate_new_layer(
     
     # Normalize BIC delta by effective sample count to remove grid-size artifact
     n_eff = max(score_after.get("n_effective_samples", 1), 1)
-    bic_delta = bic_delta_raw / n_eff  # per-sample BIC delta; range ~[-0.5, 0] for good layers
+    bic_delta = bic_delta_raw / n_eff  # per-sample BIC delta; range ~[-1.4, 0] for good layers (relative MAE)
     
     cv_mse_before = score_before["total_cv_mse"]
     cv_mse_after = score_after["total_cv_mse"]

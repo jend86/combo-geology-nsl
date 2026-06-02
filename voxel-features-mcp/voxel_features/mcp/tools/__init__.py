@@ -12,19 +12,16 @@ from voxel_features.mcp.tools.scoring_tools import (
     scoring_marginal_contribution,
     scoring_evaluate_layer,
 )
-from voxel_features.mcp.tools.experiment_tools import (
-    experiment_record,
-    experiment_get,
-    experiment_list_admitted,
-    experiment_get_crossbreed_pairs,
-    experiment_export_training,
-)
 from voxel_features.mcp.tools.execution_tools import (
     execution_submit,
     execution_status,
     execution_results,
     execution_cancel,
     execution_reset_session,
+)
+from voxel_features.mcp.tools.search_tools import (
+    web_search_geological,
+    geonames_lookup,
 )
 
 __all__ = [
@@ -38,16 +35,13 @@ __all__ = [
     "scoring_mutual_information",
     "scoring_marginal_contribution",
     "scoring_evaluate_layer",
-    # Experiment tools
-    "experiment_record",
-    "experiment_get",
-    "experiment_list_admitted",
-    "experiment_get_crossbreed_pairs",
-    "experiment_export_training",
     # Execution tools
     "execution_submit",
     "execution_status",
     "execution_results",
     "execution_cancel",
     "execution_reset_session",
+    # Search tools
+    "web_search_geological",
+    "geonames_lookup",
 ]
