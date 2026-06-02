@@ -1940,7 +1940,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         episode_context: dict[str, Any],
     ) -> EpisodeConstraints:
         return EpisodeConstraints(
-            budgets=BudgetConstraints(max_task_tool_calls=60, max_llm_turns=45),
+            # Episode-wide budget shared across ALL phases (explore+hypothesise+code+translate+
+            # rewrite). The old 60/45 starved the Translate phase: after survey reading + code
+            # execution, only a few turns remained, forcing single-point "blob" layers. Raised for
+            # an abundance of tool calls so Translate can emit many per-record spatial ops.
+            # Per-turn context growth (not turn count) is the overflow lever -- in-loop compaction
+            # (context_compaction_*) + tool_output_max_chars handle that; watch overflow rate.
+            budgets=BudgetConstraints(max_task_tool_calls=250, max_llm_turns=150),
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
 
@@ -2061,7 +2067,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
                         "   **For text-based locations without coordinates:**\n"
                         "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
-                        "   2. Use search tools with 3-call budget:\n"
+                        "   2. Use search tools as needed (no fixed call budget):\n"
                         "      • search_web_geological('Vladimirovskoye geological formation')\n"
                         "      • search_geonames_lookup('M42-I', 'Kazakhstan')\n"
                         "   3. If search yields coordinates → use them\n"
@@ -5729,13 +5735,22 @@ finally:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     try:
+                        # Ops are logged under the BASE name the agent passed to spatial_add_*,
+                        # but the admitted/scored layer carries a `_<ms-timestamp>` suffix added by
+                        # scoring_create_feature_layer. Query both so the guard actually sees the ops.
+                        import re as _re
+
+                        _names = [layer_name]
+                        _base = _re.sub(r"_\d{10,}$", "", layer_name)
+                        if _base and _base != layer_name:
+                            _names.append(_base)
                         cursor.execute(
                             """
                             SELECT feature_name, source_file, source_excerpt, coordinate_source
                             FROM spatial_operations
-                            WHERE feature_name = ?
-                            """,
-                            (layer_name,),
+                            WHERE feature_name IN ({placeholders})
+                            """.format(placeholders=",".join("?" for _ in _names)),
+                            tuple(_names),
                         )
                     except sqlite3.OperationalError:
                         rows = []

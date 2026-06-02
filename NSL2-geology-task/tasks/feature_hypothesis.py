@@ -3156,13 +3156,21 @@ finally:
                     conn.row_factory = sqlite3.Row
                     cursor = conn.cursor()
                     try:
+                        # Match ops logged under the BASE name as well as the timestamped
+                        # scored-layer name (scoring_create_feature_layer appends `_<ms>`).
+                        import re as _re
+
+                        _names = [layer_name]
+                        _base = _re.sub(r"_\d{10,}$", "", layer_name)
+                        if _base and _base != layer_name:
+                            _names.append(_base)
                         cursor.execute(
                             """
                             SELECT feature_name, source_file, source_excerpt, coordinate_source
                             FROM spatial_operations
-                            WHERE feature_name = ?
-                            """,
-                            (layer_name,),
+                            WHERE feature_name IN ({placeholders})
+                            """.format(placeholders=",".join("?" for _ in _names)),
+                            tuple(_names),
                         )
                     except sqlite3.OperationalError:
                         rows = []
