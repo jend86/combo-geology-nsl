@@ -85,6 +85,26 @@ def _write_scratch_layer(
     store.add_layer(layer_name, values, dtype="float")
 
 
+def _write_spatial_point_layer(
+    scratch_dir: Path,
+    layer_name: str,
+    *,
+    coordinate_source: str,
+) -> None:
+    store = SpatialVoxelStore(scratch_dir, _grid())
+    store.add_point_feature(
+        name=layer_name,
+        longitude=1.0,
+        latitude=1.0,
+        depth=0.5,
+        value=1.0,
+        radius_m=1.0,
+        coordinate_source=coordinate_source,  # type: ignore[arg-type]
+        source_file="analysis.csv" if coordinate_source == "artifact" else None,
+        source_excerpt="sampled row" if coordinate_source == "artifact" else None,
+    )
+
+
 def _admit_layer(
     task: FeatureHypothesisTask,
     kg_dir: Path,
@@ -303,3 +323,99 @@ class TestAdmitWithDedup:
         assert second is False
         assert record2["novelty_rejection_reason"] == "exact_tensor_duplicate"
         assert record2["nearest_tensor_distance"] == 0.0
+
+    def test_spatial_operations_log_coordinate_provenance(self, tmp_path: Path) -> None:
+        store = SpatialVoxelStore(tmp_path / "store", _grid())
+
+        result = store.add_point_feature(
+            name="artifact_backed_point",
+            longitude=1.0,
+            latitude=1.0,
+            depth=0.5,
+            value=1.0,
+            radius_m=1.0,
+            coordinate_source="artifact",
+            source_file="analysis.csv",
+            source_excerpt="row 3 lon/lat",
+        )
+
+        assert result["success"] is True
+        operations = store.get_spatial_operations()
+        assert operations[0]["coordinate_source"] == "artifact"
+        assert operations[0]["source_file"] == "analysis.csv"
+        assert operations[0]["source_excerpt"] == "row 3 lon/lat"
+
+    def test_all_creative_fallback_layer_rejected_before_kg_admit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        layer_name = "fallback_blob"
+        scratch_dir = store_dir / "scratch" / layer_name
+        admitted_dir = store_dir / "admitted"
+        _write_spatial_point_layer(
+            scratch_dir,
+            layer_name,
+            coordinate_source="creative_fallback",
+        )
+        record = _kg_record(
+            hypothesis="Central basin fallback without evidence.",
+            parents=["pa", "pb"],
+            node_id="exp_fallback_blob",
+            layer_name=layer_name,
+        )
+
+        admitted = task._admit_with_dedup(
+            kg_dir,
+            record,
+            parents=["pa", "pb"],
+            hypothesis=record["hypothesis"],
+            scratch_dir=scratch_dir,
+            admitted_dir=admitted_dir,
+            layer_name=layer_name,
+        )
+
+        assert admitted is False
+        assert record["provenance_guard_passed"] is False
+        assert record["provenance_rejection_reason"] == "all_creative_fallback"
+        assert record["translate_fallback_used"] is True
+        assert record["coordinate_source_counts"] == {"creative_fallback": 1}
+        assert not (kg_dir / "experiments.jsonl").exists()
+        assert not (admitted_dir / "layers" / f"{layer_name}.npy").exists()
+
+    def test_artifact_backed_layer_passes_provenance_guard(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        layer_name = "artifact_point"
+        scratch_dir = store_dir / "scratch" / layer_name
+        admitted_dir = store_dir / "admitted"
+        _write_spatial_point_layer(scratch_dir, layer_name, coordinate_source="artifact")
+        record = _kg_record(
+            hypothesis="Artifact backed point.",
+            parents=["pa", "pb"],
+            node_id="exp_artifact_point",
+            layer_name=layer_name,
+        )
+
+        admitted = task._admit_with_dedup(
+            kg_dir,
+            record,
+            parents=["pa", "pb"],
+            hypothesis=record["hypothesis"],
+            scratch_dir=scratch_dir,
+            admitted_dir=admitted_dir,
+            layer_name=layer_name,
+        )
+
+        assert admitted is True
+        assert record["provenance_guard_passed"] is True
+        assert record["provenance_rejection_reason"] == "none"
+        assert record["translate_fallback_used"] is False

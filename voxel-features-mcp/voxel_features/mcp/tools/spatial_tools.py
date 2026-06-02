@@ -20,6 +20,9 @@ def spatial_add_point(
     metadata: dict[str, Any] | None = None,
     hypothesis_uri: str | None = None,
     experiment_id: str | None = None,
+    source_file: str | None = None,
+    source_excerpt: str | None = None,
+    coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
 ) -> dict[str, Any]:
     """
     Add a point feature at geographic coordinates with radius of effect.
@@ -60,6 +63,9 @@ def spatial_add_point(
             metadata=metadata,
             hypothesis_uri=hypothesis_uri,
             experiment_id=experiment_id,
+            source_file=source_file,
+            source_excerpt=source_excerpt,
+            coordinate_source=coordinate_source,
         )
         
         return result
@@ -88,6 +94,9 @@ def spatial_add_line(
     metadata: dict[str, Any] | None = None,
     hypothesis_uri: str | None = None,
     experiment_id: str | None = None,
+    source_file: str | None = None,
+    source_excerpt: str | None = None,
+    coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
 ) -> dict[str, Any]:
     """
     Add a line feature between two geographic points (e.g., fault, vein).
@@ -135,6 +144,9 @@ def spatial_add_line(
             metadata=metadata,
             hypothesis_uri=hypothesis_uri,
             experiment_id=experiment_id,
+            source_file=source_file,
+            source_excerpt=source_excerpt,
+            coordinate_source=coordinate_source,
         )
         
         return result

@@ -1659,6 +1659,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         self._artifact_dir = Path(
             task_config.get("artifact_dir", default_artifacts)
         ).resolve()
+        self._allow_creative_fallback_admission = bool(
+            task_config.get("allow_creative_fallback_admission", False)
+        )
 
         self._docker_compose_dir = task_config.get(
             "docker_compose_dir", "docker/feature-hypothesis-kazakhstan-compose"
@@ -2065,13 +2068,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   4. If search fails or is ambiguous → BE CREATIVE and make geological sense:\n"
                         "      • 'southeastern' → bottom-right 25% of grid (lat<50.75°, lon>69.0°)\n"
                         "      • 'northern edge' → top 12.5% (lat>51.75°)\n"
-                        "      • 'central basin' → around 69°E, 51°N\n"
                         "      • When in doubt, distribute spatially and document your reasoning\n"
                         "3. Create exactly ONE coherent feature layer:\n"
                         "   - ALL spatial operations must use the SAME layer name\n"
-                        "   - Values must be floats or booleans: 'copper_potential' → 0.75\n"
-                        "   - Example: spatial_add_point(name='sediment_copper_potential', ...) \n"
-                        "            spatial_add_line(name='sediment_copper_potential', ...) \n"
+                        "   - value is the cell's content: set it per operation to carry the quantity your analysis produced (e.g. concentration, probability, a distance-derived score). A constant value on every operation discards that analysis.\n"
+                        "   - Emit one operation per located record from your analysis, all under this one layer name, so the layer reflects the data's actual spatial distribution rather than a single placeholder point.\n"
+                        "   - Set the remaining fields deliberately: radius_m / width_m to the feature's real extent (the defaults are placeholders); combination_rule to resolve overlaps (max when signals compete, add when they accumulate, mean when they average); coordinate_source to record provenance (artifact for data-derived coordinates, geonames/web when looked up) -- reserve the creative fallback for coordinates you genuinely had to infer.\n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
                         "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
                         "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
@@ -3767,6 +3769,19 @@ finally:
                     error=f"Unknown search capability: {capability_name}",
                 )
 
+            if result.get("success"):
+                search_record = {
+                    "capability": capability_name,
+                    "coordinate_source": "geonames"
+                    if capability_name == "search_geonames_lookup"
+                    else "web",
+                    "timestamp": time.time(),
+                }
+                ctx.episode_context["last_coordinate_search"] = search_record
+                phase_records = ctx.episode_context.setdefault("phase_records", {})
+                translate_record = phase_records.setdefault("translate", {})
+                translate_record["last_coordinate_search"] = search_record
+
             return CapabilityResult(
                 capability_name,
                 output=result,
@@ -3949,7 +3964,23 @@ finally:
             )
             print(f"🔧 DEBUG: ✅ Store created, grid shape: {store.grid.shape}")
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
-            
+
+            args = dict(args)
+            if capability_name in ["spatial_add_point", "spatial_add_line"]:
+                metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
+                source_file = str(metadata.get("source_file") or "").strip()
+                source_excerpt = str(metadata.get("source_excerpt") or "").strip()
+                last_search = ctx.episode_context.get("last_coordinate_search")
+                if source_file or source_excerpt:
+                    coordinate_source = "artifact"
+                elif isinstance(last_search, dict) and last_search.get("coordinate_source") in {"geonames", "web"}:
+                    coordinate_source = str(last_search["coordinate_source"])
+                else:
+                    coordinate_source = "creative_fallback"
+                args["coordinate_source"] = coordinate_source
+                args["source_file"] = source_file or None
+                args["source_excerpt"] = source_excerpt or None
+             
             # Validate coordinates if this is a spatial operation with coordinates
             if capability_name in ["spatial_add_point", "spatial_add_line"]:
                 if "longitude" in args and "latitude" in args:
@@ -4000,6 +4031,21 @@ finally:
                     translate_record["feature_layer_name"] = result["layer_name"]
                     translate_record["timestamp"] = __import__('time').time()
                     print(f"🔧 DEBUG: Stored layer name '{result['layer_name']}' for later evaluation")
+                operations = store.get_spatial_operations()
+                layer_ops = [
+                    op for op in operations
+                    if op.get("feature_name") == result.get("layer_name")
+                ]
+                fallback_count = sum(
+                    1 for op in layer_ops
+                    if op.get("coordinate_source") == "creative_fallback"
+                )
+                translate_record["spatial_operation_provenance_count"] = len(layer_ops)
+                translate_record["translate_fallback_used"] = fallback_count > 0
+                translate_record["coordinate_source_counts"] = {
+                    source: sum(1 for op in layer_ops if op.get("coordinate_source") == source)
+                    for source in sorted({str(op.get("coordinate_source") or "unknown") for op in layer_ops})
+                }
             
             # Return result
             return CapabilityResult(
@@ -5666,6 +5712,57 @@ finally:
         })
         return novelty_rejection_reason == "none"
 
+    @staticmethod
+    def _stamp_candidate_provenance(
+        kg_record: dict,
+        *,
+        scratch_dir: Path | str | None,
+        layer_name: str | None,
+    ) -> bool:
+        operations: list[dict[str, Any]] = []
+        if scratch_dir is not None and isinstance(layer_name, str) and layer_name:
+            spatial_db = Path(scratch_dir) / "spatial.db"
+            if spatial_db.exists():
+                import sqlite3
+
+                with sqlite3.connect(str(spatial_db)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT feature_name, source_file, source_excerpt, coordinate_source
+                            FROM spatial_operations
+                            WHERE feature_name = ?
+                            """,
+                            (layer_name,),
+                        )
+                    except sqlite3.OperationalError:
+                        rows = []
+                    else:
+                        rows = cursor.fetchall()
+                    operations = [dict(row) for row in rows]
+
+        source_counts: dict[str, int] = {}
+        for op in operations:
+            source = str(op.get("coordinate_source") or "creative_fallback")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        fallback_count = source_counts.get("creative_fallback", 0)
+        all_creative_fallback = bool(operations) and fallback_count == len(operations)
+        override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
+        guard_passed = (not all_creative_fallback) or override_enabled
+
+        kg_record.update({
+            "spatial_operation_provenance_count": len(operations),
+            "coordinate_source_counts": source_counts,
+            "translate_fallback_used": fallback_count > 0,
+            "provenance_guard_passed": guard_passed,
+            "provenance_rejection_reason": "all_creative_fallback"
+            if all_creative_fallback and not override_enabled
+            else "none",
+        })
+        return guard_passed
+
     def _admit_with_dedup(
         self,
         kg_dir: Path | str,
@@ -5706,14 +5803,22 @@ finally:
         on_admit = None
         pre_admit = None
         if candidate_values is not None:
-            def check_novelty() -> bool:
-                return self._stamp_candidate_novelty(
+            def check_guards() -> bool:
+                novelty_passed = self._stamp_candidate_novelty(
                     kg_record,
                     values=candidate_values,
                     admitted_dir=admitted_dir,
                 )
+                if self._allow_creative_fallback_admission:
+                    kg_record["allow_creative_fallback_admission"] = True
+                provenance_passed = self._stamp_candidate_provenance(
+                    kg_record,
+                    scratch_dir=scratch_dir,
+                    layer_name=layer_name,
+                )
+                return novelty_passed and provenance_passed
 
-            pre_admit = check_novelty
+            pre_admit = check_guards
 
         if (
             scratch_dir is not None

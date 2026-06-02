@@ -3139,6 +3139,57 @@ finally:
         })
         return novelty_rejection_reason == "none"
 
+    @staticmethod
+    def _stamp_candidate_provenance(
+        kg_record: dict,
+        *,
+        scratch_dir: Path | str | None,
+        layer_name: str | None,
+    ) -> bool:
+        operations: list[dict[str, Any]] = []
+        if scratch_dir is not None and isinstance(layer_name, str) and layer_name:
+            spatial_db = Path(scratch_dir) / "spatial.db"
+            if spatial_db.exists():
+                import sqlite3
+
+                with sqlite3.connect(str(spatial_db)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT feature_name, source_file, source_excerpt, coordinate_source
+                            FROM spatial_operations
+                            WHERE feature_name = ?
+                            """,
+                            (layer_name,),
+                        )
+                    except sqlite3.OperationalError:
+                        rows = []
+                    else:
+                        rows = cursor.fetchall()
+                    operations = [dict(row) for row in rows]
+
+        source_counts: dict[str, int] = {}
+        for op in operations:
+            source = str(op.get("coordinate_source") or "creative_fallback")
+            source_counts[source] = source_counts.get(source, 0) + 1
+        fallback_count = source_counts.get("creative_fallback", 0)
+        all_creative_fallback = bool(operations) and fallback_count == len(operations)
+        override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
+        guard_passed = (not all_creative_fallback) or override_enabled
+
+        kg_record.update({
+            "spatial_operation_provenance_count": len(operations),
+            "coordinate_source_counts": source_counts,
+            "translate_fallback_used": fallback_count > 0,
+            "provenance_guard_passed": guard_passed,
+            "provenance_rejection_reason": "all_creative_fallback"
+            if all_creative_fallback and not override_enabled
+            else "none",
+        })
+        return guard_passed
+
     def _admit_with_dedup(
         self,
         kg_dir: Path | str,
@@ -3176,14 +3227,20 @@ finally:
         on_admit = None
         pre_admit = None
         if candidate_values is not None:
-            def check_novelty() -> bool:
-                return self._stamp_candidate_novelty(
+            def check_guards() -> bool:
+                novelty_passed = self._stamp_candidate_novelty(
                     kg_record,
                     values=candidate_values,
                     admitted_dir=admitted_dir,
                 )
+                provenance_passed = self._stamp_candidate_provenance(
+                    kg_record,
+                    scratch_dir=scratch_dir,
+                    layer_name=layer_name,
+                )
+                return novelty_passed and provenance_passed
 
-            pre_admit = check_novelty
+            pre_admit = check_guards
 
         if (
             scratch_dir is not None

@@ -51,9 +51,22 @@ class SpatialVoxelStore(VoxelStore):
                 feature_name TEXT NOT NULL,
                 coordinates TEXT NOT NULL,
                 parameters TEXT NOT NULL,
+                source_file TEXT,
+                source_excerpt TEXT,
+                coordinate_source TEXT NOT NULL DEFAULT 'creative_fallback',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        for column_name, column_type in (
+            ("source_file", "TEXT"),
+            ("source_excerpt", "TEXT"),
+            ("coordinate_source", "TEXT NOT NULL DEFAULT 'creative_fallback'"),
+        ):
+            try:
+                cursor.execute(f"ALTER TABLE spatial_operations ADD COLUMN {column_name} {column_type}")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
         
         self._spatial_conn.commit()
     
@@ -184,6 +197,9 @@ class SpatialVoxelStore(VoxelStore):
         radius_m: float = 100,
         dtype: Literal["float", "categorical", "boolean"] = "float",
         combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+        source_file: str | None = None,
+        source_excerpt: str | None = None,
+        coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
         **kwargs
     ) -> dict[str, Any]:
         """
@@ -230,7 +246,15 @@ class SpatialVoxelStore(VoxelStore):
             layer = self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
             
             # Log spatial operation
-            self._log_spatial_operation("point", name, f"{longitude},{latitude},{depth}", f"radius_m={radius_m},value={value}")
+            self._log_spatial_operation(
+                "point",
+                name,
+                f"{longitude},{latitude},{depth}",
+                f"radius_m={radius_m},value={value}",
+                source_file=source_file,
+                source_excerpt=source_excerpt,
+                coordinate_source=coordinate_source,
+            )
             
             return {
                 "success": True,
@@ -255,6 +279,9 @@ class SpatialVoxelStore(VoxelStore):
         width_m: float = 50,
         dtype: Literal["float", "categorical", "boolean"] = "float",
         combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+        source_file: str | None = None,
+        source_excerpt: str | None = None,
+        coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
         **kwargs
     ) -> dict[str, Any]:
         """
@@ -314,7 +341,15 @@ class SpatialVoxelStore(VoxelStore):
             
             # Log spatial operation
             coords_str = f"{start_coords[0]},{start_coords[1]},{start_coords[2]};{end_coords[0]},{end_coords[1]},{end_coords[2]}"
-            self._log_spatial_operation("line", name, coords_str, f"width_m={width_m},value={value}")
+            self._log_spatial_operation(
+                "line",
+                name,
+                coords_str,
+                f"width_m={width_m},value={value}",
+                source_file=source_file,
+                source_excerpt=source_excerpt,
+                coordinate_source=coordinate_source,
+            )
             
             return {
                 "success": True,
@@ -330,19 +365,49 @@ class SpatialVoxelStore(VoxelStore):
                 "operation": "line_feature",
             }
     
-    def _log_spatial_operation(self, operation_type: str, feature_name: str, coordinates: str, parameters: str):
+    def _log_spatial_operation(
+        self,
+        operation_type: str,
+        feature_name: str,
+        coordinates: str,
+        parameters: str,
+        *,
+        source_file: str | None = None,
+        source_excerpt: str | None = None,
+        coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
+    ):
         """Log spatial operation to database for debugging/tracing."""
         cursor = self._spatial_conn.cursor()
         cursor.execute(
-            "INSERT INTO spatial_operations (operation_type, feature_name, coordinates, parameters) VALUES (?, ?, ?, ?)",
-            (operation_type, feature_name, coordinates, parameters)
+            """
+            INSERT INTO spatial_operations (
+                operation_type, feature_name, coordinates, parameters,
+                source_file, source_excerpt, coordinate_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation_type,
+                feature_name,
+                coordinates,
+                parameters,
+                source_file,
+                source_excerpt,
+                coordinate_source,
+            ),
         )
         self._spatial_conn.commit()
     
     def get_spatial_operations(self) -> list[dict[str, Any]]:
         """Get history of spatial operations."""
         cursor = self._spatial_conn.cursor()
-        cursor.execute("SELECT * FROM spatial_operations ORDER BY timestamp DESC")
+        cursor.execute(
+            """
+            SELECT id, operation_type, feature_name, coordinates, parameters,
+                   source_file, source_excerpt, coordinate_source, timestamp
+            FROM spatial_operations
+            ORDER BY timestamp DESC
+            """
+        )
         
         operations = []
         for row in cursor.fetchall():
@@ -352,7 +417,10 @@ class SpatialVoxelStore(VoxelStore):
                 "feature_name": row[2], 
                 "coordinates": row[3],
                 "parameters": row[4],
-                "timestamp": row[5],
+                "source_file": row[5],
+                "source_excerpt": row[6],
+                "coordinate_source": row[7],
+                "timestamp": row[8],
             })
         
         return operations
