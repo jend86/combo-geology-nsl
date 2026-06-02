@@ -1,10 +1,8 @@
 """Regression tests for two-stage scoring (Stage 1 MAE gate + Stage 2 BIC).
 
-Covers the bugs documented in
-``NSL2-geology-task/docs/design/scoring-fix-and-replay-2026-05-25.md`` (§9).
-Each test asserts an invariant of the *current* (post-fix, post-calibration,
-post-RNG-seeding, post-null-baseline) scoring path. If any of these regress,
-the SFT reward signal silently degrades.
+Covers the current scoring invariants after the MAE gate, BIC calibration,
+deterministic RNG seeding, and null-baseline fixes. If any of these regress, the
+SFT reward signal silently degrades.
 
 Notes:
 - Uses the voxel-features-mcp copy of ``voxel_features.scoring`` (the live

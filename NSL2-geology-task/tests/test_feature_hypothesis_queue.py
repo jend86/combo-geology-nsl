@@ -2,9 +2,9 @@
 
 Today `_get_crossbreed_context` picks the single best `(parent_a, parent_b)`
 pair and hands it to *every* concurrent slot, which guarantees duplicates.
-Approach A in the design doc replaces that with a file-locked ordered-pair
-queue: every concurrent slot pops a distinct pair. `(A, B)` and `(B, A)` are
-distinct entries (parent_episodes is not commutative).
+The file-locked ordered-pair queue fixes that by giving every concurrent slot a
+distinct pop. `(A, B)` and `(B, A)` are distinct entries because the prompt treats
+the ordered parent slots as non-commutative context.
 
 These tests cover the queue primitive itself; integration with `populate()`
 is covered in `test_feature_hypothesis_parent_persist.py`.
@@ -419,7 +419,7 @@ class TestQueueConsummatedTier:
 
 
 # ---------------------------------------------------------------------------
-# Approach B + C tests (crossbreed-queue-scoring-redesign-2026-05-26.md)
+# Score compression, orthogonality, and parent-fatigue tests.
 # ---------------------------------------------------------------------------
 
 
@@ -445,7 +445,7 @@ def _seed_pairwise_distance(
 
 
 class TestScoreFormulaLog1pAndDistance:
-    """Approach B: score = log1p(|bic_a|) + log1p(|bic_b|) + λ · dist(a, b)."""
+    """Score = log1p(|bic_a|) + log1p(|bic_b|) + λ · dist(a, b)."""
 
     def test_score_is_log1p_sum_when_no_distance_index(
         self, tmp_path: Path
@@ -550,16 +550,16 @@ class TestScoreFormulaLog1pAndDistance:
 
 
 class TestParentFatigue:
-    """Approach C: per-parent fatigue in _effective_pair_score."""
+    """Per-parent fatigue in _effective_pair_score."""
 
     def test_parent_fatigue_breaks_monoculture(self, tmp_path: Path) -> None:
         # One high-BIC parent ("fold") + 5 lower-BIC partners. Under the
         # legacy formula (linear BIC, no parent fatigue), every fold-pair
         # tops the queue; only after extensive per-pair decay do non-fold
-        # pairs surface. Under C, popping any (fold, X) bumps uses(fold),
-        # which divides ALL fold-pair effective scores in parallel. By the
-        # time we've popped enough to fatigue the ring as a whole, non-fold
-        # pairs should be winning.
+        # pairs surface. With per-parent fatigue, popping any (fold, X) bumps
+        # uses(fold), which divides ALL fold-pair effective scores in parallel.
+        # By the time we've popped enough to fatigue the ring as a whole,
+        # non-fold pairs should be winning.
         task = _task(tmp_path)
         kg_dir = Path(_variation(tmp_path).kg_dir)
         kg_dir.mkdir(parents=True, exist_ok=True)
@@ -673,10 +673,11 @@ class TestParentFatigue:
 
 
 class TestQueueRebuildAfterScoreShapeChange:
-    """Approach B migration: existing queue entries get score refreshed but
+    """Queue migration: existing queue entries get score refreshed but
     attempt_count / popped_at preserved when `_merge_new_pairs` re-runs.
 
-    This is the migration path documented in §5.5 of the redesign doc.
+    This lets a running queue adopt the log1p BIC score formula without erasing
+    the attempt history that drives fatigue.
     """
 
     def test_rebuild_refreshes_score_but_keeps_attempt_history(
@@ -711,7 +712,8 @@ class TestQueueRebuildAfterScoreShapeChange:
         by_pair = {e["pair_id"]: e for e in entries}
         # _seed_experiments writes bic_delta = -(10.0 + i) for each node, so:
         #   a has bic_delta = -10.0, b has bic_delta = -11.0.
-        # Under log1p (Approach B), score = log1p(10) + log1p(11).
+        # Under the current log1p BIC score formula:
+        # score = log1p(10) + log1p(11).
         expected = math.log1p(10.0) + math.log1p(11.0)
         for pair_id in ("a->b", "b->a"):
             entry = by_pair[pair_id]

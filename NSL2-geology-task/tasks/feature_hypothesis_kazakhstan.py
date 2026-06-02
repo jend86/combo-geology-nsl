@@ -510,9 +510,10 @@ PAIR_KIND_OUTCOME_NARRATIVE = "outcome_narrative"
 # survey/explore prompt. The merged ``explore`` step injects an "ASSIGNED SOURCE"
 # header plus a "SAMPLE CONTENT" excerpt of the file the episode was anchored to;
 # both describe what the agent actually read. We lift them onto the QUERY side of
-# synthesized rows so the model conditions on the source evidence and only learns
-# to generate the reasoning/hypothesis/plan (the boundary principle in
-# docs/design/sft-reasoning-decomposition-deep-dive-2026-05-30.md §4).
+# synthesized rows so the model sees the source evidence as input while the
+# completion contains only what the agent had to produce: reasoning, hypothesis,
+# and plan. This prevents harness-injected grounding from being trained as if it
+# were model output.
 _ASSIGNED_SECTION_RE = re.compile(
     r"ASSIGNED SOURCE FOR THIS EPISODE\s*\n\s*(?:Section|Path)\s*:\s*(.+)"
 )
@@ -1976,9 +1977,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         # prompt — grounding is preserved either way).
         #
         # NOTE: the novelty nudge (self._novelty_block_for) is NOT injected into
-        # any prompt. It was briefly wired into crossbreed (Approach C, 2026-05-31)
-        # then REVERTED the same day — it backfired via negation-priming and did
-        # not diversify proposals. Survey diversity relies on file rotation; the
+        # any prompt. A 2026-05-31 crossbreed experiment injected it and was
+        # reverted the same day: it backfired via negation-priming and did not
+        # diversify proposals. Survey diversity relies on file rotation; the
         # crossbreed prompt intentionally follows numpy-slices generic grounding.
         explore_prompt = self._generate_explore_prompt(episode_context)
 
@@ -2015,6 +2016,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Tests geological relationships and patterns\n"
                         "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
                         "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
+                        "   - KEY DELIVERABLE (the spatial spec): when your analysis localizes the feature, write\n"
+                        "     /tmp/feature_points.csv with columns longitude,latitude,depth_m,value,coordinate_source --\n"
+                        "     ONE ROW PER LOCATION the feature occupies (every located prospect/contact/sample your\n"
+                        "     analysis supports), NOT a single representative point. 'value' carries the per-location\n"
+                        "     quantity (concentration, probability, score); 'coordinate_source' is 'artifact' when the\n"
+                        "     coordinate came from the dataset, else 'geonames'/'web'/'creative_fallback'. The next phase\n"
+                        "     maps this table directly to voxels. (This is a data table, not voxel creation.)\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -2058,6 +2066,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "🚨 CRITICAL: You are NOT in analysis mode. Your role is now to convert existing analysis artifacts into spatial feature commands as best you can.\n"
                         "The system automatically maps these to a voxel grid.\n\n"
                         "1. Call get_experiment_summary() to get hypothesis, data_spec, and analysis results\n"
+                        "1b. PRIMARY PATH -- if it returns feature_points (the Code phase's table), that IS your\n"
+                        "    spatial spec: call spatial_add_point ONCE PER ROW, passing that row's longitude,\n"
+                        "    latitude, depth_m, value, and coordinate_source, all under ONE shared layer name. Emit\n"
+                        "    every row -- do NOT collapse them to a single point. Then go to scoring (step 5). Use the\n"
+                        "    steps below only for locations feature_points does not cover, or if it is empty.\n"
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
@@ -2983,6 +2996,51 @@ except Exception as user_code_error:
         }
         return enhanced
     
+    @staticmethod
+    def _load_feature_points(
+        artifact_files,
+        artifact_directory,
+        *,
+        max_rows: int = 2000,
+    ) -> tuple[list[dict], bool]:
+        """A1 handoff: read the Code phase's `feature_points.csv` artifact (columns
+        longitude,latitude,depth_m,value,coordinate_source) and return its rows so the Translate
+        agent -- which has no file-read capability -- can map ONE spatial op per row instead of
+        stamping a single blob. Returns (rows, truncated). Robust to full-path or basename entries
+        in artifact_files; falls back to <artifact_directory>/feature_points.csv."""
+        import csv as _csv
+        import os as _os
+
+        path = None
+        for f in artifact_files or []:
+            if str(f).endswith("feature_points.csv"):
+                if _os.path.exists(str(f)):
+                    path = str(f)
+                elif artifact_directory:
+                    cand = _os.path.join(artifact_directory, _os.path.basename(str(f)))
+                    if _os.path.exists(cand):
+                        path = cand
+                break
+        if path is None and artifact_directory:
+            cand = _os.path.join(artifact_directory, "feature_points.csv")
+            if _os.path.exists(cand):
+                path = cand
+        if path is None:
+            return [], False
+
+        rows: list[dict] = []
+        truncated = False
+        try:
+            with open(path, newline="") as fh:
+                for i, row in enumerate(_csv.DictReader(fh)):
+                    if i >= max_rows:
+                        truncated = True
+                        break
+                    rows.append(dict(row))
+        except Exception:
+            return [], False
+        return rows, truncated
+
     def _exec_get_experiment_summary(
         self,
         containers: list[Container],
@@ -3003,7 +3061,10 @@ except Exception as user_code_error:
         artifact_files = code.get("artifact_files", [])
         if not isinstance(artifact_files, list):
             artifact_files = []
-        
+        feature_points, feature_points_truncated = self._load_feature_points(
+            artifact_files, code.get("artifact_directory", "")
+        )
+
         return CapabilityResult(
             "get_experiment_summary",
             output={
@@ -3016,6 +3077,9 @@ except Exception as user_code_error:
                 "artifact_directory": code.get("artifact_directory", ""),
                 "artifact_files": artifact_files,
                 "artifact_count": len(artifact_files),
+                "feature_points": feature_points,
+                "feature_points_count": len(feature_points),
+                "feature_points_truncated": feature_points_truncated,
                 "feature_layer_name": translate.get("feature_layer_name", ""),
                 "dtype": translate.get("dtype", "float"),
                 "bic_delta": evaluate.get("bic_delta"),
@@ -5477,11 +5541,12 @@ finally:
     ) -> str:
         """Compute the novelty-nudge prompt block for a given variation.
 
-        ⚠️ NOT WIRED into any prompt. Briefly injected into crossbreed (Approach C,
-        2026-05-31) then REVERTED the same day: it backfired via negation-priming
-        (listing the saturated families primed them — geochemical share rose, no
-        diversity gain). An explicit "be a different family" instruction is the
-        wrong lever; diversity is meant to emerge organically from file rotation.
+        NOT WIRED into any prompt. A 2026-05-31 crossbreed experiment injected
+        this block and was reverted the same day: it backfired via
+        negation-priming (listing the saturated families primed them —
+        geochemical share rose, no diversity gain). An explicit "be a different
+        family" instruction is the wrong lever; diversity is meant to emerge
+        organically from file rotation.
         Retained (with `_render_novelty_block`, `_render_mechanism_summary`,
         `_classify_mechanism`, `novelty_*` knobs) for analysis use only.
 
@@ -6230,8 +6295,8 @@ finally:
 
         Derived on read from existing queue state — no extra persistent
         counter. This is the input to `_effective_pair_score`'s per-parent
-        fatigue term (γ), which breaks the §8 monoculture where a single
-        dominant parent (e.g. fold) ends up in 32 of the top-N pairs.
+        fatigue term (γ), which prevents a single dominant parent (e.g. a
+        fold-derived layer) from monopolizing the top-N queue.
         """
         uses: dict[str, int] = {}
         for entry in entries:

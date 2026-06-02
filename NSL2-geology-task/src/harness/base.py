@@ -2,8 +2,8 @@
 
 A harness drives the agent loop for one episode. The ABC is deliberately
 minimal — a single ``run_episode(ctx) -> HarnessTranscript`` method. Users
-extend behavior not by growing the ABC but by subclassing the framework's
-TracedGenner / EventRecorder (see docs/design/harness-abstraction.md).
+extend behavior by subclassing concrete harnesses and the framework's
+TracedGenner / EventRecorder instrumentation, not by growing this ABC.
 """
 
 from __future__ import annotations

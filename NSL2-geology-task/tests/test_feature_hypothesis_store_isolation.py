@@ -1,7 +1,5 @@
 """Store-isolation tests for the feature-hypothesis pipeline.
 
-Spec: ``docs/design/feature_hypothesis_voxel_store_isolation.md``.
-
 These tests cover the per-episode scratch + admitted overlay layout that
 replaces the previously-shared ``store_dir``. The failure modes they pin
 were observed in a 35-episode parallel run (``20260524-pdgqar``):

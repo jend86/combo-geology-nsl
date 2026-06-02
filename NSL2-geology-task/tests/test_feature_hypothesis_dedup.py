@@ -1,7 +1,6 @@
 """Duplicate-handling tests for FeatureHypothesisTask.
 
-These tests target Approach A of
-``docs/design/feature_hypothesis_duplicate_handling_and_bootstrap_ramp.md``:
+These tests pin the duplicate-admission policy:
 
   - ``_fingerprint`` is pure, order-sensitive, and handles missing parents.
   - ``_admit_with_dedup`` admits the first occurrence and silently rejects the
@@ -145,9 +144,8 @@ class TestFingerprint:
         assert fp1 == fp2
 
     def test_parent_order_matters(self, tmp_path: Path) -> None:
-        # (A, B) and (B, A) must hash differently — see open-question 1 in the
-        # design doc and the user's explicit "parent_episodes are NOT
-        # commutative" note.
+        # (A, B) and (B, A) must hash differently because the crossbreed prompt
+        # treats the ordered parent slots as distinct context.
         task = _task(tmp_path)
         ab = task._fingerprint(["a", "b"], "h")
         ba = task._fingerprint(["b", "a"], "h")

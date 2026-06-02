@@ -1,7 +1,6 @@
 """Tests for ``scripts/replay_scoring.py``.
 
-Covers the three contracts the replay tool must satisfy
-(``docs/design/scoring-fix-and-replay-2026-05-25.md`` §9 items 9–11):
+Covers the three contracts the replay tool must satisfy:
 
 1. Replay reproduces seeded scoring (within numerical tolerance) for a
    fabricated run dir built from a known fixed code path.

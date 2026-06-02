@@ -109,9 +109,9 @@ _KG_LOCK = "kg.lock"
 #   score / (1 + α · attempt_count) / Π (1 + γ · uses(parent_i)),
 # with an extra · β multiplier when the pair is "consummated" (already has ≥1
 # admitted crossbreed child). α decays repeatedly-tried *pairs*; γ decays
-# repeatedly-tried *parents* (the lever that breaks the §8 monoculture where
-# 32 fold-pairs share the top slope); β puts consummated pairs in a slow lane
-# without banning them — LLM hypothesis generation is high-variance and the
+# repeatedly-tried *parents* (the lever that breaks monoculture where many
+# top-scored pairs share one dominant parent); β puts consummated pairs in a
+# slow lane without banning them — LLM hypothesis generation is high-variance and the
 # surrounding feature pool keeps growing, so a second attempt at the same
 # pair is a genuinely different experiment.
 _PAIR_ATTEMPT_DECAY = 0.5
@@ -2215,8 +2215,8 @@ finally:
 
             # Per-episode scratch with the admitted pool as read-only
             # overlay — isolates this slot's in-flight mutations from
-            # every other slot's. See
-            # docs/design/feature_hypothesis_voxel_store_isolation.md.
+            # every other slot's. Scoring reads admitted layers plus this
+            # episode's scratch writes, never another episode's partial state.
             scratch_dir = Path(store_dir) / "scratch" / episode_id
             admitted_dir = Path(store_dir) / "admitted"
             admitted_dir.mkdir(parents=True, exist_ok=True)
@@ -3452,7 +3452,8 @@ finally:
                 distance = distance_index.get(dist_pair_id, 0.0)
                 # log1p shrinks BIC outliers (e.g. the |bic|=6.68 fold parent
                 # that monopolised the queue under linear scoring); the λ·dist
-                # term rewards orthogonal parents. See redesign §2.2 and §6.
+                # term rewards orthogonal parents so redundant high-BIC pairs do
+                # not dominate purely by historical score magnitude.
                 score = (
                     math.log1p(bic_a)
                     + math.log1p(bic_b)
@@ -3594,8 +3595,8 @@ finally:
 
         Derived on read from existing queue state — no extra persistent
         counter. This is the input to `_effective_pair_score`'s per-parent
-        fatigue term (γ), which breaks the §8 monoculture where a single
-        dominant parent (e.g. fold) ends up in 32 of the top-N pairs.
+        fatigue term (γ), which prevents a single dominant parent (e.g. a
+        fold-derived layer) from monopolizing the top-N queue.
         """
         uses: dict[str, int] = {}
         for entry in entries:

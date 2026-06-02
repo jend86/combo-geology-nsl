@@ -1,7 +1,7 @@
 # DUAL-ENDPOINT variant of config-feature-hypothesis-kazakhstan-vllm.toml.
 #
 # Supplements the local 2x4090 box with one external RunPod A40 48GB vLLM endpoint
-# to lift throughput (Approach C, gone-dual). A pipeline diagnostic (opt-125m on an A40)
+# to lift throughput beyond the local machine. A pipeline diagnostic (opt-125m on an A40)
 # proved the image + `vllm serve` + RunPod-TCP-proxy path works; the A100 was dropped on
 # cost ($1.39/hr) once its only failures turned out to be download/load time, not anything
 # structural. A40 ($0.44/hr SECURE) ~matches the local box's 48GB KV budget (the local
@@ -63,7 +63,7 @@ capacity = 8                          # the existing nsl-vllm-8000 box; no api_k
 [[vllm.endpoints]]
 id          = "runpod-a40-1"
 base_url    = "http://194.68.245.114:22043"   # A40 pod 571sc1lvcopuy6 (v0.20.2, --kv-cache-dtype auto)
-capacity    = 6                           # A40 runs fp16 KV (auto): fp8 unusable on Ampere -- e4m3 arch-gated, e5m2 trips an attention assert (see docs/design/runpod-a40-vllm-crash-investigation-2026-06-01.md). Measured num_gpu_blocks=8064 => ~129K KV tokens (~half an fp8 setup) => 6 @ ~21K ctx. Tune from /metrics preemptions.
+capacity    = 6                           # A40 runs fp16 KV (auto): fp8 is unusable on Ampere because e4m3 is architecture-gated and e5m2 trips a vLLM attention assert. Measured num_gpu_blocks=8064 => ~129K KV tokens (~half an fp8 setup) => 6 @ ~21K ctx. Tune from /metrics preemptions.
 api_key_env = "RUNPOD_VLLM_KEY"           # pod injects VLLM_API_KEY; bearer confirmed serving (tool-calls OK)
 
 [task]

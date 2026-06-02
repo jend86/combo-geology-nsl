@@ -21,3 +21,6 @@ __pycache__/
 # Logs
 *.log
 test_kazakhstan_output.log
+
+# Unsloth
+unsloth_compiled_cache.bak-5.6-stale

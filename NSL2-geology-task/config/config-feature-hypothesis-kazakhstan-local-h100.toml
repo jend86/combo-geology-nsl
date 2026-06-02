@@ -2,7 +2,7 @@
 # NOTE: filename still says "-local-h100" for continuity, but the external GPU is now a
 # right-sized 48GB Ada card (L40S), NOT an H100 -- see the respec rationale below.
 #
-# Topology (6 local + 28 external = 34):
+# Topology (6 local + 22 external = 28 slots):
 #   - local-4090    : the 2x RTX 4090 box (PP=2), brought up SEPARATELY via
 #                     scripts/start_local_vllm.py (container nsl-vllm-8000) and left
 #                     running; endpoints-mode does NOT launch it (vllm.py:960). 6 slots.
@@ -26,10 +26,12 @@
 # local slots OFFLOAD prefill, and in-loop context compaction (below, chars_per_token=3.0)
 # caps per-turn prompt growth.
 #
-# max_iterations = 40 (NOT the vetoed 28): turn caps are deliberately unchanged --
-# the overflow leak is per-turn context growth, not turn count (see the recovery-plan
-# doc + survey-admission-rate-deep-dive §11). Per-turn context is curbed via
-# tool_output_max_chars=2500 + the kill-stuck-loop commits, not budget clamps.
+# max_iterations = 60 (raised from 40, 2026-06-03): per-phase LLM-turn cap. Raised alongside the
+# episode budget (BudgetConstraints 250 calls / 150 turns in feature_hypothesis_kazakhstan.py) to
+# give the Translate phase an ABUNDANCE of tool calls -- the old caps starved Translate after
+# survey+code, forcing single-point "blob" layers. Per-turn context growth (not turn count) is the
+# overflow lever; in-loop compaction (context_compaction_*) + tool_output_max_chars=2500 curb it.
+# WATCH the context_overflow rate in the local loop; if it climbs, lean on compaction, not a turn clamp.
 #
 # Run (generation-only):
 #   source ~/.config/nsl-runpod/secrets.env          # RUNPOD_VLLM_KEY for the pool
@@ -59,16 +61,12 @@ timeout = 300
 # L40S 28 >= 4); abort only if BOTH collapse (see endpoint-timeout-not-outage).
 min_healthy_endpoint_capacity = 4
 
+# LOCAL-ONLY (2026-06-03): L40S torn down; iterating on voxel-triviality/root-quality fixes against
+# the local 4090 only. Re-add the runpod-l40s-1 endpoint (provision_runpod_vllm.py up) for the full run.
 [[vllm.endpoints]]
 id       = "local-4090"
 base_url = "http://127.0.0.1:8000"
 capacity = 6                          # nsl-vllm-8000 (PP=2, fp8 KV, max_num_seqs=10); runs without --api-key
-
-[[vllm.endpoints]]
-id          = "runpod-l40s-1"
-base_url    = "http://PENDING-PROVISION:0"    # OVERWRITTEN post-provision with the fresh Ada-48GB pod IP:port
-capacity    = 28                              # host-RAM-capped (NOT GPU-capped); vLLM --max-num-seqs 32 (4 slack). Tune from /metrics preemptions.
-api_key_env = "RUNPOD_VLLM_KEY"               # pod injects VLLM_API_KEY (bearer); same secret as before
 
 [task]
 class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
@@ -114,7 +112,7 @@ build_args = {}
 [harness.container.profile_config]
 model = "nsl-feature-hypothesis-kazakhstan"
 agent_type = "tool_calling_agent"
-max_iterations = 40
+max_iterations = 60
 tool_call_timeout_s = 600
 function_group_name = "capabilities"
 force_tool_choice = true
@@ -124,20 +122,22 @@ variation_strategy = "round_robin"
 generation_timeout_s = 172800  # 48 hrs
 max_consecutive_verification_failures = 2
 container_rebuild_interval = 10
-# 6 local + 28 external = 34 slots. Capacity-weighted home map: 6/34 to local-4090,
-# 28/34 to runpod-l40s-1. Host runs ALL episodes' harness+sandbox containers
-# (~4/episode = ~136 at 34); inference is remote for 28, local-GPU for 6. Lowered from
-# 40 (which bled 24G->6G avail over the run) for headroom vs the container-memory creep.
-# MONITOR steady-state `free -g`; dial to 30 if avail < 8G / swap climbs.
-parallel_episodes = 34
+# parallel_episodes=6 (LOCAL-DEV LOOP 2026-06-03): matches the local-4090 capacity (6) now that the
+# L40S is torn down. Episodes are MUCH longer under the raised tool-call budget (250 calls / 150 turns),
+# so 6 concurrent is plenty for fast dev iteration and keeps RAM trivial (~6 x 3.5 G). Restore to ~28
+# (and re-add the L40S endpoint) for the full run once the voxel-triviality/root-quality fixes validate.
+# Prior treadmill history: orchestrator-memory-leak + kg-saturation-trajectory memories.
+parallel_episodes = 3
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20
 checkpoint_every_episode = true
-# RESUME: generation_0 checkpoint exists (264 episodes, 7 admits, recipe ee073501) --
-# continues the run. Compaction/capacity/chars_per_token live under [harness.container]
-# + [[vllm.endpoints]], which are NOT in the export recipe hash, so the resume guard
-# (generation.py:221) still matches. Set false only to force a clean restart.
+# FRESH RUN (2026-06-02): generation_0 + KG + candidate store backed up to
+# data/kazakhstan/feature-hypothesis/_backup_2026-06-02-ep461/ then CLEARED. Kept true (not false)
+# ON PURPOSE: with no checkpoint.json present, load_generation_checkpoint() returns None and the run
+# starts fresh from ep 0 with an EMPTY KG (generation.py:239-241) -- but on a supervisor SIGKILL->resume
+# (RAM-floor restart) the now-existing checkpoint IS picked up, so restarts stay lossless. Setting false
+# would instead discard progress and restart from ep 0 on every supervisor cycle.
 resume_from_checkpoint = true
 generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
 

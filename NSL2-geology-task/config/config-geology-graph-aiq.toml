@@ -13,8 +13,8 @@
 # which can compel a tool call on every turn — preventing the silent
 # single-turn collapse seen in run 20260515-8fuepq.
 #
-# Known risk: per docs/design/aiq-tool-emission-multi-model.md (run
-# 20260509-dhjjal), Qwen2.5-Coder-7B-Instruct-AWQ has been observed to emit
+# Known risk from run 20260509-dhjjal: Qwen2.5-Coder-7B-Instruct-AWQ has been
+# observed to emit
 # markdown-fenced OpenAI-shape tool-call JSON under AIQ instead of Hermes
 # <tool_call> tags, producing 0 tool calls / 1-turn episodes. force_tool_choice
 # = true is our v1 mitigation; if dhjjal-style behaviour reappears here, the

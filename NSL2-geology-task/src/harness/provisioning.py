@@ -27,8 +27,7 @@ from src.typing.config import ContainerHarnessConfig
 
 # Docker label that stamps the build-context content hash into the image
 # so a later run can detect drift and auto-rebuild instead of silently
-# running a stale image (see docs/design/msagent-workflow-lifecycle-and-
-# measurement.md §"Stale-image footgun mitigation").
+# running a stale image after Dockerfile or harness build-context edits.
 _BUILD_CONTEXT_SHA_LABEL = "nsl.build-context-sha"
 _BUILD_CONTEXT_SHA_BUILD_ARG = "NSL_BUILD_CONTEXT_SHA"
 

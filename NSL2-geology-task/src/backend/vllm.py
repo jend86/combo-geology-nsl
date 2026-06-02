@@ -29,8 +29,8 @@ VLLM_IMAGE = "vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada"
 # branched from v0.20.0 on 2026-04-27 and never received the gemma4 PP fix
 # from PR #40786 (merged 2026-04-29). The fix replaces a broken
 # `intermediate_tensors.get("per_layer_inputs")` call (gemma4.py L1320 in
-# v0.20.1) with a subscript access. See
-# docs/design/vllm-gemma4-pp-upstream-bug.md.
+# v0.20.1) with a subscript access. Relax this pin only after the target vLLM
+# tag is smoke-tested with gemma4 pipeline parallelism.
 CONTAINER_NAME_PREFIX = "nsl-vllm"
 HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/tmp/huggingface"

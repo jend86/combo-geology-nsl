@@ -1,17 +1,10 @@
 """Novelty-nudge tests for FeatureHypothesisKazakhstanTask.
 
-Spec:
-  - Approach B of
-    ``docs/design/kazakhstan-variance-and-throughput-2026-05-24.md``
-    (original novelty block at the proposer turn).
-  - Approach A of
-    ``docs/design/survey-diversity-and-data-surfacing-2026-05-29.md``
-    moved the injection point in ``_survey_workflow`` from the
-    *hypothesise* step to the *survey* step (so the agent sees the
-    diversity signal before choosing which files to open) and added a
-    one-line mechanism-family summary computed from the recent-admit
-    pool. The crossbreed workflow has no survey step and keeps the
-    nudge at hypothesise.
+The novelty-nudge machinery reads recent admitted hypotheses and can render a
+length-capped "avoid repeating" block plus a mechanism-family summary. It is
+retained for offline analysis only; workflow prompts deliberately do not inject
+it because direct negative examples previously caused agents to mirror saturated
+families instead of diversifying.
 
 These tests pin the contract:
 
@@ -24,9 +17,8 @@ These tests pin the contract:
   - ``_classify_mechanism`` + ``_render_mechanism_summary`` produce a
     one-line summary of the dominant mechanism family in the recent
     admit pool, with sensible degenerate-case handling.
-  - ``_survey_workflow`` routes the block into the *survey* step prompt
-    (NOT hypothesise) when admissions exist; ``_crossbreed_workflow``
-    routes it into hypothesise (its entry step).
+  - ``_survey_workflow`` and ``_crossbreed_workflow`` keep the block out of
+    prompts so the retained helper cannot accidentally steer live episodes.
 """
 
 from __future__ import annotations

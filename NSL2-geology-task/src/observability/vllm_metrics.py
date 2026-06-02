@@ -3,8 +3,7 @@
 Focuses on gauges (KV cache, queue depth) and counters (token totals,
 preemptions, prefix-cache hits/queries). Counter snapshots are cumulative
 since server start; pair two snapshots through :func:`inference_metrics_delta`
-to obtain windowed deltas and hit ratios (the form used for tuning decisions
-in docs/design/local-vllm-tuning-2026-05-31.md).
+to obtain the windowed deltas and hit ratios used for capacity tuning.
 
 Histogram extraction (TTFT, e2e latency) is deferred — those require
 maintaining per-request state across scrapes.
@@ -31,7 +30,7 @@ class InferenceMetricsSnapshot:
     # Counter-based (cumulative since server start; useful via deltas between scrapes)
     total_prompt_tokens: Optional[int] = None
     total_generation_tokens: Optional[int] = None
-    # KV-residency / prefix-cache health (see local-vllm-tuning design doc §2).
+    # KV-residency / prefix-cache health; inspect as windowed deltas, not raw totals.
     total_preemptions: Optional[int] = None
     prefix_cache_hits: Optional[int] = None
     prefix_cache_queries: Optional[int] = None

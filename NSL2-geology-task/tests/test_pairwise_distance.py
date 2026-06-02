@@ -1,10 +1,9 @@
 """Unit tests for ``voxel_features.scoring.pairwise_distance``.
 
 Background: the crossbreed queue's orthogonality term was a broken
-mutual_information() (unit mismatch — always returned 0). The redesign
-(``crossbreed-queue-scoring-redesign-2026-05-26.md`` Approach B) replaces it
-with ``pairwise_distance``: Jaccard distance for boolean layers and MAE for
-non-boolean. These tests pin the contract.
+mutual_information() (unit mismatch — always returned 0). The current queue
+score uses ``pairwise_distance`` instead: Jaccard distance for boolean layers
+and MAE for non-boolean. These tests pin the contract.
 """
 
 from __future__ import annotations

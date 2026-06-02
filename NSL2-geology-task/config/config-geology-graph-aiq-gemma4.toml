@@ -57,7 +57,7 @@ timeout = 300
 # splits layers ~half/half so each card holds ~8.5 GB of weights and leaves
 # headroom for activations + KV. PP requires the upstream gemma4 fix landed in
 # vLLM PR #40786 (2026-04-29); src/backend/vllm.py pins a nightly containing
-# it. See docs/design/vllm-gemma4-pp-upstream-bug.md.
+# it. Do not move back to v0.20.1/latest unless gemma4 PP is smoke-tested.
 startup_timeout = 2400
 tensor_parallel_size = 1
 pipeline_parallel_size = 2

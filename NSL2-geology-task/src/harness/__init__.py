@@ -4,7 +4,8 @@ A harness drives the agent loop for one episode. The framework owns
 inference, containers, and trajectory persistence; the harness owns loop
 shape (orchestrator, ReAct, graph, external binary, etc.).
 
-See docs/design/harness-abstraction.md for the full design.
+The public surface stays deliberately small: concrete harnesses implement the
+loop, while recorder/genner wrappers provide telemetry and persistence hooks.
 """
 
 from src.harness.base import (

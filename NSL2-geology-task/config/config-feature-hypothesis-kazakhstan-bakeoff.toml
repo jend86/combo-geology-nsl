@@ -1,4 +1,4 @@
-# BAKE-OFF: measure one L40S's real concurrent-episode cap (Approach C, target 16).
+# BAKE-OFF: measure one L40S's real concurrent-episode cap; target 16 simultaneous episodes on a single external endpoint.
 #
 # RunPod-ONLY inference (no local box), isolated scratch store/KG so it never
 # touches the production run the user is about to kick off. Provision the pod
@@ -14,10 +14,10 @@
 #
 # VERDICT: 16 fits this card iff, in steady state (post-bootstrap, ~16 running),
 #   preempt ~= 0 AND pfx_hit climbs high. If preempt climbs before 16 -> the card
-#   caps lower; reach 16 external with a 2nd L40S (Approach B) instead.
+#   caps lower; reach 16 external by adding a second L40S endpoint instead.
 # NOTE: a fresh KG starts in bootstrap at concurrency cap 4 (task default), so
 #   either seed the scratch KG from production to hit 16 immediately, or run >40
-#   episodes and read only the post-bootstrap windows. See the runbook.
+#   episodes and read only post-bootstrap windows where concurrency reached target.
 
 model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
 gpu_memory_utilization = 0.90
