@@ -174,7 +174,30 @@ def scoring_create_feature_layer(
         
         # Extract layer values from spatial operations
         arr = store.get_layer_values(name)
-        
+
+        # Reject near-constant layers — they have no spatial signal and score 0.
+        # Check is done before removing the layer so the agent can add variation
+        # to the existing layer and retry without redoing all spatial operations.
+        flat = arr.flatten()
+        if len(flat) > 0:
+            rounded = np.round(flat, 4)
+            unique_vals, counts = np.unique(rounded, return_counts=True)
+            mode_fraction = float(counts.max()) / len(flat)
+            if mode_fraction >= 0.9:
+                mode_val = float(unique_vals[counts.argmax()])
+                return {
+                    "success": False,
+                    "error": (
+                        f"Layer '{name}' rejected: {mode_fraction:.1%} of voxels share "
+                        f"the same value ({mode_val:.4f}). A near-constant layer has no "
+                        f"spatial signal and cannot improve BIC. "
+                        f"Do not cover the full grid with a single spatial_add_box. "
+                        f"The layer is still in the store — add spatial_add_point calls "
+                        f"at specific geological locations to introduce variation, then "
+                        f"retry scoring_create_feature_layer."
+                    ),
+                }
+
         # Create unique layer name with timestamp to prevent collisions
         timestamp = int(time.time() * 1000)  # millisecond precision
         unique_name = f"{name}_{timestamp}"
