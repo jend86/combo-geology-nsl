@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -134,6 +134,14 @@ class GlobalCircuitBreaker:
         return tripped_count / len(self._slot_breakers) >= self._threshold
 
 
+@dataclass(frozen=True)
+class RowCountState:
+    total_episodes_run: int
+    training_row_count: int
+    training_row_count_is_exact: bool
+    training_row_count_last_refreshed_episode: int
+
+
 class ThreadSafeGenerationCollector:
     """Thread-safe wrapper for collecting episode results."""
 
@@ -146,25 +154,59 @@ class ThreadSafeGenerationCollector:
         self._training_row_count_fn = training_row_count_fn
         self._lock = threading.Lock()
 
-    def _refresh_training_row_count_locked(self) -> None:
-        if self._training_row_count_fn is None:
-            return
-        count = int(self._training_row_count_fn(self._generation_data))
-        self._generation_data.set_training_row_count(count)
+    def _snapshot_generation_data_locked(self) -> GenerationData:
+        return replace(
+            self._generation_data,
+            all_episodes=list(self._generation_data.all_episodes),
+            successful_episodes=list(self._generation_data.successful_episodes),
+            failed_episodes=list(self._generation_data.failed_episodes),
+        )
 
     def add_episode(self, episode: EpisodeTrajectory) -> None:
         with self._lock:
             self._generation_data.add_episode(episode)
-            self._refresh_training_row_count_locked()
+            if self._training_row_count_fn is None:
+                self._generation_data.set_training_row_count(
+                    self._generation_data.training_row_count,
+                )
+            else:
+                self._generation_data.mark_training_row_count_stale()
+
+    def refresh_training_row_count(self) -> int:
+        if self._training_row_count_fn is None:
+            with self._lock:
+                self._generation_data.set_training_row_count(
+                    self._generation_data.training_row_count,
+                )
+                return self._generation_data.training_row_count
+
+        with self._lock:
+            snapshot = self._snapshot_generation_data_locked()
+
+        exact_count = int(self._training_row_count_fn(snapshot))
+
+        with self._lock:
+            raw_delta = max(
+                0,
+                self._generation_data.raw_successful_row_count
+                - snapshot.raw_successful_row_count,
+            )
+            is_exact = (
+                self._generation_data.total_episodes_run == snapshot.total_episodes_run
+            )
+            self._generation_data.set_training_row_count(
+                exact_count if is_exact else exact_count + raw_delta,
+                is_exact=is_exact,
+                last_refreshed_episode=snapshot.total_episodes_run,
+            )
+            return self._generation_data.training_row_count
 
     def training_row_count(self) -> int:
         with self._lock:
-            self._refresh_training_row_count_locked()
             return self._generation_data.training_row_count
 
     def progress_snapshot(self) -> tuple[int, int]:
         with self._lock:
-            self._refresh_training_row_count_locked()
             return (
                 self._generation_data.total_episodes_run,
                 self._generation_data.training_row_count,
@@ -172,8 +214,20 @@ class ThreadSafeGenerationCollector:
 
     def should_stop(self, target_rows: int) -> bool:
         with self._lock:
-            self._refresh_training_row_count_locked()
             return self._generation_data.training_row_count >= target_rows
+
+    def row_count_state(self) -> RowCountState:
+        with self._lock:
+            return RowCountState(
+                total_episodes_run=self._generation_data.total_episodes_run,
+                training_row_count=self._generation_data.training_row_count,
+                training_row_count_is_exact=(
+                    self._generation_data.training_row_count_is_exact
+                ),
+                training_row_count_last_refreshed_episode=(
+                    self._generation_data.training_row_count_last_refreshed_episode
+                ),
+            )
 
     def get_generation_data(self) -> GenerationData:
         with self._lock:

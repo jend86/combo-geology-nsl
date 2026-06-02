@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -203,6 +204,42 @@ def _default_phase_records(
 def _run_transform(episodes: list[EpisodeTrainingRows]) -> list[EpisodeTrainingRows]:
     transform = ExperimentReasoningRows()
     return transform.transform_export_rows(context=None, episodes=episodes)
+
+
+def test_source_episode_payload_loader_tail_reads_only_appended_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tasks.feature_hypothesis_kazakhstan as kz
+
+    path = tmp_path / "all_episodes.jsonl"
+    path.write_text(
+        json.dumps({"episode_id": "ep-0", "value": 0}) + "\n",
+        encoding="utf-8",
+    )
+    transform = ExperimentReasoningRows()
+    context = SimpleNamespace(source_all_episodes_path=path)
+
+    first = transform._load_source_episode_payloads(context)
+    assert set(first) == {"ep-0"}
+
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"episode_id": "ep-1", "value": 1}) + "\n")
+
+    parsed_ids: list[str] = []
+    real_loads = kz.json.loads
+
+    def tracking_loads(text: str) -> Any:
+        payload = real_loads(text)
+        parsed_ids.append(payload["episode_id"])
+        return payload
+
+    monkeypatch.setattr(kz.json, "loads", tracking_loads)
+
+    second = transform._load_source_episode_payloads(context)
+
+    assert set(second) == {"ep-0", "ep-1"}
+    assert parsed_ids == ["ep-1"]
 
 
 # ---------------------------------------------------------------------------

@@ -8,8 +8,8 @@ the SFT reward signal silently degrades.
 
 Notes:
 - Uses the voxel-features-mcp copy of ``voxel_features.scoring`` (the live
-  copy on the container path). The NSL2 mirror is kept byte-identical; see
-  task #5 in the design doc.
+  copy on the container path). The old NSL2 scorer mirror has been removed so
+  there is one authoritative implementation.
 - ``evaluate_new_layer(..., seed=N)`` drives deterministic CV split / Moran's
   I / interpolation; tests rely on that for stable assertions.
 """
@@ -61,6 +61,34 @@ class _ControlledStore:
             "related": np.full(self.grid.shape, 0.9, dtype=np.float32),
         }
         self.dtypes = {"base": "float", "related": "float"}
+        self.added_layers: list[str] = []
+
+    @property
+    def layer_names(self) -> list[str]:
+        return list(self.values)
+
+    def get_layer_values(self, name: str) -> np.ndarray:
+        return self.values[name]
+
+    def get_layer(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(dtype=self.dtypes[name])
+
+    def add_layer(self, name: str, values: np.ndarray, dtype: str) -> None:
+        self.values[name] = values
+        self.dtypes[name] = dtype
+        self.added_layers.append(name)
+
+    def update_layer_scores(self, layer_name: str, bic_delta: float, mi_scores: dict) -> None:
+        pass
+
+
+class _OneLayerStore:
+    def __init__(self) -> None:
+        self.grid = SimpleNamespace(shape=(2, 2, 1))
+        self.values = {
+            "base": np.ones(self.grid.shape, dtype=np.float32),
+        }
+        self.dtypes = {"base": "float"}
         self.added_layers: list[str] = []
 
     @property
@@ -228,6 +256,110 @@ def test_stage1_tolerance_does_not_rescue_large_mae_loss(monkeypatch: pytest.Mon
     assert result["stage_1_tolerance_used"] is False
 
 
+def test_bic_delta_recomputed_with_common_effective_sample_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stage 2 must not accept a layer because before/after BIC used different n.
+
+    The mocked raw BICs look like a strong improvement only because the before
+    score used a tiny effective-sample count and the after score used a large
+    one. Recomputing both BICs from the same MAE matrices with a common ``n``
+    shows the tiny MAE gain is not worth the added pairwise parameters.
+    """
+    calls = iter(
+        [
+            {
+                "bic": 1_000.0,
+                "total_cv_mse": 1.0,
+                "system_mae": 0.2,
+                "n_effective_samples": 10,
+                "coherence_matrix": np.array([[0.0, 0.2], [0.2, 0.0]]),
+                "spatial_correction": 1.0,
+            },
+            {
+                "bic": 900.0,
+                "total_cv_mse": 1.0,
+                "system_mae": 0.199,
+                "n_effective_samples": 1_000,
+                "coherence_matrix": np.array(
+                    [
+                        [0.0, 0.199, 0.199],
+                        [0.199, 0.0, 0.199],
+                        [0.199, 0.199, 0.0],
+                    ]
+                ),
+                "spatial_correction": 1.0,
+            },
+        ]
+    )
+
+    monkeypatch.setattr(scoring, "geological_coherence_score", lambda *args, **kwargs: next(calls))
+    monkeypatch.setattr(scoring, "mutual_information", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(scoring, "pairwise_distance", lambda *args, **kwargs: 0.0)
+
+    result = scoring.evaluate_new_layer(
+        _ControlledStore(),
+        "candidate",
+        np.full((2, 2, 1), 0.8, dtype=np.float32),
+        "float",
+        seed=7,
+    )
+
+    assert result["bic_comparison_n_effective_samples"] == 1_000
+    assert result["bic_delta"] >= 0.0
+    assert result["admitted"] is False
+
+
+def test_second_layer_bic_delta_uses_common_effective_sample_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second layer has no real Stage-1 baseline, so BIC must be clean.
+
+    This guards the boundary where Stage 1 auto-passes. A candidate should not
+    be admitted when negative raw BIC is only an artifact of comparing a
+    one-layer null scored with small ``n`` against a two-layer score with large
+    ``n``.
+    """
+    monkeypatch.setattr(
+        scoring,
+        "_single_layer_null_bic",
+        lambda *args, **kwargs: {
+            "bic": 1_000.0,
+            "total_cv_mse": 1.0,
+            "system_mae": 0.2,
+            "n_effective_samples": 10,
+            "single_layer_null_mad": 0.2,
+            "spatial_correction": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        scoring,
+        "geological_coherence_score",
+        lambda *args, **kwargs: {
+            "bic": 900.0,
+            "total_cv_mse": 1.0,
+            "system_mae": 0.25,
+            "n_effective_samples": 1_000,
+            "coherence_matrix": np.array([[0.0, 0.25], [0.25, 0.0]]),
+            "spatial_correction": 1.0,
+        },
+    )
+    monkeypatch.setattr(scoring, "mutual_information", lambda *args, **kwargs: 0.0)
+    monkeypatch.setattr(scoring, "pairwise_distance", lambda *args, **kwargs: 0.0)
+
+    result = scoring.evaluate_new_layer(
+        _OneLayerStore(),
+        "candidate",
+        np.full((2, 2, 1), 0.8, dtype=np.float32),
+        "float",
+        seed=7,
+    )
+
+    assert result["bic_comparison_n_effective_samples"] == 1_000
+    assert result["bic_delta"] >= 0.0
+    assert result["admitted"] is False
+
+
 # ---------------------------------------------------------------------------
 # Test 4 — first-layer auto-admit must include all Stage-1 fields
 # ---------------------------------------------------------------------------
@@ -253,6 +385,15 @@ def test_first_layer_returns_stage1_fields(tmp_path: Path) -> None:
     assert result["stage_completed"] == "mae_bic_completed"
     assert result["bic_delta"] != -1.0
     assert result["bic_delta"] < 0.0
+
+
+def test_stale_nsltask_scoring_mirror_is_removed() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    stale_path = repo_root / "NSL2-geology-task" / "src" / "voxel_features" / "scoring.py"
+    live_path = Path(scoring.__file__).resolve()
+
+    assert not stale_path.exists()
+    assert repo_root / "voxel-features-mcp" in live_path.parents
 
 
 # ---------------------------------------------------------------------------

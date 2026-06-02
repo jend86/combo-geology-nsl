@@ -190,6 +190,89 @@ class TestGlobalCircuitBreaker(unittest.TestCase):
 
 
 class TestThreadSafeGenerationCollector(unittest.TestCase):
+    def test_progress_snapshot_does_not_refresh_training_rows(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        count_fn = MagicMock(return_value=10)
+        collector = ThreadSafeGenerationCollector(
+            GenerationData(generation_id=0),
+            training_row_count_fn=count_fn,
+        )
+
+        self.assertEqual(collector.progress_snapshot(), (0, 0))
+        count_fn.assert_not_called()
+
+    def test_should_stop_does_not_refresh_training_rows(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        count_fn = MagicMock(return_value=10)
+        generation_data = GenerationData(generation_id=0)
+        generation_data.set_training_row_count(3)
+        collector = ThreadSafeGenerationCollector(
+            generation_data,
+            training_row_count_fn=count_fn,
+        )
+
+        self.assertTrue(collector.should_stop(target_rows=3))
+        count_fn.assert_not_called()
+
+    def test_training_row_count_does_not_refresh_training_rows(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        count_fn = MagicMock(return_value=10)
+        generation_data = GenerationData(generation_id=0)
+        generation_data.set_training_row_count(3)
+        collector = ThreadSafeGenerationCollector(
+            generation_data,
+            training_row_count_fn=count_fn,
+        )
+
+        self.assertEqual(collector.training_row_count(), 3)
+        count_fn.assert_not_called()
+
+    def test_add_episode_marks_row_count_stale_without_refreshing(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        count_fn = MagicMock(return_value=10)
+        collector = ThreadSafeGenerationCollector(
+            GenerationData(generation_id=0),
+            training_row_count_fn=count_fn,
+        )
+
+        collector.add_episode(_make_episode(episode_id="ep-0"))
+
+        count_fn.assert_not_called()
+        state = collector.row_count_state()
+        self.assertEqual(state.training_row_count, 1)
+        self.assertFalse(state.training_row_count_is_exact)
+        self.assertEqual(state.training_row_count_last_refreshed_episode, 0)
+
+    def test_explicit_refresh_counts_rows_once_from_snapshot(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        snapshots = []
+
+        def count_rows(data):
+            snapshots.append(data)
+            return 7
+
+        generation_data = GenerationData(generation_id=0)
+        collector = ThreadSafeGenerationCollector(
+            generation_data,
+            training_row_count_fn=count_rows,
+        )
+        collector.add_episode(_make_episode(episode_id="ep-0"))
+
+        self.assertEqual(collector.refresh_training_row_count(), 7)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertIsNot(snapshots[0], generation_data)
+        self.assertEqual(snapshots[0].total_episodes_run, 1)
+        state = collector.row_count_state()
+        self.assertEqual(state.training_row_count, 7)
+        self.assertTrue(state.training_row_count_is_exact)
+        self.assertEqual(state.training_row_count_last_refreshed_episode, 1)
+
     def test_concurrent_add_all_present(self):
         from src.parallel import ThreadSafeGenerationCollector
 

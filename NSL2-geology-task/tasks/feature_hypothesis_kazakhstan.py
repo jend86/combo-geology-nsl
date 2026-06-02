@@ -583,6 +583,10 @@ class ExperimentReasoningRows:
         # used for best-effort evidence enrichment; "" disables disk reads.
         self._dataset_dir = dataset_dir
         self._max_evidence_chars = max_evidence_chars
+        self._source_payload_cache_path: Path | None = None
+        self._source_payload_cache_identity: tuple[int, int] | None = None
+        self._source_payload_cache_offset = 0
+        self._source_payload_cache: dict[str, dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # TrainingDataTransform protocol
@@ -645,27 +649,55 @@ class ExperimentReasoningRows:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _load_source_episode_payloads(context: Any) -> dict[str, dict[str, Any]]:
+    def _reset_source_payload_cache(
+        self,
+        source_path: Path,
+        identity: tuple[int, int],
+    ) -> None:
+        self._source_payload_cache_path = source_path
+        self._source_payload_cache_identity = identity
+        self._source_payload_cache_offset = 0
+        self._source_payload_cache = {}
+
+    def _load_source_episode_payloads(self, context: Any) -> dict[str, dict[str, Any]]:
         path = getattr(context, "source_all_episodes_path", None)
         if path is None:
             return {}
         source_path = Path(path)
-        if not source_path.exists():
-            return {}
-        out: dict[str, dict[str, Any]] = {}
         try:
-            with source_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
-                    line = line.strip()
+            stat = source_path.stat()
+        except FileNotFoundError:
+            return {}
+        identity = (int(stat.st_dev), int(stat.st_ino))
+        if (
+            self._source_payload_cache_path != source_path
+            or self._source_payload_cache_identity != identity
+            or stat.st_size < self._source_payload_cache_offset
+        ):
+            self._reset_source_payload_cache(source_path, identity)
+
+        try:
+            with source_path.open("rb") as handle:
+                handle.seek(self._source_payload_cache_offset)
+                while True:
+                    line_start = handle.tell()
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        self._source_payload_cache_offset = handle.tell()
+                        break
+                    if not raw_line.endswith(b"\n"):
+                        self._source_payload_cache_offset = line_start
+                        break
+                    self._source_payload_cache_offset = handle.tell()
+                    line = raw_line.strip()
                     if not line:
                         continue
-                    payload = json.loads(line)
+                    payload = json.loads(line.decode("utf-8"))
                     if isinstance(payload, dict) and isinstance(payload.get("episode_id"), str):
-                        out[payload["episode_id"]] = payload
+                        self._source_payload_cache[payload["episode_id"]] = payload
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"ExperimentReasoningRows: failed to inspect all_episodes.jsonl: {exc}")
-        return out
+        return dict(self._source_payload_cache)
 
     def _backfill_record(
         self,

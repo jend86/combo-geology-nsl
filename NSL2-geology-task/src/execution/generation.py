@@ -99,6 +99,10 @@ def _generation_dir(output_dir: Path, generation_id: int) -> Path:
     return output_dir / f"generation_{generation_id}"
 
 
+_ROW_COUNT_REFRESH_EVERY_EPISODES = 10
+_ROW_COUNT_NEAR_TARGET_MARGIN = 2
+
+
 def _is_bootstrap_episode(episode: EpisodeTrajectory) -> bool:
     return bool((episode.task_breakdown or {}).get("bootstrap_active"))
 
@@ -161,6 +165,24 @@ def _refresh_training_row_count(
     count = count_training_rows(generation_data, transforms, context)
     generation_data.set_training_row_count(count)
     return count
+
+
+def _should_refresh_training_row_count(
+    generation_data: GenerationData,
+    target_training_rows: int,
+) -> bool:
+    if generation_data.training_row_count_is_exact:
+        return False
+    episodes_since_refresh = (
+        generation_data.total_episodes_run
+        - generation_data.training_row_count_last_refreshed_episode
+    )
+    if episodes_since_refresh >= _ROW_COUNT_REFRESH_EVERY_EPISODES:
+        return True
+    return generation_data.training_row_count >= max(
+        0,
+        target_training_rows - _ROW_COUNT_NEAR_TARGET_MARGIN,
+    )
 
 
 def _build_checkpoint_payload(
@@ -317,9 +339,25 @@ def run_generation_sequential(
 
     try:
         while not _budget_exhausted():
+            if _should_refresh_training_row_count(
+                generation_data,
+                target_training_rows,
+            ):
+                _refresh_training_row_count(
+                    generation_data,
+                    transforms,
+                    export_context,
+                )
             if generation_data.training_row_count >= target_training_rows:
-                generation_data.termination_reason = "target_reached"
-                break
+                if not generation_data.training_row_count_is_exact:
+                    _refresh_training_row_count(
+                        generation_data,
+                        transforms,
+                        export_context,
+                    )
+                if generation_data.training_row_count >= target_training_rows:
+                    generation_data.termination_reason = "target_reached"
+                    break
 
             if pending_variation_index is None:
                 variation_index = select_variation_index(
@@ -381,11 +419,12 @@ def run_generation_sequential(
                 harness_session=sequential_harness_session,
             )
             generation_data.add_episode(episode)
-            _refresh_training_row_count(
-                generation_data,
-                transforms,
-                export_context,
-            )
+            if transforms:
+                generation_data.mark_training_row_count_stale()
+            else:
+                generation_data.set_training_row_count(
+                    generation_data.training_row_count,
+                )
             if _is_bootstrap_episode(episode):
                 bootstrap_episodes_run += 1
             else:
@@ -439,6 +478,16 @@ def run_generation_sequential(
                 )
                 generation_data.termination_reason = "harness_error"
                 break
+
+            if _should_refresh_training_row_count(
+                generation_data,
+                target_training_rows,
+            ):
+                _refresh_training_row_count(
+                    generation_data,
+                    transforms,
+                    export_context,
+                )
 
             episode_progress.update(1)
             rows_progress.update(generation_data.training_row_count - previous_rows)
@@ -510,6 +559,15 @@ def run_generation_sequential(
         rows_progress.close()
 
     if generation_data.termination_reason is None:
+        if (
+            generation_data.training_row_count >= target_training_rows
+            and not generation_data.training_row_count_is_exact
+        ):
+            _refresh_training_row_count(
+                generation_data,
+                transforms,
+                export_context,
+            )
         if generation_data.training_row_count >= target_training_rows:
             generation_data.termination_reason = "target_reached"
         elif max_bootstrap_count is None:

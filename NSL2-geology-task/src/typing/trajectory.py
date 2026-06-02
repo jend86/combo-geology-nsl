@@ -162,6 +162,8 @@ class GenerationData:
     total_successful: int = 0
     raw_successful_row_count: int = 0
     training_row_count: int = 0
+    training_row_count_is_exact: bool = True
+    training_row_count_last_refreshed_episode: int = 0
     total_score: float = 0.0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -180,8 +182,23 @@ class GenerationData:
         else:
             self.failed_episodes.append(episode)
 
-    def set_training_row_count(self, count: int) -> None:
+    def set_training_row_count(
+        self,
+        count: int,
+        *,
+        is_exact: bool = True,
+        last_refreshed_episode: int | None = None,
+    ) -> None:
         self.training_row_count = int(count)
+        self.training_row_count_is_exact = bool(is_exact)
+        if last_refreshed_episode is None:
+            if is_exact:
+                self.training_row_count_last_refreshed_episode = self.total_episodes_run
+        else:
+            self.training_row_count_last_refreshed_episode = int(last_refreshed_episode)
+
+    def mark_training_row_count_stale(self) -> None:
+        self.training_row_count_is_exact = False
 
     def get_successful_training_row_groups(self) -> list[EpisodeTrainingRows]:
         groups: list[EpisodeTrainingRows] = []
@@ -235,6 +252,10 @@ class GenerationData:
             "total_successful": self.total_successful,
             "raw_successful_row_count": self.raw_successful_row_count,
             "training_row_count": self.training_row_count,
+            "training_row_count_is_exact": self.training_row_count_is_exact,
+            "training_row_count_last_refreshed_episode": (
+                self.training_row_count_last_refreshed_episode
+            ),
             "target_count_basis": "training_rows",
             "total_score": self.total_score,
             "success_rate": self.success_rate,

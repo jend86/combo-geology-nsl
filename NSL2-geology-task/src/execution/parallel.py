@@ -44,6 +44,10 @@ from src.typing.training import (
 from src.typing.trajectory import GenerationData
 
 
+_ROW_COUNT_REFRESH_EVERY_EPISODES = 10
+_ROW_COUNT_NEAR_TARGET_MARGIN = 2
+
+
 def _episode_triggers_endpoint_quarantine(error_category: str | None) -> bool:
     """Whether an episode's failure should quarantine its inference endpoint.
 
@@ -83,12 +87,19 @@ def _save_parallel_checkpoint(
     export_recipe_hash: str,
 ) -> None:
     generation_data = collector.get_generation_data()
+    row_count_state = collector.row_count_state()
     payload = generation_data.to_metadata_dict(run_id=run_id)
     payload["total_episodes_completed"] = generation_data.total_episodes_run
     payload["target_count_basis"] = TARGET_COUNT_BASIS
     payload["target_training_rows"] = target_training_rows
     payload["export_recipe_hash"] = export_recipe_hash
-    payload["training_row_count"] = generation_data.training_row_count
+    payload["training_row_count"] = row_count_state.training_row_count
+    payload["training_row_count_is_exact"] = (
+        row_count_state.training_row_count_is_exact
+    )
+    payload["training_row_count_last_refreshed_episode"] = (
+        row_count_state.training_row_count_last_refreshed_episode
+    )
     save_generation_checkpoint(payload, checkpoint_path)
 
 
@@ -153,6 +164,30 @@ def _run_generation_parallel(
     if generation_data.started_at is None:
         generation_data.started_at = datetime.now().isoformat()
 
+    transforms = tuple(rt.task.training_data_transforms())
+    recipe = build_export_recipe(transforms)
+    export_context = TrainingDataExportContext(
+        generation_id=generation_id,
+        run_id=rt.run_id,
+        task_name=str(getattr(rt.task, "name", type(rt.task).__name__)),
+        source_generation_dir=generation_dir,
+        source_all_episodes_path=all_episodes_path,
+        export_recipe_hash=recipe.recipe_hash,
+    )
+
+    def _count_training_rows(data: GenerationData) -> int:
+        return count_training_rows(data, transforms, export_context)
+
+    if generation_config.resume_from_checkpoint and all_episodes_path.exists():
+        checkpoint = load_generation_checkpoint(checkpoint_path)
+        checkpoint_recipe_hash = checkpoint.get("export_recipe_hash") if checkpoint else None
+        if checkpoint_recipe_hash != recipe.recipe_hash:
+            raise RuntimeError(
+                "checkpoint export recipe hash differs from current task recipe: "
+                f"{checkpoint_recipe_hash!r} != {recipe.recipe_hash!r}"
+            )
+        generation_data.set_training_row_count(_count_training_rows(generation_data))
+
     base_compose_dir = (
         Path(rt.config.docker_compose_dir or rt.task.docker_compose_dir)
         if (rt.config.docker_compose_dir or rt.task.docker_compose_dir)
@@ -179,33 +214,9 @@ def _run_generation_parallel(
             f"insufficient to create all slots."
         )
 
-    transforms = tuple(rt.task.training_data_transforms())
-    recipe = build_export_recipe(transforms)
-    export_context = TrainingDataExportContext(
-        generation_id=generation_id,
-        run_id=rt.run_id,
-        task_name=str(getattr(rt.task, "name", type(rt.task).__name__)),
-        source_generation_dir=generation_dir,
-        source_all_episodes_path=all_episodes_path,
-        export_recipe_hash=recipe.recipe_hash,
-    )
-
-    def _count_training_rows(data: GenerationData) -> int:
-        return count_training_rows(data, transforms, export_context)
-
-    if generation_config.resume_from_checkpoint and all_episodes_path.exists():
-        checkpoint = load_generation_checkpoint(checkpoint_path)
-        checkpoint_recipe_hash = checkpoint.get("export_recipe_hash") if checkpoint else None
-        if checkpoint_recipe_hash != recipe.recipe_hash:
-            raise RuntimeError(
-                "checkpoint export recipe hash differs from current task recipe: "
-                f"{checkpoint_recipe_hash!r} != {recipe.recipe_hash!r}"
-            )
-        generation_data.set_training_row_count(_count_training_rows(generation_data))
-
     collector = parallel_runtime.ThreadSafeGenerationCollector(
         generation_data,
-        training_row_count_fn=_count_training_rows,
+        training_row_count_fn=_count_training_rows if transforms else None,
     )
     global_circuit = parallel_runtime.GlobalCircuitBreaker(
         [s.circuit_breaker for s in slots], threshold=0.5
@@ -214,6 +225,7 @@ def _run_generation_parallel(
     file_lock = threading.Lock()
     stop_event = threading.Event()
     stop_reason = StopReason()
+    row_count_refresh_lock = threading.Lock()
     episode_counter = itertools.count(start=start_episode_index)
     counter_lock = threading.Lock()
     variations = rt.task.list_variations()
@@ -303,6 +315,40 @@ def _run_generation_parallel(
         if display is not None:
             episodes, rows = collector.progress_snapshot()
             display.update_progress(rows=rows, episodes=episodes)
+
+    def _should_refresh_training_row_count() -> bool:
+        state = collector.row_count_state()
+        if state.training_row_count_is_exact:
+            return False
+        episodes_since_refresh = (
+            state.total_episodes_run - state.training_row_count_last_refreshed_episode
+        )
+        if episodes_since_refresh >= _ROW_COUNT_REFRESH_EVERY_EPISODES:
+            return True
+        return state.training_row_count >= max(
+            0,
+            target_rows - _ROW_COUNT_NEAR_TARGET_MARGIN,
+        )
+
+    def _maybe_refresh_training_row_count() -> None:
+        if not _should_refresh_training_row_count():
+            return
+        if not row_count_refresh_lock.acquire(blocking=False):
+            return
+        try:
+            if _should_refresh_training_row_count():
+                collector.refresh_training_row_count()
+        finally:
+            row_count_refresh_lock.release()
+
+    def _confirm_target_reached() -> bool:
+        if not collector.should_stop(target_rows):
+            return False
+        state = collector.row_count_state()
+        if not state.training_row_count_is_exact:
+            with row_count_refresh_lock:
+                collector.refresh_training_row_count()
+        return collector.should_stop(target_rows)
 
     def worker_loop(slot: WorkerSlot) -> None:
         slot_config = rt.config.model_copy(
@@ -470,9 +516,10 @@ def _run_generation_parallel(
                 if episode.success:
                     slot_successes += len(episode.prompt_responses)
                 _display_update_slot(slot.slot_id, successes=slot_successes)
+                _maybe_refresh_training_row_count()
                 _display_update_progress()
 
-                if collector.should_stop(target_rows):
+                if _confirm_target_reached():
                     _signal_stop("target_reached")
                 if generation_config.checkpoint_every_episode:
                     with file_lock:
@@ -639,9 +686,10 @@ def _run_generation_parallel(
 
             result = collector.get_generation_data()
             result.completed_at = datetime.now().isoformat()
+            target_reached = _confirm_target_reached()
             result.termination_reason = stop_reason.get() or (
                 "target_reached"
-                if collector.should_stop(target_rows)
+                if target_reached
                 else "force_stop"
                 if global_circuit.is_tripped()
                 else "max_episodes"

@@ -937,6 +937,13 @@ class GenerationOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(append_episode_jsonl.call_count, 2)
         self.assertEqual(save_generation_checkpoint.call_count, 2)
+        checkpoint_payload = save_generation_checkpoint.call_args_list[-1].args[0]
+        self.assertIn("training_row_count_is_exact", checkpoint_payload)
+        self.assertIn(
+            "training_row_count_last_refreshed_episode",
+            checkpoint_payload,
+        )
+        self.assertTrue(checkpoint_payload["training_row_count_is_exact"])
 
     def test_resume_from_checkpoint_restores_progress(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1286,6 +1293,148 @@ class GenerationOrchestratorTests(unittest.TestCase):
         )
         # scoped_loguru_to_rich should be used instead of _scoped_parallel_logging
         scoped_loguru.assert_called_once()
+
+    def test_parallel_resume_recomputes_rows_before_worker_slots(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=2,
+                resume_from_checkpoint=True,
+                target_training_rows=200,
+            )
+            generation_dir = base_dir / "generations" / "generation_0"
+            generation_dir.mkdir(parents=True)
+            all_episodes_path = generation_dir / "all_episodes.jsonl"
+            all_episodes_path.write_text(
+                json.dumps(self.make_episode(0, row_count=1, success=True).to_dict())
+                + "\n",
+                encoding="utf-8",
+            )
+            checkpoint_path = generation_dir / "checkpoint.json"
+            checkpoint_path.write_text(
+                json.dumps(
+                    {
+                        "next_episode_index": 1,
+                        "training_row_count": 999,
+                        "export_recipe_hash": build_export_recipe(()).recipe_hash,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events: list[str] = []
+
+            def fake_count_training_rows(*args: object, **kwargs: object) -> int:
+                events.append("count")
+                return 123
+
+            def fake_create_worker_slots(*args: object, **kwargs: object) -> list[WorkerSlot]:
+                events.append("create_slots")
+                return []
+
+            with (
+                patch(
+                    "src.execution.parallel.count_training_rows",
+                    side_effect=fake_count_training_rows,
+                ) as count_training_rows,
+                patch(
+                    "src.parallel.create_worker_slots",
+                    side_effect=fake_create_worker_slots,
+                ),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = run_generation_parallel(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=self.make_task(),
+                )
+
+        count_training_rows.assert_called_once()
+        self.assertEqual(events[:2], ["count", "create_slots"])
+        self.assertEqual(result.training_row_count, 123)
+
+    def test_parallel_near_target_refreshes_before_target_reached(self) -> None:
+        class IdentityTransform:
+            @property
+            def name(self) -> str:
+                return "IdentityTransform[test]"
+
+            def config(self) -> dict[str, object]:
+                return {}
+
+            def transform_export_rows(self, context: object, episodes: list[object]):
+                return episodes
+
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=1,
+                target_training_rows=2,
+                max_episodes=5,
+            )
+            task = self.make_task()
+            task.training_data_transforms.return_value = (IdentityTransform(),)
+            manager = MagicMock()
+            self.configure_manager_mock(manager)
+            slot = WorkerSlot(
+                slot_id=0,
+                container_manager=manager,
+                docker_client=MagicMock(),
+                circuit_breaker=SlotCircuitBreaker(),
+                cache_dir=base_dir / "slot-0",
+            )
+            exact_refresh_episode_counts: list[int] = []
+
+            def fake_count_training_rows(data: GenerationData, *args: object) -> int:
+                exact_refresh_episode_counts.append(data.total_episodes_run)
+                return 2 if data.total_episodes_run >= 3 else 1
+
+            def fake_run_single_episode(*args: object, **kwargs: object) -> EpisodeTrajectory:
+                return self.make_episode(
+                    int(kwargs["episode_index"]),
+                    row_count=1,
+                    success=True,
+                )
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=[slot]),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    side_effect=fake_run_single_episode,
+                ) as run_single_episode_mock,
+                patch(
+                    "src.execution.parallel.count_training_rows",
+                    side_effect=fake_count_training_rows,
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                result = run_generation_parallel(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+        self.assertEqual(run_single_episode_mock.call_count, 3)
+        self.assertEqual(exact_refresh_episode_counts, [1, 2, 3])
+        self.assertEqual(result.termination_reason, "target_reached")
+        self.assertEqual(result.training_row_count, 2)
 
     def test_save_generation_data_output_structure(self) -> None:
         with TemporaryDirectory() as temp_dir:
