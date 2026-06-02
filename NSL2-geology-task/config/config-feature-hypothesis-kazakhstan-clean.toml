@@ -1,0 +1,105 @@
+# Feature hypothesis task for Kazakhstan Teniz Basin — clean run with fixed code.
+#
+# Fixes vs prior runs:
+#   - scoring.py: first-layer bic_delta sign corrected (null_bic was inverted)
+#   - translation prompt: full-grid box warning + placeholder examples only
+
+model_name = "openrouter:anthropic/claude-3.5-haiku"
+# gpu_memory_utilization = 0.90  # Not needed for OpenRouter
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan-clean/feature-hypothesis/train_data"
+
+[inference]
+timeout = 300
+
+[vllm]
+# Two RTX 4090s without NVLink — same topology as geology-graph-aiq-gemma4
+startup_timeout = 2400
+tensor_parallel_size = 1
+pipeline_parallel_size = 2
+kv_cache_dtype = "fp8"
+enable_chunked_prefill = true
+enable_prefix_caching = true
+max_model_len = 65536
+max_num_seqs = 10
+max_num_batched_tokens = 8192
+cudagraph_mode = "piecewise"
+extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
+enable_auto_tool_choice = true
+tool_call_parser = "gemma4"
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan-clean/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan-clean/feature-hypothesis/knowledge"
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 14400
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+parallel_episodes = 10
+target_training_rows = 2000
+max_episodes = 50
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+resume_from_checkpoint = false
+generation_output_dir = "./data/kazakhstan-clean/feature-hypothesis/generations"
+
+[training]
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan-clean"
+wandb_project = "feature-hypothesis-kazakhstan-clean"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 6
+training_window_size = 2
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "regional-analysis", "bic-scoring", "bic-fix", "translation-fix"]

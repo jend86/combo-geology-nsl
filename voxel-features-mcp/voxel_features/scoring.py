@@ -2047,10 +2047,10 @@ def evaluate_new_layer(
         n_eff = null_result.get("n_effective_samples", 0)
         sys_mae = null_result.get("system_mae", 0.0)
         return {
-            "bic_before": null_bic,
-            "bic_after": 0.0,
-            "bic_delta": -null_bic,
-            "bic_delta_raw": -null_bic,
+            "bic_before": 0.0,
+            "bic_after": null_bic,
+            "bic_delta": null_bic,
+            "bic_delta_raw": null_bic,
             "n_effective_samples": n_eff,
             "cv_mse_before": sys_mae,
             "cv_mse_after": 0.0,
