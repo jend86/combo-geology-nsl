@@ -37,6 +37,7 @@ class JsonDedupLedger:
         record: dict[str, Any],
         *,
         fingerprint: str,
+        pre_admit: Callable[[], bool] | None = None,
         on_admit: Callable[[], None] | None = None,
     ) -> bool:
         """Append ``record`` iff ``fingerprint`` has not been seen."""
@@ -45,6 +46,9 @@ class JsonDedupLedger:
             ledger = read_json_or(ledger_path, {self.fingerprint_key: []})
             seen = list(ledger.get(self.fingerprint_key, []))
             if fingerprint in seen:
+                return False
+
+            if pre_admit is not None and not pre_admit():
                 return False
 
             if on_admit is not None:

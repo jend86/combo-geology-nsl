@@ -33,7 +33,7 @@ def _ctx(tmp_path: Path, *, phase_records: dict) -> CapabilityExecutionContext:
     )
 
 
-def test_prompt_names_true_two_stage_gate_and_dense_surfaces(tmp_path: Path) -> None:
+def test_prompt_names_true_two_stage_gate_and_support_matching(tmp_path: Path) -> None:
     task = _task(tmp_path)
     variation = task.list_variations()[0]
 
@@ -48,8 +48,10 @@ def test_prompt_names_true_two_stage_gate_and_dense_surfaces(tmp_path: Path) -> 
     assert "MAE" in prompt
     assert "Stage 2" in prompt
     assert "bic_delta < 0" in prompt
-    assert "dense prospectivity surface" in prompt
-    assert "sparse point mark" in prompt
+    assert "Prefer a dense prospectivity surface" not in prompt
+    assert "match spatial support to the geological claim" in prompt
+    assert "Dense basin-scale surfaces" in prompt
+    assert "sparse localized layers are acceptable" in prompt
 
 
 def test_episode_constraints_use_overflow_recovery_caps(tmp_path: Path) -> None:

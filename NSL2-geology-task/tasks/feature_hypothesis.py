@@ -115,12 +115,10 @@ _KG_LOCK = "kg.lock"
 # surrounding feature pool keeps growing, so a second attempt at the same
 # pair is a genuinely different experiment.
 _PAIR_ATTEMPT_DECAY = 0.5
-_PARENT_USE_DECAY = 0.01     # γ — chosen conservatively for retroactive
-                             # rollout (see redesign §5.5: with 360 historical
-                             # uses on the fold parent, γ=0.1 gives a divisor
-                             # of 37 and effectively exiles it). 0.01 still
-                             # gives ~4.6× on resume — enough to demote fold
-                             # below fresh non-fold pairs.
+_PARENT_USE_DECAY = 0.05     # γ — safety rail while tensor novelty guards bed
+                             # in. With 360 historical uses this gives an ~19×
+                             # divisor: strong enough to break monoculture
+                             # without hard-banning high-value parents.
 _PAIR_DISTANCE_WEIGHT = 2.0  # λ for the orthogonality term in the score prior
 _CONSUMMATED_DISCOUNT = 0.25
 
@@ -3060,6 +3058,87 @@ finally:
         payload = "|".join(parents) + "::" + normalized
         return "sha256:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _support_hash(values: Any) -> str:
+        import numpy as np
+
+        support = np.asarray(values).astype(bool)
+        return "sha256:" + hashlib.sha256(support.tobytes()).hexdigest()
+
+    @staticmethod
+    def _tensor_hash(values: Any) -> str:
+        import numpy as np
+
+        rounded = np.round(np.asarray(values, dtype=float), 6)
+        return "sha256:" + hashlib.sha256(rounded.tobytes()).hexdigest()
+
+    @classmethod
+    def _stamp_candidate_novelty(
+        cls,
+        kg_record: dict,
+        *,
+        values: Any,
+        admitted_dir: Path | str | None,
+    ) -> bool:
+        import numpy as np
+
+        candidate = np.asarray(values, dtype=float)
+        candidate_support_hash = cls._support_hash(candidate)
+        candidate_tensor_hash = cls._tensor_hash(candidate)
+        nonzero = int(np.count_nonzero(candidate))
+        total = int(candidate.size)
+
+        nearest_layer_name = None
+        nearest_tensor_distance = None
+        nearest_support_match = False
+        novelty_rejection_reason = "none"
+
+        layers_dir = Path(admitted_dir) / "layers" if admitted_dir is not None else None
+        if layers_dir is not None and layers_dir.exists():
+            for admitted_npy in sorted(layers_dir.glob("*.npy")):
+                try:
+                    admitted = np.load(admitted_npy)
+                except Exception as exc:
+                    logger.warning(
+                        f"feature_hypothesis: novelty scan skipped {admitted_npy}: {exc}"
+                    )
+                    continue
+                if admitted.shape != candidate.shape:
+                    continue
+                distance = float(np.mean(np.abs(candidate - admitted)))
+                support_match = cls._support_hash(admitted) == candidate_support_hash
+                tensor_match = cls._tensor_hash(admitted) == candidate_tensor_hash
+                if nearest_tensor_distance is None or distance < nearest_tensor_distance:
+                    nearest_layer_name = admitted_npy.stem
+                    nearest_tensor_distance = distance
+                    nearest_support_match = support_match
+                if tensor_match:
+                    novelty_rejection_reason = "exact_tensor_duplicate"
+                    nearest_layer_name = admitted_npy.stem
+                    nearest_tensor_distance = distance
+                    nearest_support_match = True
+                    break
+                if support_match and novelty_rejection_reason == "none":
+                    novelty_rejection_reason = "support_duplicate"
+                    nearest_layer_name = admitted_npy.stem
+                    nearest_tensor_distance = distance
+                    nearest_support_match = True
+
+        kg_record.update({
+            "candidate_support_hash": candidate_support_hash,
+            "candidate_tensor_hash": candidate_tensor_hash,
+            "support_hash": candidate_support_hash,
+            "tensor_hash": candidate_tensor_hash,
+            "candidate_nonzero_voxels": nonzero,
+            "candidate_fill_fraction": (nonzero / total) if total else 0.0,
+            "nearest_layer_name": nearest_layer_name,
+            "nearest_tensor_distance": nearest_tensor_distance,
+            "nearest_support_match": nearest_support_match,
+            "novelty_guard_passed": novelty_rejection_reason == "none",
+            "novelty_rejection_reason": novelty_rejection_reason,
+        })
+        return novelty_rejection_reason == "none"
+
     def _admit_with_dedup(
         self,
         kg_dir: Path | str,
@@ -3082,8 +3161,30 @@ finally:
         """
         kg_path = Path(kg_dir)
         fp = self._fingerprint(parents, hypothesis)
+        candidate_values = None
+        if (
+            scratch_dir is not None
+            and isinstance(layer_name, str)
+            and layer_name
+        ):
+            scratch_npy = Path(scratch_dir) / "layers" / f"{layer_name}.npy"
+            if scratch_npy.exists():
+                import numpy as np
+
+                candidate_values = np.load(scratch_npy)
 
         on_admit = None
+        pre_admit = None
+        if candidate_values is not None:
+            def check_novelty() -> bool:
+                return self._stamp_candidate_novelty(
+                    kg_record,
+                    values=candidate_values,
+                    admitted_dir=admitted_dir,
+                )
+
+            pre_admit = check_novelty
+
         if (
             scratch_dir is not None
             and admitted_dir is not None
@@ -3102,7 +3203,7 @@ finally:
             ledger_filename=_KG_ADMITTED_INDEX,
             records_filename=_KG_EXPERIMENTS,
             lock_filename=_KG_LOCK,
-        ).admit(kg_record, fingerprint=fp, on_admit=on_admit)
+        ).admit(kg_record, fingerprint=fp, pre_admit=pre_admit, on_admit=on_admit)
 
     @staticmethod
     def _promote_scratch_layer(

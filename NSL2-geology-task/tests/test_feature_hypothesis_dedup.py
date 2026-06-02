@@ -14,7 +14,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
+
 from tasks.feature_hypothesis import FeatureHypothesisTask, FeatureHypothesisVariation
+from voxel_features.spatial import SpatialVoxelStore
+from voxel_features.store import GridSpec
 
 
 def _task(tmp_path: Path) -> FeatureHypothesisTask:
@@ -36,14 +40,16 @@ def _variation(tmp_path: Path) -> FeatureHypothesisVariation:
     )
 
 
-def _kg_record(*, hypothesis: str, parents: list[str], node_id: str) -> dict:
+def _kg_record(
+    *, hypothesis: str, parents: list[str], node_id: str, layer_name: str = "demo_layer"
+) -> dict:
     return {
         "node_id": node_id,
         "hypothesis": hypothesis,
         "parent_node_1": parents[0] if len(parents) > 0 else None,
         "parent_node_2": parents[1] if len(parents) > 1 else None,
         "bic_delta": -10.0,
-        "layer_name": "demo_layer",
+        "layer_name": layer_name,
     }
 
 
@@ -59,6 +65,56 @@ def _admit(
     return task._admit_with_dedup(
         kg_dir, record, parents=parents, hypothesis=record.get("hypothesis", "")
     )
+
+
+def _grid() -> GridSpec:
+    return GridSpec(
+        origin=(0.0, 0.0, 0.0),
+        maximum=(4.0, 4.0, 2.0),
+        shape=(4, 4, 2),
+        crs="EPSG:4326",
+    )
+
+
+def _write_scratch_layer(
+    scratch_dir: Path,
+    layer_name: str,
+    values: np.ndarray,
+) -> None:
+    store = SpatialVoxelStore(scratch_dir, _grid())
+    store.add_layer(layer_name, values, dtype="float")
+
+
+def _admit_layer(
+    task: FeatureHypothesisTask,
+    kg_dir: Path,
+    store_dir: Path,
+    *,
+    layer_name: str,
+    values: np.ndarray,
+    hypothesis: str,
+    parents: list[str] | None = None,
+) -> tuple[bool, dict]:
+    parents = parents or ["pa", "pb"]
+    scratch_dir = store_dir / "scratch" / layer_name
+    admitted_dir = store_dir / "admitted"
+    _write_scratch_layer(scratch_dir, layer_name, values)
+    record = _kg_record(
+        hypothesis=hypothesis,
+        parents=parents,
+        node_id=f"exp_{layer_name}",
+        layer_name=layer_name,
+    )
+    admitted = task._admit_with_dedup(
+        kg_dir,
+        record,
+        parents=parents,
+        hypothesis=hypothesis,
+        scratch_dir=scratch_dir,
+        admitted_dir=admitted_dir,
+        layer_name=layer_name,
+    )
+    return admitted, record
 
 
 class TestFingerprint:
@@ -172,3 +228,78 @@ class TestAdmitWithDedup:
 
         task2 = _task(tmp_path)
         assert _admit(task2, kg_dir, record2) is False
+
+    def test_same_support_different_hypothesis_rejected_before_kg_admit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        values_a = np.zeros(_grid().shape, dtype=float)
+        values_b = np.zeros(_grid().shape, dtype=float)
+        values_a[1:3, 1:3, 0] = 1.0
+        values_b[1:3, 1:3, 0] = 0.8
+
+        first, record1 = _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="central_redox",
+            values=values_a,
+            hypothesis="Central reduced facies prospectivity.",
+        )
+        second, record2 = _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="central_magmatic",
+            values=values_b,
+            hypothesis="Central magmatic prospectivity with different wording.",
+        )
+
+        assert first is True
+        assert second is False
+        lines = (kg_dir / "experiments.jsonl").read_text().strip().splitlines()
+        assert len(lines) == 1
+        written = json.loads(lines[0])
+        assert written["node_id"] == record1["node_id"]
+        assert "candidate_support_hash" in written
+        assert record2["novelty_guard_passed"] is False
+        assert record2["novelty_rejection_reason"] == "support_duplicate"
+        assert record2["nearest_layer_name"] == "central_redox"
+        assert record2["nearest_support_match"] is True
+        assert not (store_dir / "admitted" / "layers" / "central_magmatic.npy").exists()
+
+    def test_exact_tensor_duplicate_stamped_as_exact_duplicate(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        values = np.zeros(_grid().shape, dtype=float)
+        values[0, 0, 0] = 1.0
+
+        assert _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="first_point",
+            values=values,
+            hypothesis="First point support.",
+        )[0] is True
+        second, record2 = _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="second_point",
+            values=values.copy(),
+            hypothesis="Second point support with different text.",
+        )
+
+        assert second is False
+        assert record2["novelty_rejection_reason"] == "exact_tensor_duplicate"
+        assert record2["nearest_tensor_distance"] == 0.0
