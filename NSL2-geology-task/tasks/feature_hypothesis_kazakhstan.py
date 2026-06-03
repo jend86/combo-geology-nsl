@@ -1702,6 +1702,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         self._allow_creative_fallback_admission = bool(
             task_config.get("allow_creative_fallback_admission", False)
         )
+        # Minimum admitted layers before survey may hand off to crossbreed AND
+        # before greedy BIC init runs. 0 = source-coverage alone gates the
+        # transition (legacy). A higher floor keeps survey blanketing the basin
+        # until the pool is deep enough that greedy/crossbreed start from a rich
+        # basis rather than ~4 layers. See list_variations / the greedy gate.
+        self._min_features = int(task_config.get("min_features", 0))
 
         self._docker_compose_dir = task_config.get(
             "docker_compose_dir", "docker/feature-hypothesis-kazakhstan-compose"
@@ -1758,6 +1764,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 store_dir=str(self._store_dir / "teniz_basin"),
                 kg_dir=str(self._kg_dir / "teniz_basin"),
                 grid_spec=dict(_KAZAKHSTAN_TENIZ_GRID),
+                min_features=self._min_features,
             ),
         ]
     
@@ -1783,9 +1790,14 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         n_features = self._count_features(variation)
         all_sources_done = self._all_sources_visited(variation.kg_dir)
 
-        # Once all sources are visited, attempt greedy BIC init (no-op if already
-        # complete or another parallel episode beat us to it).
-        if all_sources_done:
+        # Once all sources are visited AND the pool has reached min_features,
+        # attempt greedy BIC init (no-op if already complete or another parallel
+        # episode beat us to it). Gating greedy on min_features too (not just
+        # source coverage) stops it from initializing crossbreed's foundation
+        # from a near-empty pool — otherwise greedy fires at the first
+        # all_sources_done moment (~4 layers) and never recomputes on the
+        # fuller pool that survey goes on to bank.
+        if all_sources_done and n_features >= variation.min_features:
             self._run_greedy_bic_initialization(variation)
 
         greedy_done = (
@@ -2431,7 +2443,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 name="spatial_upsert_geometry_batch",
                 description=(
                     "Read the current episode's feature_geometry or feature_points artifact "
-                    "and materialize point/line/box records into one voxel layer in one call."
+                    "and materialize point/line/box records into one voxel layer in one call. "
+                    "value_column must name a NUMERIC column (a continuous measurement, or all "
+                    "1.0 for simple presence). Do NOT point value_column at a text/label column "
+                    "(e.g. a suite name): non-numeric values are coerced to presence 1.0 with a "
+                    "warning, losing any intended magnitude."
                 ),
                 schema={
                     "type": "object",
@@ -2452,9 +2468,14 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                             "enum": ["replace_layer", "accumulate_layer"],
                             "default": "replace_layer",
                         },
-                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float",
+                                  "description": "Layer value semantics; values must be numeric regardless. "
+                                                 "Use categorical with numeric class codes, not name strings."},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
-                        "value_column": {"type": "string", "default": "value"},
+                        "value_column": {"type": "string", "default": "value",
+                                         "description": "Name of the NUMERIC column to use as each record's value "
+                                                        "(continuous measurement, or 1.0 for presence). Must not be a "
+                                                        "text/label column."},
                         "max_records": {"type": "integer", "default": 5000},
                         "bounds_policy": {"type": "string", "enum": ["skip", "clip", "fail"], "default": "skip"},
                         "metadata": {"type": "object"},
@@ -3864,6 +3885,12 @@ finally:
                         evaluate[key] = kg_record[key]
                 phase_records["evaluate"] = evaluate
                 duplicate_rejected = not admitted_to_kg
+                # Record the ACTUAL KG-admission outcome (True only when a layer
+                # entered the graph — not a dedup-duplicate or guard-reject) so
+                # finalize_episode can enforce "admitted ⇒ episode success".
+                # compute_reward only sees the scorer verdict, which the
+                # survey-phase bypass overrides, so this is the truthful signal.
+                ctx.episode_context["layer_admitted_to_kg"] = bool(admitted_to_kg)
                 if (
                     not admitted_to_kg
                     and kg_record.get("admission_tier") == "guard_rejected"
@@ -4952,6 +4979,29 @@ finally:
                 },
             )
 
+    @staticmethod
+    def _enforce_admission_success(
+        reward: TaskReward, episode_context: dict[str, Any]
+    ) -> TaskReward:
+        """Invariant: an episode that lands a layer in the KG is a SUCCESS.
+
+        ``compute_reward`` derives success from the scorer verdict
+        (``final.admitted``), but the survey-phase bypass admits distributed
+        layers the scorer rejected (``admitted=False``, positive BIC). The
+        actual KG-admission outcome is recorded by ``_exec_submit_rewrite`` as
+        ``episode_context["layer_admitted_to_kg"]``; when a layer truly entered
+        the graph, force ``success=True`` so successful episodes are a SUPERSET
+        of episodes that admit to the graph. Reward ``value`` is preserved (the
+        scorer's reward magnitude and the success flag are separate signals).
+        """
+        if episode_context.get("layer_admitted_to_kg") and not reward.success:
+            return TaskReward(
+                value=reward.value,
+                success=True,
+                breakdown={**(reward.breakdown or {}), "admitted_to_kg_forced_success": True},
+            )
+        return reward
+
     def finalize_episode(
         self,
         containers: list[Container],
@@ -4967,6 +5017,10 @@ finally:
                 containers, episode_context, artifacts, private_context=private_context
             )
             reward = self.compute_reward(initial, final, artifacts)
+            # Enforce admitted ⇒ success BEFORE breakdown is snapshotted below,
+            # so a survey-bypass admit is recorded as a successful episode
+            # (and its trajectory becomes SFT-eligible via training_success).
+            reward = self._enforce_admission_success(reward, episode_context)
             breakdown = dict(reward.breakdown or {})
             # The framework's max_bootstrap_episodes guard inspects
             # task_breakdown["bootstrap_active"] (src/execution/generation.py).
@@ -6771,6 +6825,16 @@ finally:
         successes but do not flood the admitted pool.
         """
         kg_path = Path(kg_dir)
+        # Phantom-record guard: a degenerate candidate whose layer never
+        # materialized (empty/None layer_name => no .npy to promote) must not
+        # write a KG experiment record. Such empty-layer_name rows polluted
+        # experiments.jsonl (and the diversity/pool reads) in the 2026-06-03 run.
+        # The persist call site passes ``layer_name=feature_layer_name or None``,
+        # so a falsy layer_name is exactly the degenerate signal.
+        if not (isinstance(layer_name, str) and layer_name):
+            kg_record["admission_tier"] = "guard_rejected"
+            kg_record["first_root_rejection_reason"] = "degenerate_empty_layer"
+            return False
         fp = self._fingerprint(parents, hypothesis)
         candidate_values = None
         if (

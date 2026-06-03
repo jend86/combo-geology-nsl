@@ -207,6 +207,31 @@ def test_second_root_with_positive_bic_admits_in_survey(tmp_path: Path) -> None:
     assert (store_dir / "admitted" / "layers" / f"{layer_name}.npy").exists()
 
 
+def test_empty_layer_name_is_not_persisted_no_phantom(tmp_path: Path) -> None:
+    # Phantom-record guard: a degenerate candidate whose layer never materialized
+    # (no layer_name) must NOT write a KG experiment record. In the 2026-06-03 run
+    # two such empty-layer_name phantoms reached experiments.jsonl and polluted the
+    # diversity/pool reads. _admit_with_dedup is the chokepoint (it otherwise writes
+    # unconditionally when no candidate .npy is present).
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    record = _first_root_record("exp_phantom", "")  # empty layer_name
+
+    admitted = task._admit_with_dedup(
+        kg_dir,
+        record,
+        parents=[],
+        hypothesis="phantom degenerate layer",
+        scratch_dir=None,
+        admitted_dir=None,
+        layer_name=None,  # call site passes `feature_layer_name or None`
+        seed_phase=True,
+    )
+
+    assert admitted is False
+    assert not (kg_dir / "experiments.jsonl").exists()
+
+
 def test_distributed_uniform_multi_op_first_root_admits(tmp_path: Path) -> None:
     # Approach 1 relaxation: a multi-op, UNIFORM-valued distributed root is a
     # fine seed and must admit (this exact shape deadlocked the prior run).
