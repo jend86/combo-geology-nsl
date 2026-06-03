@@ -11,8 +11,8 @@ services:
 
   vfm:
     build:
-      context: ../..
-      dockerfile: docker/feature-hypothesis-compose/Dockerfile.vfm
+      context: ../../..
+      dockerfile: NSL2-geology-task/docker/feature-hypothesis-compose/Dockerfile.vfm
     restart: unless-stopped
     tty: true
     stdin_open: true

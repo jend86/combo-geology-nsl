@@ -94,7 +94,32 @@ _ROLE_SERVICE = {
 _SUMMARY_CODE_MAX_CHARS = 2_000
 _SUMMARY_RESULT_MAX_CHARS = 2_500
 _FEATURE_POINT_NUMERIC_COLUMNS = {"longitude", "latitude", "depth_m", "value"}
+_FEATURE_GEOMETRY_NUMERIC_COLUMNS = {
+    "longitude", "latitude", "depth_m", "radius_m",
+    "start_longitude", "start_latitude", "start_depth_m",
+    "end_longitude", "end_latitude", "end_depth_m", "width_m",
+    "lon_min", "lat_min", "depth_min_m",
+    "lon_max", "lat_max", "depth_max_m", "value",
+}
 _VALID_COORDINATE_SOURCES = {"artifact", "geonames", "web", "creative_fallback"}
+
+
+def _ensure_voxel_features_mcp_path() -> str:
+    """Prefer the canonical sibling voxel-features-mcp package over src/ copies."""
+    import sys
+
+    vfm_path = str(Path(__file__).resolve().parent.parent.parent / "voxel-features-mcp")
+    if vfm_path in sys.path:
+        sys.path.remove(vfm_path)
+    sys.path.insert(0, vfm_path)
+
+    loaded = sys.modules.get("voxel_features")
+    loaded_file = str(getattr(loaded, "__file__", "")) if loaded is not None else ""
+    if loaded_file and vfm_path not in loaded_file:
+        for module_name in list(sys.modules):
+            if module_name == "voxel_features" or module_name.startswith("voxel_features."):
+                sys.modules.pop(module_name, None)
+    return vfm_path
 
 
 def _safe_artifact_component(value: Any) -> str:
@@ -1708,13 +1733,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
     @staticmethod
     def _prewarm_voxel_features() -> None:
         """Import voxel-features-mcp modules once, at task construction."""
-        import sys
-
-        vfm_path = str(
-            Path(__file__).resolve().parent.parent.parent / "voxel-features-mcp"
-        )
-        if vfm_path not in sys.path:
-            sys.path.append(vfm_path)
+        _ensure_voxel_features_mcp_path()
         try:
             import voxel_features.spatial  # noqa: F401
             import voxel_features.store  # noqa: F401
@@ -2031,14 +2050,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Creates artifact outputs: top-level DataFrames/arrays are auto-saved, and files\n"
                         "     written under /workspace/out are collected as artifacts.\n"
                         "   - KEY DELIVERABLE (the spatial spec): when your analysis localizes the feature, build a\n"
-                        "     pandas DataFrame named EXACTLY `feature_points` with EXACTLY these columns:\n"
-                        "     longitude, latitude, depth_m, value, coordinate_source -- ONE ROW PER LOCATION the\n"
-                        "     feature occupies (every located prospect/contact/sample your analysis supports), NOT a\n"
-                        "     single representative point. It is auto-saved as an artifact for the next phase. 'value'\n"
-                        "     carries the per-location quantity (concentration, probability, score); 'coordinate_source'\n"
-                        "     is 'artifact' when the coordinate came from the dataset, else 'geonames'/'web'/\n"
-                        "     'creative_fallback'. The next phase maps this table directly to voxels. (This is a data\n"
-                        "     table, not voxel creation.)\n"
+                        "     pandas DataFrame named EXACTLY `feature_geometry` for mixed geometry, with\n"
+                        "     geometry_kind plus the relevant coordinate columns. Common columns: record_id,\n"
+                        "     geometry_kind, value, coordinate_source, source_file, source_excerpt. Point columns:\n"
+                        "     longitude, latitude, depth_m, radius_m. Line columns: start_longitude, start_latitude,\n"
+                        "     start_depth_m, end_longitude, end_latitude, end_depth_m, width_m. Box columns:\n"
+                        "     lon_min, lat_min, depth_min_m, lon_max, lat_max, depth_max_m. For point-only output,\n"
+                        "     a DataFrame named EXACTLY `feature_points` with longitude, latitude, depth_m, value,\n"
+                        "     coordinate_source is still accepted. Emit ONE ROW PER LOCATION/VOLUME the feature\n"
+                        "     occupies, NOT a single representative point. This is a data table, not voxel creation.\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -2082,11 +2102,12 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "🚨 CRITICAL: You are NOT in analysis mode. Your role is now to convert existing analysis artifacts into spatial feature commands as best you can.\n"
                         "The system automatically maps these to a voxel grid.\n\n"
                         "1. Call get_experiment_summary() to get hypothesis, data_spec, and analysis results\n"
-                        "1b. PRIMARY PATH -- if it returns feature_points (the Code phase's table), that IS your\n"
-                        "    spatial spec: call spatial_add_point ONCE PER ROW, passing that row's longitude,\n"
-                        "    latitude, depth_m, value, and coordinate_source, all under ONE shared layer name. Emit\n"
-                        "    every row -- do NOT collapse them to a single point. Then go to scoring (step 5). Use the\n"
-                        "    steps below only for locations feature_points does not cover, or if it is empty.\n"
+                        "1b. PRIMARY PATH -- if it returns feature_geometry or feature_points, that artifact IS your\n"
+                        "    spatial spec: call spatial_upsert_geometry_batch(name='shared_layer_name', artifact_name='auto')\n"
+                        "    once, then go to scoring (step 5). The batch tool reads the current episode's artifact\n"
+                        "    and materializes every row under ONE shared layer name. Do NOT collapse rows into a\n"
+                        "    single point. Use the steps below only for locations the artifact does not cover, or if\n"
+                        "    it is empty.\n"
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
@@ -2094,6 +2115,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
                         "   **For geological structures (faults, anticlines, basins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
+
+                        "   **For areal/volumetric extents with depth control:**\n"
+                        "   spatial_add_box(name='string', min_longitude=float, min_latitude=float, min_depth_m=float, max_longitude=float, max_latitude=float, max_depth_m=float, value=float)\n\n"
                         "   **For text-based locations without coordinates:**\n"
                         "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
                         "   2. Use search tools as needed (no fixed call budget):\n"
@@ -2115,7 +2139,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   Example workflow:\n"
                         "   1. spatial_add_point(name='name', ...)\n"
                         "   2. spatial_add_line(name='name', ...)\n"
-                        "   3. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
+                        "   3. spatial_upsert_geometry_batch(name='name', artifact_name='auto')\n"
+                        "   4. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
                         "Focus on regional geological intelligence for Kazakhstan basin analysis!"
                     ),
@@ -2123,8 +2148,10 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     inherit_all_capabilities=False,
                     capabilities=(
                         "get_experiment_summary",
+                        "spatial_upsert_geometry_batch",
                         "spatial_add_point",
                         "spatial_add_line",
+                        "spatial_add_box",
                         "spatial_query_region",
                         "spatial_coord_to_voxel",
                         "spatial_get_operations_log",
@@ -2401,6 +2428,41 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             ),
             # Spatial tool capabilities
             Capability(
+                name="spatial_upsert_geometry_batch",
+                description=(
+                    "Read the current episode's feature_geometry or feature_points artifact "
+                    "and materialize point/line/box records into one voxel layer in one call."
+                ),
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "artifact_name": {
+                            "type": "string",
+                            "default": "auto",
+                            "description": "Artifact to read; auto prefers feature_geometry over feature_points",
+                        },
+                        "artifact_format": {
+                            "type": "string",
+                            "enum": ["auto", "csv"],
+                            "default": "auto",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["replace_layer", "accumulate_layer"],
+                            "default": "replace_layer",
+                        },
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
+                        "value_column": {"type": "string", "default": "value"},
+                        "max_records": {"type": "integer", "default": 5000},
+                        "bounds_policy": {"type": "string", "enum": ["skip", "clip", "fail"], "default": "skip"},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Capability(
                 name="spatial_add_point",
                 description="Add a point feature at geographic coordinates with radius of effect.",
                 schema={
@@ -2442,6 +2504,31 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     },
                     "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
                                 "end_longitude", "end_latitude", "end_depth_m", "value"],
+                },
+            ),
+            Capability(
+                name="spatial_add_box",
+                description="Add an axis-aligned box feature with explicit depth bounds.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "min_longitude": {"type": "number", "description": "Minimum longitude in degrees"},
+                        "min_latitude": {"type": "number", "description": "Minimum latitude in degrees"},
+                        "min_depth_m": {"type": "number", "description": "Minimum depth in meters"},
+                        "max_longitude": {"type": "number", "description": "Maximum longitude in degrees"},
+                        "max_latitude": {"type": "number", "description": "Maximum latitude in degrees"},
+                        "max_depth_m": {"type": "number", "description": "Maximum depth in meters"},
+                        "value": {"type": "number", "description": "Feature value"},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "coordinate_source": {"type": "string", "enum": sorted(_VALID_COORDINATE_SOURCES)},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": [
+                        "name", "min_longitude", "min_latitude", "min_depth_m",
+                        "max_longitude", "max_latitude", "max_depth_m", "value",
+                    ],
                 },
             ),
             Capability(
@@ -3082,6 +3169,131 @@ except Exception as user_code_error:
         return rows, truncated
 
     @staticmethod
+    def _resolve_geometry_artifact_path(
+        artifact_files,
+        artifact_directory,
+        *,
+        artifact_name: str = "auto",
+    ) -> str | None:
+        import os as _os
+        import re as _re
+
+        artifact_name = str(artifact_name or "auto").strip() or "auto"
+
+        def _existing_path(candidate) -> str | None:
+            if candidate is None:
+                return None
+            text = str(candidate)
+            if _os.path.exists(text):
+                return text
+            if artifact_directory:
+                joined = _os.path.join(artifact_directory, _os.path.basename(text))
+                if _os.path.exists(joined):
+                    return joined
+            return None
+
+        if artifact_name != "auto":
+            path = _existing_path(artifact_name)
+            if path:
+                return path
+            if artifact_directory:
+                for suffix in ("", ".csv", "_dataframe.csv"):
+                    path = _existing_path(_os.path.join(artifact_directory, artifact_name + suffix))
+                    if path:
+                        return path
+            return None
+
+        patterns = (
+            _re.compile(r"feature_geometry(_dataframe)?\.csv"),
+            _re.compile(r"feature_points(_dataframe)?\.csv"),
+        )
+        for pattern in patterns:
+            for f in artifact_files or []:
+                if pattern.fullmatch(_os.path.basename(str(f))):
+                    path = _existing_path(f)
+                    if path:
+                        return path
+            if artifact_directory:
+                names = (
+                    ("feature_geometry.csv", "feature_geometry_dataframe.csv")
+                    if "geometry" in pattern.pattern
+                    else ("feature_points.csv", "feature_points_dataframe.csv")
+                )
+                for name in names:
+                    path = _existing_path(_os.path.join(artifact_directory, name))
+                    if path:
+                        return path
+        return None
+
+    @staticmethod
+    def _load_geometry_records(
+        artifact_files,
+        artifact_directory,
+        *,
+        artifact_name: str = "auto",
+        max_records: int = 5000,
+    ) -> tuple[list[dict], bool, int, str]:
+        """Read mixed geometry rows, preferring feature_geometry over legacy feature_points."""
+        import csv as _csv
+        import os as _os
+
+        path = FeatureHypothesisKazakhstanTask._resolve_geometry_artifact_path(
+            artifact_files,
+            artifact_directory,
+            artifact_name=artifact_name,
+        )
+        if path is None:
+            return [], False, 0, ""
+
+        legacy_points = _os.path.basename(path) in {
+            "feature_points.csv",
+            "feature_points_dataframe.csv",
+        }
+        rows: list[dict] = []
+        total_count = 0
+        truncated = False
+        try:
+            with open(path, newline="") as fh:
+                for row in _csv.DictReader(fh):
+                    total_count += 1
+                    if len(rows) >= max_records:
+                        truncated = True
+                        continue
+                    rows.append(
+                        FeatureHypothesisKazakhstanTask._coerce_geometry_record_row(
+                            row,
+                            legacy_points=legacy_points,
+                        )
+                    )
+        except Exception:
+            return [], False, 0, ""
+        return rows, truncated, total_count, path
+
+    @staticmethod
+    def _coerce_geometry_record_row(row: dict, *, legacy_points: bool = False) -> dict:
+        coerced = {}
+        for key, value in dict(row).items():
+            if key is None:
+                continue
+            clean_key = str(key).strip()
+            clean_value = value.strip() if isinstance(value, str) else value
+            if clean_value == "":
+                continue
+            if clean_key in _FEATURE_GEOMETRY_NUMERIC_COLUMNS:
+                try:
+                    coerced[clean_key] = float(clean_value)
+                except (TypeError, ValueError):
+                    coerced[clean_key] = clean_value
+            else:
+                coerced[clean_key] = clean_value
+        if legacy_points:
+            coerced.setdefault("geometry_kind", "point")
+            coerced.setdefault("radius_m", 100.0)
+        else:
+            coerced["geometry_kind"] = str(coerced.get("geometry_kind") or "point").strip().lower()
+        return coerced
+
+    @staticmethod
     def _coerce_feature_point_row(row: dict) -> dict:
         coerced = {}
         for key, value in dict(row).items():
@@ -3105,8 +3317,8 @@ except Exception as user_code_error:
     ) -> dict[str, Any]:
         resolved = dict(args)
         metadata = resolved.get("metadata") if isinstance(resolved.get("metadata"), dict) else {}
-        source_file = str(metadata.get("source_file") or "").strip()
-        source_excerpt = str(metadata.get("source_excerpt") or "").strip()
+        source_file = str(resolved.get("source_file") or metadata.get("source_file") or "").strip()
+        source_excerpt = str(resolved.get("source_excerpt") or metadata.get("source_excerpt") or "").strip()
         explicit_source = str(resolved.get("coordinate_source") or "").strip()
         last_search = episode_context.get("last_coordinate_search")
 
@@ -3147,6 +3359,11 @@ except Exception as user_code_error:
         feature_points, feature_points_truncated = self._load_feature_points(
             artifact_files, code.get("artifact_directory", "")
         )
+        feature_geometry, feature_geometry_truncated, feature_geometry_count, _ = self._load_geometry_records(
+            artifact_files,
+            code.get("artifact_directory", ""),
+            max_records=2000,
+        )
 
         return CapabilityResult(
             "get_experiment_summary",
@@ -3163,6 +3380,9 @@ except Exception as user_code_error:
                 "feature_points": feature_points,
                 "feature_points_count": len(feature_points),
                 "feature_points_truncated": feature_points_truncated,
+                "feature_geometry": feature_geometry,
+                "feature_geometry_count": feature_geometry_count,
+                "feature_geometry_truncated": feature_geometry_truncated,
                 "feature_layer_name": translate.get("feature_layer_name", ""),
                 "dtype": translate.get("dtype", "float"),
                 "bic_delta": evaluate.get("bic_delta"),
@@ -3496,26 +3716,20 @@ finally:
         # See ``_should_persist_to_kg`` for the gate semantics, including
         # the stage_completed string allowlist.
         #
-        # The first _EARLY_ROOT_COUNT admits seed the KG and bypass the
-        # co-location scorer's verdict (it rejects distributed layers at
-        # supports distinct from the seed). Window = admitted layers BEFORE
-        # this one; no-op once the pool already holds >= K. The geometry/
-        # provenance floor in _admit_with_dedup is the real quality gate.
-        early_root_pool_size = 0
-        if store_dir:
-            try:
-                early_root_pool_size = sum(
-                    1 for _ in (Path(store_dir) / "admitted" / "layers").glob("*.npy")
-                )
-            except OSError:
-                early_root_pool_size = 0
+        # Every SURVEY-phase admit seeds the KG and bypasses the co-location
+        # scorer's verdict (it rejects distributed layers at supports distinct
+        # from the seed). The survey blankets the basin so that by crossbreed
+        # there is enough co-location for the scorer to discriminate; in
+        # crossbreed the scorer governs again. The geometry/provenance floor in
+        # _admit_with_dedup is the real quality gate during the survey.
+        seed_phase = self._in_seed_phase(ctx.episode_context)
         both_stages_passed = self._should_persist_to_kg(
             masking_test_passed=masking_test_passed,
             admitted=admitted,
             bic_delta=bic_delta,
             stage_completed=stage_completed,
             admission_path=admission_path,
-            early_root=early_root_pool_size < self._EARLY_ROOT_COUNT,
+            seed_phase=seed_phase,
         )
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
@@ -3567,14 +3781,15 @@ finally:
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_completed": stage_completed,
                     "admission_path": admission_path,
-                    # True when this admit rode the early-root seed bypass
-                    # (scorer rejected it, but pool < K). Lets analysis separate
-                    # bypass-seeded roots from naturally BIC-passing admits.
-                    "early_root_bypass": bool(
-                        early_root_pool_size < self._EARLY_ROOT_COUNT
+                    "workflow_kind": ctx.episode_context.get("workflow_kind", "survey"),
+                    # True when this admit rode the survey-phase scorer bypass
+                    # (seed phase, and the scorer would otherwise have rejected
+                    # it). Lets analysis separate bypass-seeded survey roots from
+                    # naturally BIC-passing admits.
+                    "seed_phase_bypass": bool(
+                        seed_phase
                         and not (bic_delta is not None and bic_delta < 0)
                     ),
-                    "early_root_pool_size": early_root_pool_size,
                     "scoring_version": "two_stage_v2",
                     "proposal_evidence_tier": proposal_evidence_tier,
                     "self_assessment": self_assessment,
@@ -3625,6 +3840,7 @@ finally:
                     scratch_dir=scratch_dir,
                     admitted_dir=admitted_dir,
                     layer_name=feature_layer_name or None,
+                    seed_phase=seed_phase,
                 )
                 for key in (
                     "evidence_strength",
@@ -3935,11 +4151,7 @@ finally:
         
         try:
             # Import and call execution_results directly
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
+            _ensure_voxel_features_mcp_path()
                 
             from voxel_features.mcp.tools.execution_tools import execution_results
             
@@ -4008,11 +4220,7 @@ finally:
         consistent. Network errors surface as a non-fatal failed result.
         """
         try:
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
+            _ensure_voxel_features_mcp_path()
 
             from voxel_features.mcp.tools.search_tools import (
                 web_search_geological,
@@ -4067,11 +4275,7 @@ finally:
         
         try:
             # Add voxel-features-mcp to path
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
+            _ensure_voxel_features_mcp_path()
             
             # Import execution tools directly
             from voxel_features.mcp.tools.execution_tools import (
@@ -4175,12 +4379,10 @@ finally:
         print(f"🔧 DEBUG: Args: {args}")
         
         # Set up environment for spatial operations
-        import sys
         from pathlib import Path
         
         # Add voxel-features-mcp to path
-        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-        sys.path.append(vfm_path)
+        vfm_path = _ensure_voxel_features_mcp_path()
         print(f"🔧 DEBUG: Added path: {vfm_path}")
         
         try:
@@ -4189,7 +4391,8 @@ finally:
             from voxel_features.spatial import SpatialVoxelStore
             from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.spatial_tools import (
-                spatial_add_point, spatial_add_line, spatial_query_region,
+                spatial_add_point, spatial_add_line, spatial_add_box,
+                spatial_upsert_geometry_batch, spatial_query_region,
                 spatial_coord_to_voxel, spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
@@ -4227,9 +4430,54 @@ finally:
             print(f"🔧 DEBUG: Grid bounds: lon {store.grid.origin[0]:.3f}-{store.grid.maximum[0]:.3f}, lat {store.grid.origin[1]:.3f}-{store.grid.maximum[1]:.3f}, depth {store.grid.origin[2]:.1f}-{store.grid.maximum[2]:.1f}")
 
             args = dict(args)
-            if capability_name in ["spatial_add_point", "spatial_add_line"]:
+            batch_total_count: int | None = None
+            batch_loaded_count: int | None = None
+            if capability_name in ["spatial_add_point", "spatial_add_line", "spatial_add_box"]:
                 args = self._prepare_spatial_provenance_args(args, ctx.episode_context)
-             
+            elif capability_name == "spatial_upsert_geometry_batch":
+                batch_args = dict(args)
+                artifact_name = str(batch_args.pop("artifact_name", "auto") or "auto")
+                batch_args.pop("artifact_format", None)
+                value_column = str(batch_args.pop("value_column", "value") or "value")
+                max_records = int(batch_args.get("max_records", 5000) or 5000)
+                code_record = ctx.episode_context.get("phase_records", {}).get("code", {})
+                artifact_files = code_record.get("artifact_files", [])
+                if not isinstance(artifact_files, list):
+                    artifact_files = []
+                records, truncated, total_count, artifact_path = self._load_geometry_records(
+                    artifact_files,
+                    code_record.get("artifact_directory", ""),
+                    artifact_name=artifact_name,
+                    max_records=max_records,
+                )
+                if not records:
+                    return CapabilityResult(
+                        capability_name,
+                        success=False,
+                        error="No feature_geometry or feature_points artifact rows available for batch spatial materialization",
+                    )
+                batch_total_count = total_count
+                batch_loaded_count = len(records)
+                prepared_records = []
+                for record in records:
+                    rec = dict(record)
+                    if value_column != "value" and "value" not in rec and value_column in rec:
+                        rec["value"] = rec[value_column]
+                    if artifact_path and not rec.get("source_file"):
+                        rec["source_file"] = Path(artifact_path).name
+                    prepared_records.append(
+                        self._prepare_spatial_provenance_args(rec, ctx.episode_context)
+                    )
+                batch_args["records"] = prepared_records
+                batch_args["max_records"] = max_records
+                batch_args["metadata"] = {
+                    **(batch_args.get("metadata") if isinstance(batch_args.get("metadata"), dict) else {}),
+                    "artifact_path": artifact_path,
+                    "artifact_rows_total": total_count,
+                    "artifact_rows_truncated": truncated,
+                }
+                args = batch_args
+              
             # Validate coordinates if this is a spatial operation with coordinates
             if capability_name in ["spatial_add_point", "spatial_add_line"]:
                 if "longitude" in args and "latitude" in args:
@@ -4253,6 +4501,19 @@ finally:
             elif capability_name == "spatial_add_line":
                 print("🔧 DEBUG: Calling spatial_add_line...")
                 result = spatial_add_line(store, **args)
+            elif capability_name == "spatial_add_box":
+                print("🔧 DEBUG: Calling spatial_add_box...")
+                result = spatial_add_box(store, **args)
+            elif capability_name == "spatial_upsert_geometry_batch":
+                print("🔧 DEBUG: Calling spatial_upsert_geometry_batch...")
+                result = spatial_upsert_geometry_batch(store, **args)
+                if result.get("success") and batch_total_count is not None and batch_loaded_count is not None:
+                    extra_skipped = max(0, batch_total_count - batch_loaded_count)
+                    if extra_skipped:
+                        result["records_seen"] = batch_total_count
+                        result["records_skipped"] = result.get("records_skipped", 0) + extra_skipped
+                        warnings = result.setdefault("warnings", [])
+                        warnings.append(f"Skipped {extra_skipped} artifact rows beyond max_records")
             elif capability_name == "spatial_query_region":
                 print("🔧 DEBUG: Calling spatial_query_region...")
                 result = spatial_query_region(store, **args)
@@ -4295,6 +4556,13 @@ finally:
                     source: sum(1 for op in layer_ops if op.get("coordinate_source") == source)
                     for source in sorted({str(op.get("coordinate_source") or "unknown") for op in layer_ops})
                 }
+                translate_record["geometry_kind_counts"] = {
+                    kind: sum(1 for op in layer_ops if op.get("operation_type") == kind)
+                    for kind in sorted({str(op.get("operation_type") or "unknown") for op in layer_ops})
+                }
+                if "records_applied" in result:
+                    translate_record["bulk_geometry_records"] = result.get("records_applied")
+                    translate_record["bulk_geometry_skipped"] = result.get("records_skipped", 0)
             
             # Return result
             return CapabilityResult(
@@ -4326,12 +4594,10 @@ finally:
         print(f"🎯 DEBUG: Args: {args}")
         
         # Set up environment for scoring operations
-        import sys
         from pathlib import Path
         
         # Add voxel-features-mcp to path
-        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-        sys.path.append(vfm_path)
+        vfm_path = _ensure_voxel_features_mcp_path()
         print(f"🎯 DEBUG: Added path: {vfm_path}")
         
         try:
@@ -5495,32 +5761,33 @@ finally:
         bic_delta: float | None,
         stage_completed: str,
         admission_path: str | None = None,
-        early_root: bool = False,
+        seed_phase: bool = False,
     ) -> bool:
         """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
         experiments enter the kg pool.
 
-        Normal path — all four conditions must hold:
+        Normal path (crossbreed) — all four conditions must hold:
           - ``masking_test_passed`` — stage 1 predictive-capacity check.
           - ``admitted`` — stage 2 scorer admitted the layer (bic_delta < 0).
           - ``bic_delta is not None and bic_delta < 0`` — defense in depth.
           - ``stage_completed`` in the allowlist — proves stage 2 actually ran
             (vs. partial / aborted scoring).
 
-        ``early_root`` (the first ``_EARLY_ROOT_COUNT`` admits, decided by pool
-        size at the call site) bypasses the Stage-1/Stage-2 *verdicts*. The
+        ``seed_phase`` (``workflow_kind == "survey"``, decided at the call site
+        via ``_in_seed_phase``) bypasses the Stage-1/Stage-2 *verdicts*. The
         co-location objective rejects distributed layers at supports distinct
         from the seed (live: post-seed candidates scored relative_mae~=1.0,
-        bic_delta~=+3.38), so the first K seed the KG on completed scoring
-        alone. The only invariant kept is the ``stage_completed`` allowlist, so
-        aborted/partial episodes can never seed; the geometry/provenance floor
-        in ``_admit_with_dedup`` (``_early_root_admission_ok``) is the real
-        quality gate. ``first_layer_auto`` (empty pool, no scoring possible)
-        keeps its own bypass below.
+        bic_delta~=+3.38), so the whole survey admits on completed scoring
+        alone — blanketing the basin so that by crossbreed there is enough
+        co-location for the scorer to discriminate. The only invariant kept is
+        the ``stage_completed`` allowlist, so aborted/partial episodes can never
+        seed; the geometry/provenance floor in ``_admit_with_dedup``
+        (``_seed_phase_admission_ok``) is the real quality gate. ``first_layer_auto``
+        (empty pool, no scoring possible) keeps its own bypass below.
         """
         if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
             return True
-        if early_root:
+        if seed_phase:
             return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
         if not bool(masking_test_passed):
             return False
@@ -5964,42 +6231,45 @@ finally:
     _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
 
-    # The first K admits SEED the KG (and the very first rides a BIC bypass), so
-    # they are held to a GEOMETRY/PROVENANCE floor a single arbitrary central
-    # blob cannot clear. See docs/design/scoring-colocation-monoculture-2026-06-03
-    # (Approach 1 + B): the floor rejects only the single-op central blob that
-    # drives the co-location monoculture and all-creative_fallback anchors. It
-    # deliberately does NOT gate value uniformity / entropy — a *distributed*
-    # uniform layer is a perfectly good seed (gating it deadlocked the prior run:
-    # the agent reliably places distributed real coordinates but rarely grades
-    # values, so an entropy floor rejected every candidate and the KG never
-    # seeded). Extended from the literal first root to the first
-    # ``_EARLY_ROOT_COUNT`` admits so the early KG can't fill with trivial
-    # co-located blobs either. Re-rollable: a false reject only costs a retry.
-    _EARLY_ROOT_COUNT = 5
+    @staticmethod
+    def _in_seed_phase(episode_context: dict[str, Any]) -> bool:
+        """True for SURVEY-phase episodes (``workflow_kind == "survey"``), which
+        seed the KG via the scorer bypass + geometry/provenance floor.
+
+        Defaults to seeding when ``workflow_kind`` is absent — the task reads it
+        as ``"survey"`` everywhere else, and the floor still guards. Crossbreed
+        episodes always stamp ``workflow_kind == "crossbreed"`` explicitly.
+        """
+        return episode_context.get("workflow_kind", "survey") == "survey"
 
     @classmethod
-    def _early_root_admission_ok(cls, kg_record: dict[str, Any], pool_size: int) -> bool:
-        """Geometry/provenance floor for the first ``_EARLY_ROOT_COUNT`` admits.
+    def _seed_phase_admission_ok(cls, kg_record: dict[str, Any], seed_phase: bool) -> bool:
+        """Geometry/provenance floor for SURVEY-phase admits.
 
-        ``pool_size`` is the number of layers already in the admitted pool. Once
-        it reaches ``_EARLY_ROOT_COUNT`` the gate is a no-op (returns True) —
-        later layers keep the generous admission policy where single-op /
-        uniform / low-entropy are telemetry only.
+        Every survey admit seeds the KG (and rides the scorer bypass), so the
+        whole survey is held to a floor a single arbitrary central blob cannot
+        clear. See docs/design/scoring-colocation-monoculture-2026-06-03.
 
-        For an early root (``pool_size < _EARLY_ROOT_COUNT``) reject only:
+        When ``seed_phase`` is False (crossbreed) the gate is a no-op (returns
+        True) — the scorer governs and single-op / uniform / low-entropy are
+        telemetry only.
+
+        For a survey seed reject only:
           - all-creative_fallback, regardless of the
             allow_creative_fallback_admission override (the seed must rest on
             real provenance), and
           - a single spatial op (the single central-blob anchor that drives the
             co-location monoculture).
 
-        Value uniformity / entropy are deliberately NOT gated. Stamps
+        Value uniformity / entropy are deliberately NOT gated — a *distributed*
+        uniform layer is a perfectly good seed (gating it deadlocked the prior
+        run: the agent reliably places distributed real coordinates but rarely
+        grades values, so an entropy floor rejected every candidate). Stamps
         ``first_root_rejection_reason`` for audit. Must run *after*
         ``_stamp_candidate_provenance`` and ``_stamp_candidate_triviality`` so
         the fields it reads are populated.
         """
-        if pool_size >= cls._EARLY_ROOT_COUNT:
+        if not seed_phase:
             kg_record["first_root_rejection_reason"] = "none"
             return True
 
@@ -6437,9 +6707,12 @@ finally:
                     operations = [dict(row) for row in rows]
 
         source_counts: dict[str, int] = {}
+        geometry_kind_counts: dict[str, int] = {}
         for op in operations:
             source = str(op.get("coordinate_source") or "creative_fallback")
             source_counts[source] = source_counts.get(source, 0) + 1
+            kind = str(op.get("operation_type") or "unknown")
+            geometry_kind_counts[kind] = geometry_kind_counts.get(kind, 0) + 1
         fallback_count = source_counts.get("creative_fallback", 0)
         all_creative_fallback = bool(operations) and fallback_count == len(operations)
         override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
@@ -6458,6 +6731,7 @@ finally:
         kg_record.update({
             "spatial_operation_provenance_count": len(operations),
             "coordinate_source_counts": source_counts,
+            "geometry_kind_counts": geometry_kind_counts,
             "spatial_operation_support_hash": operation_hash if operations else None,
             "spatial_operation_signatures": operation_signatures,
             "translate_fallback_used": fallback_count > 0,
@@ -6478,9 +6752,14 @@ finally:
         scratch_dir: Path | str | None = None,
         admitted_dir: Path | str | None = None,
         layer_name: str | None = None,
+        seed_phase: bool = False,
     ) -> bool:
         """Append kg_record to experiments.jsonl iff (parents, hypothesis)
         is unseen. Returns True if newly admitted, False on duplicate.
+
+        ``seed_phase`` (``workflow_kind == "survey"``) enforces the
+        geometry/provenance floor (``_seed_phase_admission_ok``); in crossbreed
+        the floor is a no-op and the scorer governs.
 
         When ``scratch_dir`` / ``admitted_dir`` / ``layer_name`` are all
         supplied, the candidate's ``.npy`` is *promoted* from scratch into
@@ -6523,21 +6802,11 @@ finally:
                 )
                 self._stamp_candidate_triviality(kg_record, values=candidate_values)
                 emptiness_passed = not bool(kg_record.get("declared_nothing", False))
-                # The first _EARLY_ROOT_COUNT admits seed the KG: hold them to a
-                # geometry/provenance floor (override-proof against
-                # creative_fallback; reject the single-op central blob that
-                # drives co-location monoculture). No-op once the pool already
-                # holds >= K layers. pool_size = admitted layers BEFORE this one
-                # (promotion happens in on_admit, after this guard passes).
-                pool_size = 0
-                if admitted_dir is not None:
-                    try:
-                        pool_size = sum(
-                            1 for _ in (Path(admitted_dir) / "layers").glob("*.npy")
-                        )
-                    except OSError:
-                        pool_size = 0
-                first_root_passed = self._early_root_admission_ok(kg_record, pool_size)
+                # Survey-phase admits seed the KG: hold them to a geometry/
+                # provenance floor (override-proof against creative_fallback;
+                # reject the single-op central blob that drives co-location
+                # monoculture). No-op in crossbreed, where the scorer governs.
+                first_root_passed = self._seed_phase_admission_ok(kg_record, seed_phase)
                 if not (
                     novelty_passed
                     and provenance_passed

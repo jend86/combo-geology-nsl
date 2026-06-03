@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
+import uuid
 from pathlib import Path
 from typing import Any, Literal
 
@@ -82,6 +83,9 @@ class SpatialVoxelStore(VoxelStore):
             ("source_file", "TEXT"),
             ("source_excerpt", "TEXT"),
             ("coordinate_source", "TEXT NOT NULL DEFAULT 'creative_fallback'"),
+            ("operation_group_id", "TEXT"),
+            ("record_id", "TEXT"),
+            ("affected_voxels", "INTEGER"),
         ):
             try:
                 cursor.execute(f"ALTER TABLE spatial_operations ADD COLUMN {column_name} {column_type}")
@@ -250,6 +254,129 @@ class SpatialVoxelStore(VoxelStore):
                 scratch_npy.unlink()
             return self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
 
+    @staticmethod
+    def _combine_values(current, value: float, combination_rule: str):
+        if combination_rule == "replace":
+            return value
+        if combination_rule == "max":
+            return np.maximum(current, value)
+        if combination_rule == "add":
+            return current + value
+        if combination_rule == "mean":
+            return (current + value) / 2
+        raise ValueError(f"Unsupported combination_rule: {combination_rule}")
+
+    def _apply_region_into(
+        self,
+        layer_values: np.ndarray,
+        region,
+        value: float,
+        combination_rule: str,
+    ) -> int:
+        """Fold a voxel list/set or slice tuple into an in-memory layer array."""
+        if isinstance(region, tuple) and len(region) == 3 and all(isinstance(s, slice) for s in region):
+            before = layer_values[region]
+            affected = int(before.size)
+            if affected == 0:
+                return 0
+            layer_values[region] = self._combine_values(before, value, combination_rule)
+            return affected
+
+        voxels = list(region or [])
+        if not voxels:
+            return 0
+        xs, ys, zs = zip(*voxels)
+        if combination_rule == "replace":
+            layer_values[xs, ys, zs] = value
+        elif combination_rule == "max":
+            layer_values[xs, ys, zs] = np.maximum(layer_values[xs, ys, zs], value)
+        elif combination_rule == "add":
+            layer_values[xs, ys, zs] += value
+        elif combination_rule == "mean":
+            layer_values[xs, ys, zs] = (layer_values[xs, ys, zs] + value) / 2
+        else:
+            raise ValueError(f"Unsupported combination_rule: {combination_rule}")
+        return len(voxels)
+
+    def _coord_in_bounds(self, longitude: float, latitude: float, depth: float) -> bool:
+        grid = self.grid
+        return (
+            grid.origin[0] <= longitude <= grid.maximum[0]
+            and grid.origin[1] <= latitude <= grid.maximum[1]
+            and grid.origin[2] <= depth <= grid.maximum[2]
+        )
+
+    def _clamp_coord(self, longitude: float, latitude: float, depth: float) -> tuple[float, float, float]:
+        grid = self.grid
+        return (
+            max(grid.origin[0], min(float(longitude), grid.maximum[0])),
+            max(grid.origin[1], min(float(latitude), grid.maximum[1])),
+            max(grid.origin[2], min(float(depth), grid.maximum[2])),
+        )
+
+    def _box_region(
+        self,
+        min_longitude: float,
+        min_latitude: float,
+        min_depth_m: float,
+        max_longitude: float,
+        max_latitude: float,
+        max_depth_m: float,
+        *,
+        bounds_policy: Literal["skip", "clip", "fail"] = "clip",
+    ) -> tuple[slice, slice, slice] | None:
+        grid = self.grid
+        lon0, lon1 = sorted((float(min_longitude), float(max_longitude)))
+        lat0, lat1 = sorted((float(min_latitude), float(max_latitude)))
+        dep0, dep1 = sorted((float(min_depth_m), float(max_depth_m)))
+        values = (
+            (lon0, grid.origin[0], grid.maximum[0], "Longitude"),
+            (lon1, grid.origin[0], grid.maximum[0], "Longitude"),
+            (lat0, grid.origin[1], grid.maximum[1], "Latitude"),
+            (lat1, grid.origin[1], grid.maximum[1], "Latitude"),
+            (dep0, grid.origin[2], grid.maximum[2], "Depth"),
+            (dep1, grid.origin[2], grid.maximum[2], "Depth"),
+        )
+        outside = [(value, lower, upper, label) for value, lower, upper, label in values if value < lower or value > upper]
+        if outside:
+            if bounds_policy == "fail":
+                value, lower, upper, label = outside[0]
+                raise ValueError(f"{label} {value} outside grid bounds [{lower}, {upper}]")
+            if bounds_policy == "skip":
+                return None
+
+        # For clipping, no overlap means no voxels rather than a clamped point.
+        if lon1 < grid.origin[0] or lon0 > grid.maximum[0]:
+            return None
+        if lat1 < grid.origin[1] or lat0 > grid.maximum[1]:
+            return None
+        if dep1 < grid.origin[2] or dep0 > grid.maximum[2]:
+            return None
+
+        lon0, lat0, dep0 = self._clamp_coord(lon0, lat0, dep0)
+        lon1, lat1, dep1 = self._clamp_coord(lon1, lat1, dep1)
+        ix0, iy0, iz0 = self.coord_to_voxel_indices(lon0, lat0, dep0)
+        ix1, iy1, iz1 = self.coord_to_voxel_indices(lon1, lat1, dep1)
+        x0, x1 = sorted((ix0, ix1))
+        y0, y1 = sorted((iy0, iy1))
+        z0, z1 = sorted((iz0, iz1))
+        region = (
+            slice(x0, min(grid.shape[0], x1 + 1)),
+            slice(y0, min(grid.shape[1], y1 + 1)),
+            slice(z0, min(grid.shape[2], z1 + 1)),
+        )
+        if any((s.stop or 0) <= (s.start or 0) for s in region):
+            return None
+        return region
+
+    def _region_affected_voxels(self, region) -> int:
+        if isinstance(region, tuple) and len(region) == 3 and all(isinstance(s, slice) for s in region):
+            total = 1
+            for s in region:
+                total *= max(0, (s.stop or 0) - (s.start or 0))
+            return int(total)
+        return len(region or [])
+
     def add_point_feature(
         self,
         name: str,
@@ -390,6 +517,322 @@ class SpatialVoxelStore(VoxelStore):
                 "error": str(e),
                 "operation": "line_feature",
             }
+
+    def add_box_feature(
+        self,
+        name: str,
+        min_longitude: float,
+        min_latitude: float,
+        min_depth_m: float,
+        max_longitude: float,
+        max_latitude: float,
+        max_depth_m: float,
+        value: float,
+        dtype: Literal["float", "categorical", "boolean"] = "float",
+        combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+        source_file: str | None = None,
+        source_excerpt: str | None = None,
+        coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
+        **kwargs,
+    ) -> dict[str, Any]:
+        """Add an axis-aligned box feature, clipping partial OOB extents to the grid."""
+        try:
+            region = self._box_region(
+                min_longitude,
+                min_latitude,
+                min_depth_m,
+                max_longitude,
+                max_latitude,
+                max_depth_m,
+                bounds_policy="clip",
+            )
+            if region is None:
+                return {
+                    "success": False,
+                    "error": "Box does not overlap grid bounds",
+                    "operation": "box_feature",
+                }
+
+            affected_voxels = self._region_affected_voxels(region)
+            with _store_rmw_lock(self.store_path):
+                scratch_npy = self._layers_dir / f"{name}.npy"
+                if scratch_npy.exists():
+                    layer_values = np.load(scratch_npy).copy()
+                elif name in self.layer_names:
+                    layer_values = self.get_layer_values(name).copy()
+                else:
+                    layer_values = np.zeros(self.grid.shape, dtype=float)
+                self._apply_region_into(layer_values, region, value, combination_rule)
+                self._layers.pop(name, None)
+                if scratch_npy.exists():
+                    scratch_npy.unlink()
+                self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
+
+            coords_str = (
+                f"{min_longitude},{min_latitude},{min_depth_m};"
+                f"{max_longitude},{max_latitude},{max_depth_m}"
+            )
+            self._log_spatial_operation(
+                "box",
+                name,
+                coords_str,
+                f"value={value}",
+                source_file=source_file,
+                source_excerpt=source_excerpt,
+                coordinate_source=coordinate_source,
+                affected_voxels=affected_voxels,
+            )
+
+            return {
+                "success": True,
+                "operation": "box_feature",
+                "affected_voxels": affected_voxels,
+                "layer_name": name,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "operation": "box_feature",
+            }
+
+    def _record_region(
+        self,
+        record: dict[str, Any],
+        kind: str,
+        bounds_policy: Literal["skip", "clip", "fail"],
+    ):
+        if kind == "point":
+            lon = float(record["longitude"])
+            lat = float(record["latitude"])
+            depth = float(record["depth_m"])
+            if not self._coord_in_bounds(lon, lat, depth):
+                if bounds_policy == "fail":
+                    self.coord_to_voxel_indices(lon, lat, depth)
+                return None
+            return self.get_voxels_in_sphere(
+                lon,
+                lat,
+                depth,
+                float(record.get("radius_m", 100.0) or 100.0),
+            )
+        if kind == "line":
+            start = (
+                float(record["start_longitude"]),
+                float(record["start_latitude"]),
+                float(record["start_depth_m"]),
+            )
+            end = (
+                float(record["end_longitude"]),
+                float(record["end_latitude"]),
+                float(record["end_depth_m"]),
+            )
+            if not (self._coord_in_bounds(*start) and self._coord_in_bounds(*end)):
+                if bounds_policy == "fail":
+                    self.coord_to_voxel_indices(*start)
+                    self.coord_to_voxel_indices(*end)
+                if bounds_policy == "skip":
+                    return None
+                start = self._clamp_coord(*start)
+                end = self._clamp_coord(*end)
+            width_m = float(record.get("width_m", 50.0) or 50.0)
+            num_samples = max(10, int(np.linalg.norm(np.array(end) - np.array(start)) * 1000))
+            affected_voxels = set()
+            for i in range(num_samples):
+                t = i / (num_samples - 1)
+                lon = start[0] + t * (end[0] - start[0])
+                lat = start[1] + t * (end[1] - start[1])
+                depth = start[2] + t * (end[2] - start[2])
+                affected_voxels.update(self.get_voxels_in_sphere(lon, lat, depth, width_m / 2))
+            return affected_voxels
+        if kind == "box":
+            return self._box_region(
+                float(record["lon_min"]),
+                float(record["lat_min"]),
+                float(record["depth_min_m"]),
+                float(record["lon_max"]),
+                float(record["lat_max"]),
+                float(record["depth_max_m"]),
+                bounds_policy=bounds_policy,
+            )
+        raise ValueError(f"Unsupported geometry_kind: {kind}")
+
+    def _record_coordinates_and_parameters(
+        self,
+        record: dict[str, Any],
+        kind: str,
+        value: float,
+    ) -> tuple[str, str]:
+        if kind == "point":
+            coords = f"{record.get('longitude')},{record.get('latitude')},{record.get('depth_m')}"
+            params = f"radius_m={record.get('radius_m', 100.0)},value={value}"
+            return coords, params
+        if kind == "line":
+            coords = (
+                f"{record.get('start_longitude')},{record.get('start_latitude')},{record.get('start_depth_m')};"
+                f"{record.get('end_longitude')},{record.get('end_latitude')},{record.get('end_depth_m')}"
+            )
+            params = f"width_m={record.get('width_m', 50.0)},value={value}"
+            return coords, params
+        if kind == "box":
+            coords = (
+                f"{record.get('lon_min')},{record.get('lat_min')},{record.get('depth_min_m')};"
+                f"{record.get('lon_max')},{record.get('lat_max')},{record.get('depth_max_m')}"
+            )
+            return coords, f"value={value}"
+        return "", f"value={value}"
+
+    def add_geometry_batch(
+        self,
+        name: str,
+        records: list[dict[str, Any]],
+        *,
+        mode: Literal["replace_layer", "accumulate_layer"] = "replace_layer",
+        dtype: Literal["float", "categorical", "boolean"] = "float",
+        combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+        max_records: int = 5000,
+        bounds_policy: Literal["skip", "clip", "fail"] = "skip",
+        metadata: dict[str, Any] | None = None,
+        hypothesis_uri: str | None = None,
+        experiment_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Materialize point/line/box geometry records into one layer in one locked write."""
+        operation_group_id = uuid.uuid4().hex
+        records_seen = len(records or [])
+        warnings: list[str] = []
+        if mode not in {"replace_layer", "accumulate_layer"}:
+            return {"success": False, "operation": "geometry_batch", "error": f"Unsupported mode: {mode}"}
+        if bounds_policy not in {"skip", "clip", "fail"}:
+            return {
+                "success": False,
+                "operation": "geometry_batch",
+                "error": f"Unsupported bounds_policy: {bounds_policy}",
+            }
+
+        skipped_for_cap = max(0, records_seen - int(max_records))
+        batch_records = list(records or [])[: int(max_records)]
+        if skipped_for_cap:
+            warnings.append(f"Skipped {skipped_for_cap} records beyond max_records={max_records}")
+
+        try:
+            with _store_rmw_lock(self.store_path):
+                scratch_npy = self._layers_dir / f"{name}.npy"
+                if mode == "accumulate_layer" and scratch_npy.exists():
+                    layer_values = np.load(scratch_npy).copy()
+                elif mode == "accumulate_layer" and name in self.layer_names:
+                    layer_values = self.get_layer_values(name).copy()
+                else:
+                    layer_values = np.zeros(self.grid.shape, dtype=float)
+
+                applied_records: list[dict[str, Any]] = []
+                geometry_kind_counts: dict[str, int] = {}
+                coordinate_source_counts: dict[str, int] = {}
+                applied_values: list[float] = []
+                affected_total = 0
+
+                for idx, record in enumerate(batch_records):
+                    rec = dict(record or {})
+                    kind = str(rec.get("geometry_kind") or rec.get("geometry_type") or "point").strip().lower()
+                    record_id = str(rec.get("record_id") or idx)
+                    try:
+                        value = float(rec.get("value", 1.0))
+                        rule = str(rec.get("combination_rule") or combination_rule)
+                        region = self._record_region(rec, kind, bounds_policy)
+                        if region is None or self._region_affected_voxels(region) == 0:
+                            warnings.append(f"Skipped record {record_id}: outside grid bounds")
+                            continue
+                        affected = self._apply_region_into(layer_values, region, value, rule)
+                        if affected == 0:
+                            warnings.append(f"Skipped record {record_id}: affected no voxels")
+                            continue
+                        coords, params = self._record_coordinates_and_parameters(rec, kind, value)
+                        coordinate_source = str(rec.get("coordinate_source") or "creative_fallback")
+                        applied_records.append(
+                            {
+                                "kind": kind,
+                                "record_id": record_id,
+                                "coordinates": coords,
+                                "parameters": params,
+                                "source_file": rec.get("source_file") or None,
+                                "source_excerpt": rec.get("source_excerpt") or None,
+                                "coordinate_source": coordinate_source,
+                                "affected_voxels": affected,
+                            }
+                        )
+                        geometry_kind_counts[kind] = geometry_kind_counts.get(kind, 0) + 1
+                        coordinate_source_counts[coordinate_source] = coordinate_source_counts.get(coordinate_source, 0) + 1
+                        affected_total += affected
+                        applied_values.append(value)
+                    except Exception as exc:  # noqa: BLE001
+                        if bounds_policy == "fail":
+                            raise
+                        warnings.append(f"Skipped record {record_id}: {exc}")
+
+                with self._spatial_conn:
+                    if mode == "replace_layer":
+                        self._spatial_conn.execute(
+                            "DELETE FROM spatial_operations WHERE feature_name = ?",
+                            (name,),
+                        )
+                    self._layers.pop(name, None)
+                    if scratch_npy.exists():
+                        scratch_npy.unlink()
+                    self.add_layer(
+                        name=name,
+                        values=layer_values,
+                        dtype=dtype,
+                        metadata=metadata,
+                        hypothesis_uri=hypothesis_uri,
+                        experiment_id=experiment_id,
+                    )
+                    for applied in applied_records:
+                        self._log_spatial_operation(
+                            applied["kind"],
+                            name,
+                            applied["coordinates"],
+                            applied["parameters"],
+                            source_file=applied["source_file"],
+                            source_excerpt=applied["source_excerpt"],
+                            coordinate_source=applied["coordinate_source"],
+                            operation_group_id=operation_group_id,
+                            record_id=applied["record_id"],
+                            affected_voxels=applied["affected_voxels"],
+                            commit=False,
+                        )
+
+            nonzero_values = layer_values[layer_values != 0]
+            unique_values_approx = int(np.unique(nonzero_values).size) if nonzero_values.size else 0
+            return {
+                "success": True,
+                "operation": "geometry_batch",
+                "operation_group_id": operation_group_id,
+                "layer_name": name,
+                "records_seen": records_seen,
+                "records_applied": len(applied_records),
+                "records_skipped": records_seen - len(applied_records),
+                "affected_voxels": affected_total,
+                "geometry_kind_counts": dict(sorted(geometry_kind_counts.items())),
+                "coordinate_source_counts": dict(sorted(coordinate_source_counts.items())),
+                "value_min": min(applied_values) if applied_values else None,
+                "value_max": max(applied_values) if applied_values else None,
+                "unique_values_approx": unique_values_approx,
+                "warnings": warnings,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "operation": "geometry_batch",
+                "operation_group_id": operation_group_id,
+                "layer_name": name,
+                "records_seen": records_seen,
+                "records_applied": 0,
+                "records_skipped": records_seen,
+                "affected_voxels": 0,
+                "geometry_kind_counts": {},
+                "coordinate_source_counts": {},
+                "warnings": warnings,
+                "error": str(e),
+            }
     
     def _log_spatial_operation(
         self,
@@ -401,6 +844,10 @@ class SpatialVoxelStore(VoxelStore):
         source_file: str | None = None,
         source_excerpt: str | None = None,
         coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
+        operation_group_id: str | None = None,
+        record_id: str | None = None,
+        affected_voxels: int | None = None,
+        commit: bool = True,
     ):
         """Log spatial operation to database for debugging/tracing."""
         cursor = self._spatial_conn.cursor()
@@ -408,8 +855,9 @@ class SpatialVoxelStore(VoxelStore):
             """
             INSERT INTO spatial_operations (
                 operation_type, feature_name, coordinates, parameters,
-                source_file, source_excerpt, coordinate_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                source_file, source_excerpt, coordinate_source,
+                operation_group_id, record_id, affected_voxels
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 operation_type,
@@ -419,9 +867,13 @@ class SpatialVoxelStore(VoxelStore):
                 source_file,
                 source_excerpt,
                 coordinate_source,
+                operation_group_id,
+                record_id,
+                affected_voxels,
             ),
         )
-        self._spatial_conn.commit()
+        if commit:
+            self._spatial_conn.commit()
     
     def get_spatial_operations(self) -> list[dict[str, Any]]:
         """Get history of spatial operations."""
@@ -429,7 +881,8 @@ class SpatialVoxelStore(VoxelStore):
         cursor.execute(
             """
             SELECT id, operation_type, feature_name, coordinates, parameters,
-                   source_file, source_excerpt, coordinate_source, timestamp
+                   source_file, source_excerpt, coordinate_source,
+                   operation_group_id, record_id, affected_voxels, timestamp
             FROM spatial_operations
             ORDER BY timestamp DESC
             """
@@ -446,7 +899,10 @@ class SpatialVoxelStore(VoxelStore):
                 "source_file": row[5],
                 "source_excerpt": row[6],
                 "coordinate_source": row[7],
-                "timestamp": row[8],
+                "operation_group_id": row[8],
+                "record_id": row[9],
+                "affected_voxels": row[10],
+                "timestamp": row[11],
             })
         
         return operations

@@ -1,5 +1,7 @@
 # Voxel Features MCP server
-# Build context: NSL2-geology-task root (docker/feature-hypothesis-compose/docker-compose.yml)
+# Build context: combo-geology-nsl root (see docker-compose.yml).
+# That's a level above NSL2-geology-task so we can COPY the canonical
+# voxel-features-mcp sibling package directly.
 FROM python:3.12-slim-bookworm
 
 # Install system dependencies
@@ -18,8 +20,8 @@ RUN pip install --no-cache-dir \
     "mcp>=1.9" \
     "filelock>=3.13"
 
-# Copy voxel_features module from src/
-COPY src/voxel_features /opt/vfm/voxel_features
+# Copy voxel_features module from the sibling voxel-features-mcp package.
+COPY voxel-features-mcp/voxel_features /opt/vfm/voxel_features
 
 ENV PYTHONPATH=/opt/vfm \
     PYTHONDONTWRITEBYTECODE=1 \

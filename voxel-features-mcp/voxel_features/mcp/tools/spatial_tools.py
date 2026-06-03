@@ -159,6 +159,88 @@ def spatial_add_line(
         }
 
 
+def spatial_add_box(
+    store: SpatialVoxelStore,
+    name: str,
+    min_longitude: float,
+    min_latitude: float,
+    min_depth_m: float,
+    max_longitude: float,
+    max_latitude: float,
+    max_depth_m: float,
+    value: float,
+    dtype: Literal["float", "categorical", "boolean"] = "float",
+    combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+    metadata: dict[str, Any] | None = None,
+    hypothesis_uri: str | None = None,
+    experiment_id: str | None = None,
+    source_file: str | None = None,
+    source_excerpt: str | None = None,
+    coordinate_source: Literal["geonames", "web", "artifact", "creative_fallback"] = "creative_fallback",
+) -> dict[str, Any]:
+    """Add an axis-aligned box feature with explicit depth bounds."""
+    try:
+        return store.add_box_feature(
+            name=name,
+            min_longitude=min_longitude,
+            min_latitude=min_latitude,
+            min_depth_m=min_depth_m,
+            max_longitude=max_longitude,
+            max_latitude=max_latitude,
+            max_depth_m=max_depth_m,
+            value=value,
+            dtype=dtype,
+            combination_rule=combination_rule,
+            metadata=metadata,
+            hypothesis_uri=hypothesis_uri,
+            experiment_id=experiment_id,
+            source_file=source_file,
+            source_excerpt=source_excerpt,
+            coordinate_source=coordinate_source,
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "operation": "spatial_add_box",
+        }
+
+
+def spatial_upsert_geometry_batch(
+    store: SpatialVoxelStore,
+    name: str,
+    records: list[dict[str, Any]],
+    mode: Literal["replace_layer", "accumulate_layer"] = "replace_layer",
+    dtype: Literal["float", "categorical", "boolean"] = "float",
+    combination_rule: Literal["replace", "max", "add", "mean"] = "max",
+    max_records: int = 5000,
+    bounds_policy: Literal["skip", "clip", "fail"] = "skip",
+    metadata: dict[str, Any] | None = None,
+    hypothesis_uri: str | None = None,
+    experiment_id: str | None = None,
+) -> dict[str, Any]:
+    """Materialize many point/line/box records into one layer in one write."""
+    try:
+        return store.add_geometry_batch(
+            name=name,
+            records=records,
+            mode=mode,
+            dtype=dtype,
+            combination_rule=combination_rule,
+            max_records=max_records,
+            bounds_policy=bounds_policy,
+            metadata=metadata,
+            hypothesis_uri=hypothesis_uri,
+            experiment_id=experiment_id,
+        )
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "operation": "spatial_upsert_geometry_batch",
+        }
+
+
 def spatial_query_region(
     store: SpatialVoxelStore,
     center_longitude: float,

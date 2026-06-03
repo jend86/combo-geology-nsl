@@ -29,7 +29,8 @@ from voxel_features.mcp.tools.scoring_tools import (
     scoring_create_feature_layer
 )
 from voxel_features.mcp.tools.spatial_tools import (
-    spatial_add_point, spatial_add_line, spatial_query_region,
+    spatial_add_point, spatial_add_line, spatial_add_box,
+    spatial_upsert_geometry_batch, spatial_query_region,
     spatial_get_operations_log, spatial_coord_to_voxel
 )
 from voxel_features.mcp.tools.execution_tools import (
@@ -197,6 +198,13 @@ TOOLS = [
                 "metadata": {"type": "object", "description": "Optional metadata"},
                 "hypothesis_uri": {"type": "string"},
                 "experiment_id": {"type": "string"},
+                "source_file": {"type": "string", "description": "Source artifact or file for coordinate provenance"},
+                "source_excerpt": {"type": "string", "description": "Short excerpt supporting the coordinate"},
+                "coordinate_source": {
+                    "type": "string",
+                    "enum": ["artifact", "geonames", "web", "creative_fallback"],
+                    "default": "creative_fallback",
+                },
             },
             "required": ["name", "longitude", "latitude", "depth_m", "value"],
         },
@@ -221,9 +229,73 @@ TOOLS = [
                 "metadata": {"type": "object", "description": "Optional metadata"},
                 "hypothesis_uri": {"type": "string"},
                 "experiment_id": {"type": "string"},
+                "source_file": {"type": "string", "description": "Source artifact or file for coordinate provenance"},
+                "source_excerpt": {"type": "string", "description": "Short excerpt supporting the coordinate"},
+                "coordinate_source": {
+                    "type": "string",
+                    "enum": ["artifact", "geonames", "web", "creative_fallback"],
+                    "default": "creative_fallback",
+                },
             },
             "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
                         "end_longitude", "end_latitude", "end_depth_m", "value"],
+        },
+    ),
+    Tool(
+        name="spatial.add_box",
+        description="Add an axis-aligned box feature with explicit depth bounds",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Feature layer name"},
+                "min_longitude": {"type": "number", "description": "Minimum longitude in degrees"},
+                "min_latitude": {"type": "number", "description": "Minimum latitude in degrees"},
+                "min_depth_m": {"type": "number", "description": "Minimum depth in meters"},
+                "max_longitude": {"type": "number", "description": "Maximum longitude in degrees"},
+                "max_latitude": {"type": "number", "description": "Maximum latitude in degrees"},
+                "max_depth_m": {"type": "number", "description": "Maximum depth in meters"},
+                "value": {"type": "number", "description": "Feature value"},
+                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
+                "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
+                "metadata": {"type": "object", "description": "Optional metadata"},
+                "hypothesis_uri": {"type": "string"},
+                "experiment_id": {"type": "string"},
+                "source_file": {"type": "string", "description": "Source artifact or file for coordinate provenance"},
+                "source_excerpt": {"type": "string", "description": "Short excerpt supporting the coordinate"},
+                "coordinate_source": {
+                    "type": "string",
+                    "enum": ["artifact", "geonames", "web", "creative_fallback"],
+                    "default": "creative_fallback",
+                },
+            },
+            "required": [
+                "name", "min_longitude", "min_latitude", "min_depth_m",
+                "max_longitude", "max_latitude", "max_depth_m", "value",
+            ],
+        },
+    ),
+    Tool(
+        name="spatial.upsert_geometry_batch",
+        description="Materialize point/line/box geometry records into one layer in one locked write",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Feature layer name"},
+                "records": {
+                    "type": "array",
+                    "description": "Geometry records with geometry_kind point, line, or box",
+                    "items": {"type": "object"},
+                },
+                "mode": {"type": "string", "enum": ["replace_layer", "accumulate_layer"], "default": "replace_layer"},
+                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
+                "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
+                "max_records": {"type": "integer", "default": 5000},
+                "bounds_policy": {"type": "string", "enum": ["skip", "clip", "fail"], "default": "skip"},
+                "metadata": {"type": "object", "description": "Optional metadata"},
+                "hypothesis_uri": {"type": "string"},
+                "experiment_id": {"type": "string"},
+            },
+            "required": ["name", "records"],
         },
     ),
     Tool(
@@ -385,6 +457,10 @@ async def handle_tool_call(name: str, arguments: dict[str, Any]) -> dict[str, An
         return spatial_add_point(store, **arguments)
     elif name == "spatial.add_line":
         return spatial_add_line(store, **arguments)
+    elif name == "spatial.add_box":
+        return spatial_add_box(store, **arguments)
+    elif name == "spatial.upsert_geometry_batch":
+        return spatial_upsert_geometry_batch(store, **arguments)
     elif name == "spatial.query_region":
         return spatial_query_region(store, **arguments)
     elif name == "spatial.coord_to_voxel":

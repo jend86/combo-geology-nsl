@@ -92,6 +92,24 @@ _ROLE_SERVICE = {
     "analysis": "analysis",
 }
 
+
+def _ensure_voxel_features_mcp_path() -> str:
+    """Prefer the canonical sibling voxel-features-mcp package over src/ copies."""
+    import sys
+
+    vfm_path = str(Path(__file__).resolve().parent.parent.parent / "voxel-features-mcp")
+    if vfm_path in sys.path:
+        sys.path.remove(vfm_path)
+    sys.path.insert(0, vfm_path)
+
+    loaded = sys.modules.get("voxel_features")
+    loaded_file = str(getattr(loaded, "__file__", "")) if loaded is not None else ""
+    if loaded_file and vfm_path not in loaded_file:
+        for module_name in list(sys.modules):
+            if module_name == "voxel_features" or module_name.startswith("voxel_features."):
+                sys.modules.pop(module_name, None)
+    return vfm_path
+
 _ANALYSIS_INPUT = "/workspace/input"
 _ANALYSIS_OUT = "/workspace/out"
 
@@ -451,13 +469,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     @staticmethod
     def _prewarm_voxel_features() -> None:
         """Import voxel-features-mcp modules once, at task construction."""
-        import sys
-
-        vfm_path = str(
-            Path(__file__).resolve().parent.parent.parent / "voxel-features-mcp"
-        )
-        if vfm_path not in sys.path:
-            sys.path.append(vfm_path)
+        _ensure_voxel_features_mcp_path()
         try:
             import voxel_features.spatial  # noqa: F401
             import voxel_features.store  # noqa: F401
@@ -775,6 +787,9 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                         "   spatial_add_point(name='string', longitude=float, latitude=float, depth_m=float, value=float, radius_m=float)\n\n"
                         "   **For geological structures (faults, veins):**\n"
                         "   spatial_add_line(name='string', start_longitude=float, start_latitude=float, start_depth_m=float, end_longitude=float, end_latitude=float, end_depth_m=float, value=float, width_m=float)\n\n"
+
+                        "   **For areal/volumetric extents with depth control:**\n"
+                        "   spatial_add_box(name='string', min_longitude=float, min_latitude=float, min_depth_m=float, max_longitude=float, max_latitude=float, max_depth_m=float, value=float)\n\n"
                         "   **For statistical results without coordinates:**\n"
                         "   - Use geological knowledge: 'near Emily Well' → find well coordinates\n"
                         "   - Create spatial patterns: 'high copper zone' → center of drill holes\n"
@@ -783,6 +798,7 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                         " - Values must be floats or booleans: 'clay' → has_clay=True\n"
                         "   - Example: spatial_add_point(name='mineralization_potential', ...) \n"
                         "            spatial_add_line(name='mineralization_potential', ...) \n"
+                        "            spatial_add_box(name='mineralization_potential', ...) \n"
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
                         "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
                         "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
@@ -797,8 +813,10 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                     inherit_all_capabilities=False,
                     capabilities=(
                         "get_experiment_summary",
+                        "spatial_upsert_geometry_batch",
                         "spatial_add_point",
                         "spatial_add_line", 
+                        "spatial_add_box",
                         "spatial_query_region",
                         "spatial_coord_to_voxel",
                         "spatial_get_operations_log",
@@ -1034,6 +1052,28 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
             ),
             # Spatial tool capabilities
             Capability(
+                name="spatial_upsert_geometry_batch",
+                description="Materialize point/line/box geometry records into one voxel layer in one call.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "records": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Geometry records with geometry_kind point, line, or box",
+                        },
+                        "mode": {"type": "string", "enum": ["replace_layer", "accumulate_layer"]},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "max_records": {"type": "integer"},
+                        "bounds_policy": {"type": "string", "enum": ["skip", "clip", "fail"]},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["name", "records"],
+                },
+            ),
+            Capability(
                 name="spatial_add_point",
                 description="Add a point feature at geographic coordinates with radius of effect.",
                 schema={
@@ -1073,6 +1113,30 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
                     },
                     "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
                                 "end_longitude", "end_latitude", "end_depth_m", "value"],
+                },
+            ),
+            Capability(
+                name="spatial_add_box",
+                description="Add an axis-aligned box feature with explicit depth bounds.",
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "min_longitude": {"type": "number", "description": "Minimum longitude in degrees"},
+                        "min_latitude": {"type": "number", "description": "Minimum latitude in degrees"},
+                        "min_depth_m": {"type": "number", "description": "Minimum depth in meters"},
+                        "max_longitude": {"type": "number", "description": "Maximum longitude in degrees"},
+                        "max_latitude": {"type": "number", "description": "Maximum latitude in degrees"},
+                        "max_depth_m": {"type": "number", "description": "Maximum depth in meters"},
+                        "value": {"type": "number", "description": "Feature value"},
+                        "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
+                        "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "metadata": {"type": "object"},
+                    },
+                    "required": [
+                        "name", "min_longitude", "min_latitude", "min_depth_m",
+                        "max_longitude", "max_latitude", "max_depth_m", "value",
+                    ],
                 },
             ),
             Capability(
@@ -2059,11 +2123,7 @@ finally:
         
         try:
             # Import and call execution_results directly
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
+            _ensure_voxel_features_mcp_path()
                 
             from voxel_features.mcp.tools.execution_tools import execution_results
             
@@ -2129,11 +2189,7 @@ finally:
         
         try:
             # Add voxel-features-mcp to path
-            import sys
-            from pathlib import Path
-            vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-            if vfm_path not in sys.path:
-                sys.path.append(vfm_path)
+            _ensure_voxel_features_mcp_path()
             
             # Import execution tools directly
             from voxel_features.mcp.tools.execution_tools import (
@@ -2210,12 +2266,10 @@ finally:
         print(f"🔧 DEBUG: Args: {args}")
         
         # Set up environment for spatial operations
-        import sys
         from pathlib import Path
         
         # Add voxel-features-mcp to path
-        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-        sys.path.append(vfm_path)
+        vfm_path = _ensure_voxel_features_mcp_path()
         print(f"🔧 DEBUG: Added path: {vfm_path}")
         
         try:
@@ -2224,7 +2278,8 @@ finally:
             from voxel_features.spatial import SpatialVoxelStore
             from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.spatial_tools import (
-                spatial_add_point, spatial_add_line, spatial_query_region,
+                spatial_add_point, spatial_add_line, spatial_add_box,
+                spatial_upsert_geometry_batch, spatial_query_region,
                 spatial_coord_to_voxel, spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
@@ -2286,6 +2341,12 @@ finally:
             elif capability_name == "spatial_add_line":
                 print("🔧 DEBUG: Calling spatial_add_line...")
                 result = spatial_add_line(store, **args)
+            elif capability_name == "spatial_add_box":
+                print("🔧 DEBUG: Calling spatial_add_box...")
+                result = spatial_add_box(store, **args)
+            elif capability_name == "spatial_upsert_geometry_batch":
+                print("🔧 DEBUG: Calling spatial_upsert_geometry_batch...")
+                result = spatial_upsert_geometry_batch(store, **args)
             elif capability_name == "spatial_query_region":
                 print("🔧 DEBUG: Calling spatial_query_region...")
                 result = spatial_query_region(store, **args)
@@ -2344,12 +2405,10 @@ finally:
         print(f"🎯 DEBUG: Args: {args}")
         
         # Set up environment for scoring operations
-        import sys
         from pathlib import Path
         
         # Add voxel-features-mcp to path
-        vfm_path = str(Path(__file__).parent.parent.parent / "voxel-features-mcp")
-        sys.path.append(vfm_path)
+        vfm_path = _ensure_voxel_features_mcp_path()
         print(f"🎯 DEBUG: Added path: {vfm_path}")
         
         try:
