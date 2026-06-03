@@ -1,4 +1,5 @@
-"""A1 handoff: the Code phase writes /tmp/feature_points.csv; get_experiment_summary must
+"""A1 handoff: the Code phase produces feature_points.csv/feature_points_dataframe.csv;
+get_experiment_summary must
 surface its rows so the Translate agent (which has NO file-read capability) can map one
 spatial_add_point per row instead of stamping a single blob.
 
@@ -19,9 +20,11 @@ def test_load_feature_points_from_full_path(tmp_path):
     rows, truncated = T._load_feature_points([str(p)], str(tmp_path))
     assert truncated is False
     assert len(rows) == 2
-    assert rows[0]["longitude"] == "69.0"
+    assert rows[0]["longitude"] == 69.0
+    assert rows[0]["latitude"] == 51.0
+    assert rows[0]["depth_m"] == 40.0
     assert rows[0]["coordinate_source"] == "artifact"
-    assert rows[1]["value"] == "0.5"
+    assert rows[1]["value"] == 0.5
 
 
 def test_load_feature_points_dataframe_capture_name(tmp_path):
@@ -34,7 +37,19 @@ def test_load_feature_points_dataframe_capture_name(tmp_path):
     )
     rows, truncated = T._load_feature_points([str(p)], str(tmp_path))
     assert len(rows) == 1
-    assert rows[0]["latitude"] == "51.99"
+    assert rows[0]["latitude"] == 51.99
+
+
+def test_spatial_args_preserve_explicit_coordinate_source():
+    args = {
+        "longitude": 69.0,
+        "latitude": 51.0,
+        "depth_m": 40.0,
+        "value": 0.8,
+        "coordinate_source": "artifact",
+    }
+    resolved = T._prepare_spatial_provenance_args(args, {})
+    assert resolved["coordinate_source"] == "artifact"
 
 
 def test_load_feature_points_missing_returns_empty(tmp_path):

@@ -4,12 +4,33 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 
 from .store import VoxelStore, GridSpec
+
+
+# Per-store-path locks serialize the read-modify-write that point/line adds perform on the
+# scratch layer. Each capability call builds a FRESH SpatialVoxelStore instance for the same
+# scratch_dir and the capability bridge dispatches calls via asyncio.to_thread (concurrent
+# threads), so without this lock concurrent adds clobber each other (lost updates) and the
+# remove->re-add window is transiently empty for a racing reader. Keyed by str(store_path) so
+# all instances for one episode's scratch share the lock; different episodes never contend.
+_STORE_RMW_LOCKS: dict[str, threading.RLock] = {}
+_STORE_RMW_LOCKS_GUARD = threading.Lock()
+
+
+def _store_rmw_lock(store_path) -> threading.RLock:
+    key = str(store_path)
+    with _STORE_RMW_LOCKS_GUARD:
+        lk = _STORE_RMW_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _STORE_RMW_LOCKS[key] = lk
+        return lk
 
 
 class SpatialVoxelStore(VoxelStore):
@@ -187,6 +208,48 @@ class SpatialVoxelStore(VoxelStore):
         
         return affected_voxels
     
+    def _accumulate_voxels(
+        self,
+        name: str,
+        affected_voxels,
+        value: float,
+        combination_rule: str,
+        dtype: str,
+        **kwargs,
+    ):
+        """Atomically accumulate ``value`` into layer ``name`` at ``affected_voxels``.
+
+        Serialized per store_path AND disk-truthful: reads the current scratch layer from disk
+        rather than the per-instance (possibly stale) in-memory index, so concurrent
+        fresh-instance adds from the capability bridge's threads accumulate instead of
+        clobbering each other. Replaces the previous non-atomic read -> remove_layer ->
+        add_layer dance that lost updates and left a transient-empty window for racing readers.
+        """
+        with _store_rmw_lock(self.store_path):
+            scratch_npy = self._layers_dir / f"{name}.npy"
+            if scratch_npy.exists():
+                layer_values = np.load(scratch_npy).copy()
+            elif name in self.layer_names:  # overlay (admitted) base, if any
+                layer_values = self.get_layer_values(name).copy()
+            else:
+                layer_values = np.zeros(self.grid.shape, dtype=float)
+
+            for x, y, z in affected_voxels:
+                if combination_rule == "replace":
+                    layer_values[x, y, z] = value
+                elif combination_rule == "max":
+                    layer_values[x, y, z] = max(layer_values[x, y, z], value)
+                elif combination_rule == "add":
+                    layer_values[x, y, z] += value
+                elif combination_rule == "mean":
+                    layer_values[x, y, z] = (layer_values[x, y, z] + value) / 2
+
+            # Clean re-add regardless of stale in-memory state.
+            self._layers.pop(name, None)
+            if scratch_npy.exists():
+                scratch_npy.unlink()
+            return self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
+
     def add_point_feature(
         self,
         name: str,
@@ -219,32 +282,13 @@ class SpatialVoxelStore(VoxelStore):
             Dictionary with operation results
         """
         try:
-            # Get or create layer array
-            if name in self.layer_names:
-                layer_values = self.get_layer_values(name).copy()
-            else:
-                layer_values = np.zeros(self.grid.shape, dtype=float)
-            
-            # Get affected voxels
+            # Get affected voxels, then atomically accumulate them into the layer
+            # (locked + disk-truthful; see _accumulate_voxels).
             affected_voxels = self.get_voxels_in_sphere(longitude, latitude, depth, radius_m)
-            
-            # Apply values based on combination rule
-            for x, y, z in affected_voxels:
-                if combination_rule == "replace":
-                    layer_values[x, y, z] = value
-                elif combination_rule == "max":
-                    layer_values[x, y, z] = max(layer_values[x, y, z], value)
-                elif combination_rule == "add":
-                    layer_values[x, y, z] += value
-                elif combination_rule == "mean":
-                    layer_values[x, y, z] = (layer_values[x, y, z] + value) / 2
-            
-            # Update or create layer
-            if name in self.layer_names:
-                self.remove_layer(name)
-            
-            layer = self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
-            
+            layer = self._accumulate_voxels(
+                name, affected_voxels, value, combination_rule, dtype, **kwargs
+            )
+
             # Log spatial operation
             self._log_spatial_operation(
                 "point",
@@ -300,12 +344,6 @@ class SpatialVoxelStore(VoxelStore):
             Dictionary with operation results
         """
         try:
-            # Get or create layer array
-            if name in self.layer_names:
-                layer_values = self.get_layer_values(name).copy()
-            else:
-                layer_values = np.zeros(self.grid.shape, dtype=float)
-            
             # Sample points along the line
             num_samples = max(10, int(np.linalg.norm(np.array(end_coords) - np.array(start_coords)) * 1000))  # Sample every ~1m
             
@@ -322,22 +360,10 @@ class SpatialVoxelStore(VoxelStore):
                 voxels = self.get_voxels_in_sphere(lon, lat, depth, width_m / 2)
                 affected_voxels.update(voxels)
             
-            # Apply values
-            for x, y, z in affected_voxels:
-                if combination_rule == "replace":
-                    layer_values[x, y, z] = value
-                elif combination_rule == "max":
-                    layer_values[x, y, z] = max(layer_values[x, y, z], value)
-                elif combination_rule == "add":
-                    layer_values[x, y, z] += value
-                elif combination_rule == "mean":
-                    layer_values[x, y, z] = (layer_values[x, y, z] + value) / 2
-            
-            # Update or create layer
-            if name in self.layer_names:
-                self.remove_layer(name)
-                
-            layer = self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
+            # Atomically accumulate (locked + disk-truthful; see _accumulate_voxels).
+            layer = self._accumulate_voxels(
+                name, affected_voxels, value, combination_rule, dtype, **kwargs
+            )
             
             # Log spatial operation
             coords_str = f"{start_coords[0]},{start_coords[1]},{start_coords[2]};{end_coords[0]},{end_coords[1]},{end_coords[2]}"

@@ -93,6 +93,8 @@ _ROLE_SERVICE = {
 
 _SUMMARY_CODE_MAX_CHARS = 2_000
 _SUMMARY_RESULT_MAX_CHARS = 2_500
+_FEATURE_POINT_NUMERIC_COLUMNS = {"longitude", "latitude", "depth_m", "value"}
+_VALID_COORDINATE_SOURCES = {"artifact", "geonames", "web", "creative_fallback"}
 
 
 def _safe_artifact_component(value: Any) -> str:
@@ -2014,8 +2016,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Performs statistical analysis, correlation, classification\n"
                         "   - Creates filtered DataFrames, computed arrays, summary statistics\n"
                         "   - Tests geological relationships and patterns\n"
-                        "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
-                        "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
+                        "   - Creates artifact outputs: top-level DataFrames/arrays are auto-saved, and files\n"
+                        "     written under /workspace/out are collected as artifacts.\n"
                         "   - KEY DELIVERABLE (the spatial spec): when your analysis localizes the feature, build a\n"
                         "     pandas DataFrame named EXACTLY `feature_points` with EXACTLY these columns:\n"
                         "     longitude, latitude, depth_m, value, coordinate_source -- ONE ROW PER LOCATION the\n"
@@ -2390,6 +2392,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "radius_m": {"type": "number", "description": "Radius of effect in meters"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "coordinate_source": {"type": "string", "enum": sorted(_VALID_COORDINATE_SOURCES)},
                         "metadata": {"type": "object"},
                     },
                     "required": ["name", "longitude", "latitude", "depth_m", "value"],
@@ -2412,6 +2415,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "width_m": {"type": "number", "description": "Width of line in meters"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
+                        "coordinate_source": {"type": "string", "enum": sorted(_VALID_COORDINATE_SOURCES)},
                         "metadata": {"type": "object"},
                     },
                     "required": ["name", "start_longitude", "start_latitude", "start_depth_m", 
@@ -3005,11 +3009,11 @@ except Exception as user_code_error:
         *,
         max_rows: int = 2000,
     ) -> tuple[list[dict], bool]:
-        """A1 handoff: read the Code phase's `feature_points.csv` artifact (columns
+        """A1 handoff: read the Code phase's feature-points artifact (columns
         longitude,latitude,depth_m,value,coordinate_source) and return its rows so the Translate
         agent -- which has no file-read capability -- can map ONE spatial op per row instead of
         stamping a single blob. Returns (rows, truncated). Robust to full-path or basename entries
-        in artifact_files; falls back to <artifact_directory>/feature_points.csv."""
+        in artifact_files; falls back to known names in artifact_directory."""
         import csv as _csv
         import os as _os
         import re as _re
@@ -3048,10 +3052,53 @@ except Exception as user_code_error:
                     if i >= max_rows:
                         truncated = True
                         break
-                    rows.append(dict(row))
+                    rows.append(FeatureHypothesisKazakhstanTask._coerce_feature_point_row(row))
         except Exception:
             return [], False
         return rows, truncated
+
+    @staticmethod
+    def _coerce_feature_point_row(row: dict) -> dict:
+        coerced = {}
+        for key, value in dict(row).items():
+            if key is None:
+                continue
+            clean_key = str(key).strip()
+            clean_value = value.strip() if isinstance(value, str) else value
+            if clean_key in _FEATURE_POINT_NUMERIC_COLUMNS:
+                try:
+                    coerced[clean_key] = float(clean_value)
+                except (TypeError, ValueError):
+                    coerced[clean_key] = clean_value
+            else:
+                coerced[clean_key] = clean_value
+        return coerced
+
+    @staticmethod
+    def _prepare_spatial_provenance_args(
+        args: dict[str, Any],
+        episode_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        resolved = dict(args)
+        metadata = resolved.get("metadata") if isinstance(resolved.get("metadata"), dict) else {}
+        source_file = str(metadata.get("source_file") or "").strip()
+        source_excerpt = str(metadata.get("source_excerpt") or "").strip()
+        explicit_source = str(resolved.get("coordinate_source") or "").strip()
+        last_search = episode_context.get("last_coordinate_search")
+
+        if explicit_source in _VALID_COORDINATE_SOURCES:
+            coordinate_source = explicit_source
+        elif source_file or source_excerpt:
+            coordinate_source = "artifact"
+        elif isinstance(last_search, dict) and last_search.get("coordinate_source") in {"geonames", "web"}:
+            coordinate_source = str(last_search["coordinate_source"])
+        else:
+            coordinate_source = "creative_fallback"
+
+        resolved["coordinate_source"] = coordinate_source
+        resolved["source_file"] = source_file or None
+        resolved["source_excerpt"] = source_excerpt or None
+        return resolved
 
     def _exec_get_experiment_summary(
         self,
@@ -4049,19 +4096,7 @@ finally:
 
             args = dict(args)
             if capability_name in ["spatial_add_point", "spatial_add_line"]:
-                metadata = args.get("metadata") if isinstance(args.get("metadata"), dict) else {}
-                source_file = str(metadata.get("source_file") or "").strip()
-                source_excerpt = str(metadata.get("source_excerpt") or "").strip()
-                last_search = ctx.episode_context.get("last_coordinate_search")
-                if source_file or source_excerpt:
-                    coordinate_source = "artifact"
-                elif isinstance(last_search, dict) and last_search.get("coordinate_source") in {"geonames", "web"}:
-                    coordinate_source = str(last_search["coordinate_source"])
-                else:
-                    coordinate_source = "creative_fallback"
-                args["coordinate_source"] = coordinate_source
-                args["source_file"] = source_file or None
-                args["source_excerpt"] = source_excerpt or None
+                args = self._prepare_spatial_provenance_args(args, ctx.episode_context)
              
             # Validate coordinates if this is a spatial operation with coordinates
             if capability_name in ["spatial_add_point", "spatial_add_line"]:
