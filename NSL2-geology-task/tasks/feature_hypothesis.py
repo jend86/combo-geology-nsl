@@ -298,6 +298,7 @@ class FeatureHypothesisState:
     masking_test_improvement: float = 0.0
     masking_test_direction: str = "not_applicable"
     stage_completed: str = "stage_2_completed"
+    admission_path: str = "normal"
     
     # Crossbreeding context
     parent_experiments: list[str] = field(default_factory=list)
@@ -382,6 +383,30 @@ class FeatureHypothesisTask(TaskSpec[FeatureHypothesisState]):
     metric_unit = "nats"
     higher_is_better = False  # Lower BIC is better
     agent_service_name = "agent"
+    _STAGE_COMPLETED_ALLOWLIST: frozenset[str] = frozenset({
+        "stage_2_completed",
+        "mae_bic_completed",
+    })
+
+    @classmethod
+    def _should_persist_to_kg(
+        cls,
+        *,
+        masking_test_passed: bool,
+        admitted: bool,
+        bic_delta: float | None,
+        stage_completed: str,
+        admission_path: str | None = None,
+    ) -> bool:
+        if not bool(masking_test_passed):
+            return False
+        if not bool(admitted):
+            return False
+        if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
+            return True
+        if bic_delta is None or bic_delta >= 0:
+            return False
+        return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
     
     def __init__(self, task_config: dict[str, Any]) -> None:
         repo_root = Path(__file__).resolve().parent.parent
@@ -1646,6 +1671,7 @@ finally:
         masking_test_improvement = evaluate.get('masking_test_improvement', 0.0)
         masking_test_direction = evaluate.get('masking_test_direction', 'not_applicable')
         stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
+        admission_path = evaluate.get('admission_path', 'normal')
         
         training_record = {
             'prompt': training_pair.get('prompt', ''),
@@ -1660,6 +1686,7 @@ finally:
             'masking_test_improvement': masking_test_improvement,
             'masking_test_direction': masking_test_direction,
             'stage_completed': stage_completed,
+            'admission_path': admission_path,
             'metadata': {
                 'hypothesis': hypothesise.get('hypothesis', ''),
                 'grid_bounds': ctx.episode_context.get('grid_spec', {}),
@@ -1671,6 +1698,7 @@ finally:
                     'stage_1_improvement': masking_test_improvement,
                     'stage_1_direction': masking_test_direction,
                     'stage_completed': stage_completed,
+                    'admission_path': admission_path,
                     'stage_1_threshold': 0.0001,  # Lowered for sparse geological data
                     'scoring_version': 'two_stage_v2'
                 }
@@ -1699,15 +1727,15 @@ finally:
         except Exception as e:
             print(f"Warning: Failed to save training data: {e}")
         
-        # Save to knowledge graph (ONLY experiments that passed BOTH stages)
-        # Stage 1: Must pass predictive capacity test
-        # Stage 2: Must improve BIC (complexity assessment)
-        both_stages_passed = (
-            masking_test_passed and 
-            admitted and 
-            bic_delta is not None and 
-            bic_delta < 0 and
-            stage_completed == 'stage_2_completed'
+        # Save to knowledge graph when canonical admission passes. Normal layers
+        # need both stages; first_layer_auto is a BIC-less root and is handled as
+        # its own admission path.
+        both_stages_passed = self._should_persist_to_kg(
+            masking_test_passed=masking_test_passed,
+            admitted=admitted,
+            bic_delta=bic_delta,
+            stage_completed=stage_completed,
+            admission_path=admission_path,
         )
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
@@ -1741,6 +1769,7 @@ finally:
                     "masking_test_improvement": masking_test_improvement,
                     "masking_test_direction": masking_test_direction,
                     "stage_completed": stage_completed,
+                    "admission_path": admission_path,
                     "scoring_version": "two_stage_v2",
                     "artifact_links": {
                         "layer_file": f"store/coe_fairbairn/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
@@ -2462,6 +2491,7 @@ finally:
             masking_test_improvement=evaluate.get("masking_test_improvement", 0.0),
             masking_test_direction=evaluate.get("masking_test_direction", "not_applicable"),
             stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
+            admission_path=evaluate.get("admission_path", "normal"),
             prompt_response_pair=terminal_record.get("training_pair", {}),
         )
     
@@ -2480,6 +2510,19 @@ finally:
         masking_test_direction = final.masking_test_direction
         admitted = final.admitted
         stage_completed = final.stage_completed
+
+        if bic_delta is None and final.admission_path == "first_layer_auto" and admitted:
+            return TaskReward(
+                value=1.0,
+                success=True,
+                breakdown={
+                    "stage_1_passed": True,
+                    "stage_2_passed": False,
+                    "first_layer_auto": True,
+                    "bic_delta": None,
+                    "stage_completed": stage_completed,
+                },
+            )
         
         if bic_delta is None:
             # No feature layer created
@@ -2499,7 +2542,7 @@ finally:
             # masking_test_improvement is now actual mae_before - mae_after delta
             # Scale: 1e-4 absolute MAE improvement = max reward
             # (calibrated to observed post-fix admit distribution [8e-06, 1e-04])
-            if masking_test_direction in ("auto_pass", "first_layer"):
+            if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0  # Insufficient layers for MAE gate; full credit
             else:
                 stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
@@ -2529,7 +2572,7 @@ finally:
         elif masking_test_passed and not admitted:
             # Stage 1 passed but Stage 2 failed - partial success
             # Reward for predictive capacity even if complexity penalty too high
-            if masking_test_direction in ("auto_pass", "first_layer"):
+            if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0
             else:
                 stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))

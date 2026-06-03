@@ -171,72 +171,78 @@ class TestEvidenceParentage:
         assert FeatureHypothesisKazakhstanTask._is_crossbreed_parent_eligible(boolean_near_dup) is False
 
 
-class TestFirstRootHardening:
-    """The first free (first_layer_auto) admit anchors the whole KG and rides a
-    BIC bypass, so it is held to a stricter bar than later layers:
+class TestEarlyRootHardening:
+    """The first K (``_EARLY_ROOT_COUNT``) KG admits seed the KG and the very
+    first rides a BIC bypass, so they are held to a GEOMETRY/PROVENANCE floor a
+    single arbitrary central blob cannot clear (Approach 1 + B,
+    docs/design/scoring-colocation-monoculture-2026-06-03):
 
-    1. It can NEVER ride the creative_fallback override — an all-fallback first
-       root is rejected regardless of allow_creative_fallback_admission.
-    2. Triviality (single-op / uniform-value / low-entropy) is a HARD reject for
-       the first root, whereas for later layers these stay telemetry-only.
-
-    ``_first_root_admission_ok`` is a no-op for non-first-root records.
+    1. An all-creative_fallback early root is rejected regardless of
+       allow_creative_fallback_admission (the seed must rest on real provenance).
+    2. A single-op early root (the single central blob that drives the
+       co-location monoculture) is rejected.
+    3. Value uniformity / low entropy are NOT gated — a *distributed* uniform
+       layer is a perfectly good seed (this is the Approach-1 relaxation).
+    4. Once the pool already holds >= K layers the gate is a no-op.
     """
 
-    def _healthy_first_root(self) -> dict:
-        # Multi-op, graded, artifact-backed first root — should pass.
+    def _healthy_early_root(self) -> dict:
+        # Multi-op, artifact-backed root — should pass even if uniform-valued.
         return {
-            "admission_path": "first_layer_auto",
             "spatial_operation_provenance_count": 4,
             "coordinate_source_counts": {"artifact": 3, "creative_fallback": 1},
             "single_spatial_operation": False,
-            "uniform_nonzero_value": False,
-            "candidate_value_entropy": 2.3,
         }
 
-    def test_non_first_root_is_unconstrained(self) -> None:
-        # A "normal" admit that is single-op, uniform, all-fallback must NOT be
-        # touched by this gate — later-layer triviality stays telemetry-only.
-        trivial_normal = {
-            "admission_path": "normal",
+    def test_pool_at_or_past_K_is_unconstrained(self) -> None:
+        # Once K roots exist, even a single-op all-fallback layer is no-op'd.
+        trivial = {
             "spatial_operation_provenance_count": 1,
             "coordinate_source_counts": {"creative_fallback": 1},
             "single_spatial_operation": True,
-            "uniform_nonzero_value": True,
-            "candidate_value_entropy": 0.0,
         }
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(trivial_normal) is True
+        K = FeatureHypothesisKazakhstanTask._EARLY_ROOT_COUNT
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(trivial, pool_size=K) is True
+        assert trivial["first_root_rejection_reason"] == "none"
 
-    def test_healthy_first_root_admits(self) -> None:
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(self._healthy_first_root()) is True
+    def test_healthy_early_root_admits(self) -> None:
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(
+            self._healthy_early_root(), pool_size=0
+        ) is True
 
-    def test_all_creative_fallback_first_root_rejected_despite_override(self) -> None:
-        record = self._healthy_first_root()
+    def test_distributed_uniform_early_root_admits(self) -> None:
+        # Approach 1: a multi-op uniform-valued, zero-entropy layer is a fine
+        # seed — it must NOT be rejected (this is what deadlocked the prior run).
+        record = self._healthy_early_root()
+        record["uniform_nonzero_value"] = True
+        record["candidate_value_entropy"] = 0.0
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=2) is True
+        assert record["first_root_rejection_reason"] == "none"
+
+    def test_all_creative_fallback_early_root_rejected_despite_override(self) -> None:
+        record = self._healthy_early_root()
         record["spatial_operation_provenance_count"] = 3
         record["coordinate_source_counts"] = {"creative_fallback": 3}
-        # Even with the override flag set on the record, the first root must not
-        # ride it.
         record["allow_creative_fallback_admission"] = True
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(record) is False
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=0) is False
         assert record["first_root_rejection_reason"] == "all_creative_fallback"
 
-    def test_single_spatial_operation_first_root_rejected(self) -> None:
-        record = self._healthy_first_root()
+    def test_single_spatial_operation_early_root_rejected(self) -> None:
+        record = self._healthy_early_root()
         record["single_spatial_operation"] = True
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(record) is False
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=3) is False
+        assert record["first_root_rejection_reason"] == "single_spatial_operation"
 
-    def test_uniform_value_first_root_rejected(self) -> None:
-        record = self._healthy_first_root()
-        record["uniform_nonzero_value"] = True
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(record) is False
+    def test_window_applies_to_each_of_first_K(self) -> None:
+        # A single-op layer is gated at every pool_size below K, not just 0.
+        K = FeatureHypothesisKazakhstanTask._EARLY_ROOT_COUNT
+        for ps in range(K):
+            record = {"single_spatial_operation": True, "spatial_operation_provenance_count": 1,
+                      "coordinate_source_counts": {"artifact": 1}}
+            assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=ps) is False
 
-    def test_low_entropy_first_root_rejected(self) -> None:
-        record = self._healthy_first_root()
-        record["candidate_value_entropy"] = 0.1
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(record) is False
-        assert record["first_root_rejection_reason"] == "low_value_entropy"
-
-    def test_partial_fallback_first_root_not_flagged_as_all_fallback(self) -> None:
-        # 1 of 4 ops is fallback → not all_creative_fallback → passes (other
-        # triviality fields are healthy).
-        assert FeatureHypothesisKazakhstanTask._first_root_admission_ok(self._healthy_first_root()) is True
+    def test_partial_fallback_early_root_passes(self) -> None:
+        # 1 of 4 ops is fallback → not all_creative_fallback → passes.
+        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(
+            self._healthy_early_root(), pool_size=0
+        ) is True

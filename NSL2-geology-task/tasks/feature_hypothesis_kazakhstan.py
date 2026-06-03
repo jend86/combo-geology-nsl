@@ -5927,33 +5927,42 @@ finally:
     _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
 
-    # The first free (first_layer_auto) admit anchors the entire KG and rides a
-    # BIC bypass, so its value distribution must clear a minimum entropy (bits)
-    # — below this it is effectively uniform and a poor anchor. Tunable; the
-    # first root is re-rollable, so a false reject only costs the agent a retry.
-    _FIRST_ROOT_MIN_VALUE_ENTROPY = 0.5
+    # The first K admits SEED the KG (and the very first rides a BIC bypass), so
+    # they are held to a GEOMETRY/PROVENANCE floor a single arbitrary central
+    # blob cannot clear. See docs/design/scoring-colocation-monoculture-2026-06-03
+    # (Approach 1 + B): the floor rejects only the single-op central blob that
+    # drives the co-location monoculture and all-creative_fallback anchors. It
+    # deliberately does NOT gate value uniformity / entropy — a *distributed*
+    # uniform layer is a perfectly good seed (gating it deadlocked the prior run:
+    # the agent reliably places distributed real coordinates but rarely grades
+    # values, so an entropy floor rejected every candidate and the KG never
+    # seeded). Extended from the literal first root to the first
+    # ``_EARLY_ROOT_COUNT`` admits so the early KG can't fill with trivial
+    # co-located blobs either. Re-rollable: a false reject only costs a retry.
+    _EARLY_ROOT_COUNT = 5
 
     @classmethod
-    def _first_root_admission_ok(cls, kg_record: dict[str, Any]) -> bool:
-        """Stricter hard gate for the first free (first_layer_auto) admit.
+    def _early_root_admission_ok(cls, kg_record: dict[str, Any], pool_size: int) -> bool:
+        """Geometry/provenance floor for the first ``_EARLY_ROOT_COUNT`` admits.
 
-        Returns True (no-op) for any non-first-root record — later layers keep
-        the generous admission policy where single-op / uniform / low-entropy
-        are telemetry only (see relative-mae-guarded-evidence-tier-admission
-        and normalized-pairwise-distance-near-duplicate-gate docs).
+        ``pool_size`` is the number of layers already in the admitted pool. Once
+        it reaches ``_EARLY_ROOT_COUNT`` the gate is a no-op (returns True) —
+        later layers keep the generous admission policy where single-op /
+        uniform / low-entropy are telemetry only.
 
-        For the first root only:
-          - all-creative_fallback is rejected regardless of the
-            allow_creative_fallback_admission override (the anchor must rest on
+        For an early root (``pool_size < _EARLY_ROOT_COUNT``) reject only:
+          - all-creative_fallback, regardless of the
+            allow_creative_fallback_admission override (the seed must rest on
             real provenance), and
-          - single-op / uniform-value / low-entropy roots are rejected as
-            degenerate anchors.
+          - a single spatial op (the single central-blob anchor that drives the
+            co-location monoculture).
 
-        Stamps ``first_root_rejection_reason`` for audit. Must run *after*
+        Value uniformity / entropy are deliberately NOT gated. Stamps
+        ``first_root_rejection_reason`` for audit. Must run *after*
         ``_stamp_candidate_provenance`` and ``_stamp_candidate_triviality`` so
         the fields it reads are populated.
         """
-        if kg_record.get("admission_path") != "first_layer_auto":
+        if pool_size >= cls._EARLY_ROOT_COUNT:
             kg_record["first_root_rejection_reason"] = "none"
             return True
 
@@ -5971,11 +5980,6 @@ finally:
 
         if bool(kg_record.get("single_spatial_operation")):
             reasons.append("single_spatial_operation")
-        if bool(kg_record.get("uniform_nonzero_value")):
-            reasons.append("uniform_nonzero_value")
-        entropy = float(kg_record.get("candidate_value_entropy", 0.0) or 0.0)
-        if entropy < cls._FIRST_ROOT_MIN_VALUE_ENTROPY:
-            reasons.append("low_value_entropy")
 
         kg_record["first_root_rejection_reason"] = reasons[0] if reasons else "none"
         return not reasons
@@ -6482,10 +6486,21 @@ finally:
                 )
                 self._stamp_candidate_triviality(kg_record, values=candidate_values)
                 emptiness_passed = not bool(kg_record.get("declared_nothing", False))
-                # First free admit anchors the KG: override-proof against
-                # creative_fallback and reject degenerate (single-op / uniform /
-                # low-entropy) roots. No-op for later layers.
-                first_root_passed = self._first_root_admission_ok(kg_record)
+                # The first _EARLY_ROOT_COUNT admits seed the KG: hold them to a
+                # geometry/provenance floor (override-proof against
+                # creative_fallback; reject the single-op central blob that
+                # drives co-location monoculture). No-op once the pool already
+                # holds >= K layers. pool_size = admitted layers BEFORE this one
+                # (promotion happens in on_admit, after this guard passes).
+                pool_size = 0
+                if admitted_dir is not None:
+                    try:
+                        pool_size = sum(
+                            1 for _ in (Path(admitted_dir) / "layers").glob("*.npy")
+                        )
+                    except OSError:
+                        pool_size = 0
+                first_root_passed = self._early_root_admission_ok(kg_record, pool_size)
                 if not (
                     novelty_passed
                     and provenance_passed

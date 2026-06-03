@@ -58,15 +58,11 @@ def _single_uniform_point(scratch_dir: Path, layer_name: str, *, coordinate_sour
     )
 
 
-def _graded_multi_point(scratch_dir: Path, layer_name: str) -> None:
+def _multi_point(scratch_dir: Path, layer_name: str, *, uniform: bool = False) -> None:
     store = SpatialVoxelStore(scratch_dir, _grid())
-    points = [
-        (0.5, 0.5, 0.5, 0.2),
-        (1.5, 1.5, 0.5, 0.5),
-        (2.5, 2.5, 1.5, 0.8),
-        (3.5, 0.5, 1.5, 1.0),
-    ]
-    for i, (lon, lat, depth, value) in enumerate(points):
+    coords = [(0.5, 0.5, 0.5), (1.5, 1.5, 0.5), (2.5, 2.5, 1.5), (3.5, 0.5, 1.5)]
+    values = [1.0, 1.0, 1.0, 1.0] if uniform else [0.2, 0.5, 0.8, 1.0]
+    for i, ((lon, lat, depth), value) in enumerate(zip(coords, values)):
         store.add_point_feature(
             name=layer_name,
             longitude=lon,
@@ -119,11 +115,9 @@ def test_degenerate_single_uniform_first_root_rejected(tmp_path: Path) -> None:
 
     assert admitted is False
     assert record["admission_tier"] == "guard_rejected"
-    assert record["first_root_rejection_reason"] in {
-        "single_spatial_operation",
-        "uniform_nonzero_value",
-        "low_value_entropy",
-    }
+    # Geometry/provenance floor: a single op is the reject reason (uniform value
+    # and entropy are no longer gated under Approach 1).
+    assert record["first_root_rejection_reason"] == "single_spatial_operation"
     assert not (kg_dir / "experiments.jsonl").exists()
     assert not (store_dir / "admitted" / "layers" / f"{layer_name}.npy").exists()
 
@@ -150,7 +144,7 @@ def test_graded_multi_op_first_root_admits(tmp_path: Path) -> None:
     kg_dir = tmp_path / "kg"
     store_dir = tmp_path / "store"
     layer_name = "graded_root"
-    _graded_multi_point(store_dir / "scratch" / layer_name, layer_name)
+    _multi_point(store_dir / "scratch" / layer_name, layer_name)
     record = _first_root_record("exp_graded", layer_name)
 
     admitted = _admit(task, kg_dir, store_dir, layer_name, record)
@@ -159,4 +153,21 @@ def test_graded_multi_op_first_root_admits(tmp_path: Path) -> None:
     assert record["first_root_rejection_reason"] == "none"
     assert record["single_spatial_operation"] is False
     assert record["admission_tier"] in {"kg_evidence", "kg_parent_eligible"}
+    assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_distributed_uniform_multi_op_first_root_admits(tmp_path: Path) -> None:
+    # Approach 1 relaxation: a multi-op, UNIFORM-valued distributed root is a
+    # fine seed and must admit (this exact shape deadlocked the prior run).
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "uniform_distributed_root"
+    _multi_point(store_dir / "scratch" / layer_name, layer_name, uniform=True)
+    record = _first_root_record("exp_uniform_dist", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record)
+
+    assert admitted is True
+    assert record["first_root_rejection_reason"] == "none"
     assert (kg_dir / "experiments.jsonl").exists()
