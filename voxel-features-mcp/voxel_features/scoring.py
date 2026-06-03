@@ -166,7 +166,7 @@ def pairwise_distance(
     layer_a: str,
     layer_b: str,
 ) -> float:
-    """Orthogonality proxy in [0, 1]: Jaccard distance for boolean, MAE otherwise.
+    """Orthogonality proxy in [0, 1], normalized so one threshold fits all dtypes.
 
     Crossbreed-queue replacement for mutual_information(): the latter had a
     unit mismatch (Shannon-bits marginals vs density-scaled joint) that
@@ -174,6 +174,16 @@ def pairwise_distance(
     orthogonality signal. Jaccard has no entropy/binning footguns and is the
     right shape for sparse boolean projections (Kazakhstan's typical layer
     type). Two all-false layers are treated as identical (distance 0).
+
+    Boolean pairs use Jaccard distance. Every other pair uses the
+    magnitude-normalized L1 (Sørensen/Bray–Curtis) distance
+    ``sum|a-b| / (sum|a| + sum|b|)``, which is the natural generalization of
+    Jaccard to real-valued layers: bounded in [0, 1] by the triangle
+    inequality, identical layers → 0, disjoint supports → 1, and (unlike raw
+    MAE) scale-free so the shared near-duplicate threshold (0.15) carries the
+    same "≥85% agreement" meaning regardless of value magnitude. Raw MAE made
+    jittered large-magnitude duplicates read as distinct and distinct
+    small-magnitude layers read as duplicates. Two all-zero layers → 0.
     """
     layer_a_obj = store.get_layer(layer_a)
     layer_b_obj = store.get_layer(layer_b)
@@ -191,7 +201,11 @@ def pairwise_distance(
 
     a_flat = np.nan_to_num(values_a.astype(float), nan=0.0).ravel()
     b_flat = np.nan_to_num(values_b.astype(float), nan=0.0).ravel()
-    return float(np.mean(np.abs(a_flat - b_flat)))
+    scale = float(np.sum(np.abs(a_flat)) + np.sum(np.abs(b_flat)))
+    if scale <= 1e-12:
+        return 0.0  # both layers are ~all-zero → identical "nothing here"
+    distance = float(np.sum(np.abs(a_flat - b_flat))) / scale
+    return min(max(distance, 0.0), 1.0)
 
 
 # =============================================================================

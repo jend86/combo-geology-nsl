@@ -115,6 +115,41 @@ class TestQueueEnumeration:
             ("eligible_b", "eligible_a"),
         }
 
+    def test_near_duplicate_parent_pairs_are_not_enumerated(
+        self, tmp_path: Path
+    ) -> None:
+        task = _task(tmp_path)
+        kg_dir = Path(_variation(tmp_path).kg_dir)
+        _seed_experiments(kg_dir, ["a", "b", "c"])
+        _seed_pairwise_distance(kg_dir, {
+            ("a", "b"): 0.01,
+            ("a", "c"): 0.80,
+            ("b", "c"): 0.75,
+        })
+
+        entries = task._enumerate_pairs(kg_dir)
+        parent_pairs = {tuple(entry["parents"]) for entry in entries}
+
+        assert ("a", "b") not in parent_pairs
+        assert ("b", "a") not in parent_pairs
+        assert {("a", "c"), ("c", "a"), ("b", "c"), ("c", "b")} <= parent_pairs
+
+    def test_viable_parent_count_collapses_near_duplicate_clusters(
+        self, tmp_path: Path
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        _seed_experiments(kg_dir, ["a", "b", "c", "d", "e"])
+        _seed_pairwise_distance(kg_dir, {("a", "b"): 0.01})
+
+        assert task._has_crossbreed_pairs(variation) is False
+
+        _seed_experiments(kg_dir, ["a", "b", "c", "d", "e", "f"])
+        _seed_pairwise_distance(kg_dir, {("a", "b"): 0.01})
+
+        assert task._has_crossbreed_pairs(variation) is True
+
 
 class TestQueuePop:
     def test_sequential_pops_yield_distinct_pairs(self, tmp_path: Path) -> None:
@@ -530,10 +565,11 @@ class TestScoreFormulaLog1pAndDistance:
                     "mutual_info": {},
                     "crossbreed_parent_eligible": True,
                 }) + "\n")
-        # (a, b) is highly orthogonal; (c, d) is highly redundant.
+        # (a, b) is highly orthogonal; (c, d) is lower-distance but still above
+        # the practical-duplicate queue gate.
         _seed_pairwise_distance(kg_dir, {
             ("a", "b"): 0.95,
-            ("c", "d"): 0.05,
+            ("c", "d"): 0.20,
         })
 
         entries = task._enumerate_pairs(kg_dir)

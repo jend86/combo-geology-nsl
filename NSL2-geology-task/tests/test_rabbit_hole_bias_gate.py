@@ -1,9 +1,11 @@
 """Rabbit-hole-bias fix: bootstrap gate + greedy BIC initialisation.
 
-Crossbreeding must not begin until every source has been visited at least once
-AND the greedy BIC initialisation has run. Previously the -1.0 first-layer
-sentinel flipped the pipeline to crossbreed after ~5/18 sources, collapsing the
-pool to a monoculture. Ported from JenD86/file-rotation@72e3239.
+Crossbreeding must not begin until every source has been visited at least
+_MIN_SOURCE_VISITS_BEFORE_CROSSBREED times AND the greedy BIC initialisation
+has run. Previously the -1.0 first-layer sentinel flipped the pipeline to
+crossbreed after ~5/18 sources, collapsing the pool to a monoculture.
+Ported from JenD86/file-rotation@72e3239; extended to require two full source
+rotations so the root population is diverse before lineage amplification.
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ from tasks.feature_hypothesis_kazakhstan import (
     FeatureHypothesisKazakhstanTask,
     FeatureHypothesisKazakhstanVariation,
 )
+
+_MIN_VISITS = FeatureHypothesisKazakhstanTask._MIN_SOURCE_VISITS_BEFORE_CROSSBREED
 
 
 def _task(tmp_path: Path) -> FeatureHypothesisKazakhstanTask:
@@ -38,13 +42,20 @@ def _seed_admits(kg_dir: Path, n: int) -> None:
     kg_dir.mkdir(parents=True, exist_ok=True)
     with (kg_dir / "experiments.jsonl").open("w") as fh:
         for i in range(n):
-            fh.write(json.dumps({"node_id": f"n{i}", "hypothesis": f"h{i}", "bic_delta": -(5.0 + i)}) + "\n")
+            fh.write(json.dumps({
+                "node_id": f"n{i}",
+                "hypothesis": f"h{i}",
+                "bic_delta": -(5.0 + i),
+                "crossbreed_parent_eligible": True,
+            }) + "\n")
 
 
-def _seed_rotation(kg_dir: Path, n_visited: int) -> None:
+def _seed_rotation(kg_dir: Path, n_visited: int, count: int = _MIN_VISITS) -> None:
+    """Seed the file-rotation state with ``count`` visits for the first
+    ``n_visited`` source keys and 0 for the rest."""
     kg_dir.mkdir(parents=True, exist_ok=True)
     keys = [s["key"] for s in _KAZAKHSTAN_SOURCE_FILES]
-    counts = {k: 1 for k in keys[:n_visited]}
+    counts = {k: count for k in keys[:n_visited]}
     (kg_dir / "file_rotation_state.json").write_text(json.dumps({"counts": counts}))
 
 
@@ -62,10 +73,16 @@ def test_all_sources_visited_requires_every_source(tmp_path: Path) -> None:
     kg = tmp_path / "kg" / "teniz_basin"
     total = len(_KAZAKHSTAN_SOURCE_FILES)
 
+    # Not enough sources covered.
     _seed_rotation(kg, n_visited=total - 1)
     assert task._all_sources_visited(str(kg)) is False
 
-    _seed_rotation(kg, n_visited=total)
+    # All sources covered but fewer visits than the floor → still False.
+    _seed_rotation(kg, n_visited=total, count=_MIN_VISITS - 1)
+    assert task._all_sources_visited(str(kg)) is False
+
+    # All sources covered with the required number of visits → True.
+    _seed_rotation(kg, n_visited=total, count=_MIN_VISITS)
     assert task._all_sources_visited(str(kg)) is True
 
 

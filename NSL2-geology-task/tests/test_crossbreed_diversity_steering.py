@@ -43,6 +43,7 @@ def _seed_admits(kg_dir: Path, hypotheses: list[str]) -> None:
                         "hypothesis": hyp,
                         "layer_name": f"layer_{i}",
                         "bic_delta": -(5.0 + i),
+                        "crossbreed_parent_eligible": True,
                     }
                 )
                 + "\n"
@@ -80,7 +81,7 @@ def test_populate_does_not_assign_rotation_source_for_crossbreed(tmp_path: Path)
     _seed_admits(kg, [f"distinct hypothesis number {i}" for i in range(5)])
     kg.mkdir(parents=True, exist_ok=True)
     (kg / "file_rotation_state.json").write_text(
-        json.dumps({"counts": {s["key"]: 1 for s in _KAZAKHSTAN_SOURCE_FILES}})
+        json.dumps({"counts": {s["key"]: 2 for s in _KAZAKHSTAN_SOURCE_FILES}})
     )
     (kg / "greedy_init_complete.json").write_text(json.dumps({"status": "complete"}))
 

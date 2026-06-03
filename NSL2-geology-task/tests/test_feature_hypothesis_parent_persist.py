@@ -71,6 +71,21 @@ def _seed_features_index(store_dir: Path, n: int) -> None:
     (store_dir / "index.json").write_text(json.dumps(payload))
 
 
+def _seed_pairwise_distance(
+    kg_dir: Path,
+    distances: dict[tuple[str, str], float],
+) -> None:
+    kg_dir.mkdir(parents=True, exist_ok=True)
+    with (kg_dir / "pairwise_distance.jsonl").open("w") as fh:
+        for (a, b), dist in distances.items():
+            fh.write(json.dumps({
+                "pair_id": f"{min(a, b)}_{max(a, b)}",
+                "node_1": a,
+                "node_2": b,
+                "pairwise_distance": dist,
+            }) + "\n")
+
+
 def test_populate_stamps_parents_from_queue(tmp_path: Path) -> None:
     task = _task(tmp_path)
     variation = _variation(tmp_path)
@@ -108,6 +123,22 @@ def test_concurrent_populates_get_distinct_parent_pairs(tmp_path: Path) -> None:
     assert tuple(first) != tuple(second), (
         "queue must serve distinct ordered pairs to consecutive episodes"
     )
+
+
+def test_populate_stays_survey_until_five_viable_parents(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    variation = _variation(tmp_path)
+    kg_dir = Path(variation.kg_dir)
+    store_dir = Path(variation.store_dir)
+    # Five raw parents, but alpha/beta are a practical duplicate cluster.
+    seeded = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    _seed_experiments(kg_dir, seeded)
+    _seed_features_index(store_dir, n=len(seeded))
+    _seed_pairwise_distance(kg_dir, {("alpha", "beta"): 0.01})
+
+    outcome = task.populate([], variation)
+
+    assert outcome.episode_context["workflow_kind"] == "survey"
 
 
 def test_kg_record_persists_parent_node_ids(tmp_path: Path) -> None:

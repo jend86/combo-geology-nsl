@@ -121,6 +121,12 @@ _PARENT_USE_DECAY = 0.05     # γ — safety rail while tensor novelty guards be
                              # without hard-banning high-value parents.
 _PAIR_DISTANCE_WEIGHT = 2.0  # λ for the orthogonality term in the score prior
 _CONSUMMATED_DISCOUNT = 0.25
+# Pairs whose measured pairwise distance is strictly below this threshold are
+# considered near-duplicates (jittered) and are excluded from the crossbreed
+# queue. Applies to both Jaccard (boolean) and MAE (continuous) distances.
+# A missing index entry is treated as "unknown" (not a duplicate). Seeded
+# conservatively; calibrate after the first audited run.
+_NEAR_DUPLICATE_PAIR_THRESHOLD = 0.05
 
 
 # Coe Fairbairn grid specification - High resolution for spatial features
@@ -2729,27 +2735,51 @@ finally:
 
         return base_prompt
     
+    @classmethod
+    def _count_diverse_parents(
+        cls,
+        experiments: list[dict[str, Any]],
+        distance_index: dict[str, float],
+    ) -> int:
+        """Count the largest set of mutually-diverse parent-eligible experiments.
+
+        Two experiments are near-duplicates when their measured pairwise
+        distance is below _NEAR_DUPLICATE_PAIR_THRESHOLD. Missing distance
+        entries are treated as "unknown" (not a duplicate) so an empty or
+        partial index never falsely blocks the survey advance.
+
+        Greedy selection sorted by |bic_delta| descending so stronger parents
+        are preferred when breaking ties. N is bounded by KG saturation (~20)
+        so O(N²) is negligible.
+        """
+        sorted_exps = sorted(
+            experiments,
+            key=lambda e: abs(float(e.get("bic_delta") or 0.0)),
+            reverse=True,
+        )
+        selected: list[str] = []
+        for exp in sorted_exps:
+            node_id = exp["node_id"]
+            is_near_dup = False
+            for sel_id in selected:
+                pair_id = f"{min(node_id, sel_id)}_{max(node_id, sel_id)}"
+                dist = distance_index.get(pair_id)
+                if dist is not None and dist < _NEAR_DUPLICATE_PAIR_THRESHOLD:
+                    is_near_dup = True
+                    break
+            if not is_near_dup:
+                selected.append(node_id)
+        return len(selected)
+
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisVariation) -> bool:
-        """Check if there are crossbreed pairs available."""
-        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
-        if not experiments_file.exists():
-            return False
+        """Check if there are ≥5 mutually-diverse crossbreed-parent-eligible experiments."""
         try:
-            # Count successful experiments in JSONL format
-            admitted_count = 0
-            with open(experiments_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            exp = json.loads(line)
-                            if exp.get("bic_delta", 0) < 0:  # Successful experiments only
-                                admitted_count += 1
-                        except json.JSONDecodeError:
-                            continue
+            kg_dir = Path(variation.kg_dir)
+            experiments = self._load_successful_experiments(kg_dir)
+            distance_index = self._load_distance_index(kg_dir)
             # Floor raised 2 → 5 so the full source-rotation list is explored
             # at least once before crossbreeding begins (file-rotation tuning).
-            return admitted_count >= 5
+            return self._count_diverse_parents(experiments, distance_index) >= 5
         except Exception:
             return False
 
@@ -3565,10 +3595,19 @@ finally:
             pair_id = rec.get("pair_id")
             if not isinstance(pair_id, str):
                 continue
+            raw = rec.get("pairwise_distance")
+            if raw is None:
+                continue
             try:
-                distances[pair_id] = float(rec.get("pairwise_distance", 0.0))
+                dist = float(raw)
             except (TypeError, ValueError):
                 continue
+            # 0.0 is written for pairs where distance was not computed (missing
+            # from evaluate result). Treat as "unknown" — do not let it trigger
+            # the near-duplicate gate. Identical layers are caught by hash checks.
+            if dist == 0.0:
+                continue
+            distances[pair_id] = dist
         return distances
 
     @staticmethod
@@ -3592,7 +3631,12 @@ finally:
                     f"{min(exp_a['node_id'], exp_b['node_id'])}_"
                     f"{max(exp_a['node_id'], exp_b['node_id'])}"
                 )
-                distance = distance_index.get(dist_pair_id, 0.0)
+                # None = distance unknown (missing from index): treat as not a
+                # near-duplicate so that incomplete indices never silently block
+                # all pairing.
+                distance = distance_index.get(dist_pair_id)
+                if distance is not None and distance < _NEAR_DUPLICATE_PAIR_THRESHOLD:
+                    continue  # near-duplicate pair — skip
                 # log1p shrinks BIC outliers (e.g. the |bic|=6.68 fold parent
                 # that monopolised the queue under linear scoring); the λ·dist
                 # term rewards orthogonal parents so redundant high-BIC pairs do
@@ -3600,7 +3644,7 @@ finally:
                 score = (
                     math.log1p(bic_a)
                     + math.log1p(bic_b)
-                    + _PAIR_DISTANCE_WEIGHT * distance
+                    + _PAIR_DISTANCE_WEIGHT * (distance if distance is not None else 0.0)
                 )
                 out.append({
                     "pair_id": self._ordered_pair_id(exp_a["node_id"], exp_b["node_id"]),

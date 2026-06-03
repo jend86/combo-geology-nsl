@@ -148,6 +148,12 @@ _PARENT_USE_DECAY = 0.05     # γ — safety rail while tensor novelty guards be
                              # without hard-banning high-value parents.
 _PAIR_DISTANCE_WEIGHT = 2.0  # λ for the orthogonality term in the score prior
 _CONSUMMATED_DISCOUNT = 0.25
+# Jaccard distance below which two boolean layers are treated as near-duplicates.
+# Value of 0.15 means >85% footprint overlap — practically the same spatial mask
+# jittered by noise or minor coordinate rounding.  Float layers are not gated
+# here because their raw-MAE distance is in geological units and has no
+# comparable normalised threshold.
+_NEAR_DUPLICATE_JACCARD_THRESHOLD = 0.15
 
 
 # Kazakhstan Teniz Basin grid specification - Regional scale for basin analysis
@@ -3566,7 +3572,13 @@ finally:
                     "timestamp": datetime.now().isoformat(),
                     "mutual_info": evaluate.get('mutual_info', {}),
                     "layer_name": feature_layer_name,
-                    "hypothesis": hypothesise.get('hypothesis', '')
+                    "hypothesis": hypothesise.get('hypothesis', ''),
+                    "layer_dtype": translate.get("dtype", "float"),
+                    "min_pairwise_distance_to_pool": (
+                        min(evaluate.get("pairwise_distance", {}).values())
+                        if evaluate.get("pairwise_distance")
+                        else None
+                    ),
                 }
 
                 # Atomic dedup + scratch→admitted promotion (both inside the
@@ -4790,22 +4802,66 @@ finally:
                 continue
         return 0
     
+    @classmethod
+    def _count_diverse_parents(
+        cls,
+        experiments: list[dict[str, Any]],
+        distance_index: dict[str, float],
+    ) -> int:
+        """Count the largest set of mutually-diverse parent-eligible experiments.
+
+        Two experiments are near-duplicates when their measured pairwise
+        distance is below _NEAR_DUPLICATE_JACCARD_THRESHOLD. Missing distance
+        entries are treated as "unknown" (not a duplicate) so an empty or
+        partial index never falsely blocks the survey advance.
+
+        Greedy selection sorted by |bic_delta| descending so stronger parents
+        are preferred when breaking ties. N is bounded by KG saturation (~20)
+        so O(N²) is negligible.
+        """
+        sorted_exps = sorted(
+            experiments,
+            key=lambda e: abs(float(e.get("bic_delta") or 0.0)),
+            reverse=True,
+        )
+        selected: list[str] = []
+        for exp in sorted_exps:
+            node_id = exp["node_id"]
+            is_near_dup = False
+            for sel_id in selected:
+                pair_id = f"{min(node_id, sel_id)}_{max(node_id, sel_id)}"
+                dist = distance_index.get(pair_id)
+                if dist is not None and dist < _NEAR_DUPLICATE_JACCARD_THRESHOLD:
+                    is_near_dup = True
+                    break
+            if not is_near_dup:
+                selected.append(node_id)
+        return len(selected)
+
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> bool:
-        """Check if there are crossbreed pairs available."""
+        """Check if there are ≥5 mutually-diverse crossbreed-parent-eligible experiments."""
         try:
-            admitted_count = len(self._load_successful_experiments(Path(variation.kg_dir)))
+            kg_dir = Path(variation.kg_dir)
+            experiments = self._load_successful_experiments(kg_dir)
+            distance_index = self._load_distance_index(kg_dir)
             # Floor raised 2 → 5 so the full source-rotation list is explored
             # at least once before crossbreeding begins (file-rotation tuning).
-            return admitted_count >= 5
+            return self._count_diverse_parents(experiments, distance_index) >= 5
         except Exception:
             return False
 
+    # Minimum visits per source file before crossbreeding is allowed.
+    # Two full rotations ensure all 18 geological domains are seen twice,
+    # building a more diverse root population before lineage amplification.
+    _MIN_SOURCE_VISITS_BEFORE_CROSSBREED = 2
+
     def _all_sources_visited(self, kg_dir: str) -> bool:
         """Return True when every source in _KAZAKHSTAN_SOURCE_FILES has been
-        visited at least once according to file_rotation_state.json.
+        visited at least ``_MIN_SOURCE_VISITS_BEFORE_CROSSBREED`` times.
 
-        Gates crossbreeding so it cannot begin before the rotation has covered
-        the whole dataset (rabbit-hole-bias fix, JenD86/file-rotation@72e3239).
+        Gates crossbreeding so it cannot begin before the full-dataset rotation
+        has been covered twice (rabbit-hole-bias fix extended: single-pass
+        coverage was too short for the pool to be diverse enough).
         """
         state_path = Path(kg_dir) / "file_rotation_state.json"
         if not state_path.exists():
@@ -4815,7 +4871,8 @@ finally:
                 counts = json.load(f).get("counts", {})
         except Exception:  # noqa: BLE001
             return False
-        return all(counts.get(s["key"], 0) >= 1 for s in _KAZAKHSTAN_SOURCE_FILES)
+        floor = self._MIN_SOURCE_VISITS_BEFORE_CROSSBREED
+        return all(counts.get(s["key"], 0) >= floor for s in _KAZAKHSTAN_SOURCE_FILES)
 
     def _run_greedy_bic_initialization(
         self, variation: "FeatureHypothesisKazakhstanVariation"
@@ -5870,6 +5927,59 @@ finally:
     _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
 
+    # The first free (first_layer_auto) admit anchors the entire KG and rides a
+    # BIC bypass, so its value distribution must clear a minimum entropy (bits)
+    # — below this it is effectively uniform and a poor anchor. Tunable; the
+    # first root is re-rollable, so a false reject only costs the agent a retry.
+    _FIRST_ROOT_MIN_VALUE_ENTROPY = 0.5
+
+    @classmethod
+    def _first_root_admission_ok(cls, kg_record: dict[str, Any]) -> bool:
+        """Stricter hard gate for the first free (first_layer_auto) admit.
+
+        Returns True (no-op) for any non-first-root record — later layers keep
+        the generous admission policy where single-op / uniform / low-entropy
+        are telemetry only (see relative-mae-guarded-evidence-tier-admission
+        and normalized-pairwise-distance-near-duplicate-gate docs).
+
+        For the first root only:
+          - all-creative_fallback is rejected regardless of the
+            allow_creative_fallback_admission override (the anchor must rest on
+            real provenance), and
+          - single-op / uniform-value / low-entropy roots are rejected as
+            degenerate anchors.
+
+        Stamps ``first_root_rejection_reason`` for audit. Must run *after*
+        ``_stamp_candidate_provenance`` and ``_stamp_candidate_triviality`` so
+        the fields it reads are populated.
+        """
+        if kg_record.get("admission_path") != "first_layer_auto":
+            kg_record["first_root_rejection_reason"] = "none"
+            return True
+
+        reasons: list[str] = []
+
+        # Override-proof: re-derive all-fallback from the stamped provenance
+        # fields *without* consulting allow_creative_fallback_admission.
+        counts = kg_record.get("coordinate_source_counts") or {}
+        if not isinstance(counts, dict):
+            counts = {}
+        op_count = int(kg_record.get("spatial_operation_provenance_count", 0) or 0)
+        fallback_count = int(counts.get("creative_fallback", 0) or 0)
+        if op_count > 0 and fallback_count == op_count:
+            reasons.append("all_creative_fallback")
+
+        if bool(kg_record.get("single_spatial_operation")):
+            reasons.append("single_spatial_operation")
+        if bool(kg_record.get("uniform_nonzero_value")):
+            reasons.append("uniform_nonzero_value")
+        entropy = float(kg_record.get("candidate_value_entropy", 0.0) or 0.0)
+        if entropy < cls._FIRST_ROOT_MIN_VALUE_ENTROPY:
+            reasons.append("low_value_entropy")
+
+        kg_record["first_root_rejection_reason"] = reasons[0] if reasons else "none"
+        return not reasons
+
     @staticmethod
     def _normalise_evidence_tier(value: Any) -> str:
         tier = str(value or "mixed").strip().lower()
@@ -5890,6 +6000,21 @@ finally:
             return False
         if bool(record.get("declared_nothing", False)):
             return False
+        # Near-duplicate gate (all dtypes): if this layer practically duplicates
+        # any existing pool member it must not seed crossbreed lineage. The
+        # distance metric (scoring.pairwise_distance) is now normalized to [0, 1]
+        # for every dtype — Jaccard for boolean, magnitude-normalized L1 for
+        # float — so the single 0.15 threshold (≈85% agreement) applies
+        # uniformly. This catches jittered float near-duplicates that the old
+        # boolean-only check let through (and that could otherwise satisfy the
+        # ≥5-diverse-parents survey-exit gate with clones of one layer).
+        min_dist = record.get("min_pairwise_distance_to_pool")
+        if min_dist is not None:
+            try:
+                if float(min_dist) < _NEAR_DUPLICATE_JACCARD_THRESHOLD:
+                    return False
+            except (TypeError, ValueError):
+                pass
         try:
             strength = float(record.get("evidence_strength", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -6357,7 +6482,16 @@ finally:
                 )
                 self._stamp_candidate_triviality(kg_record, values=candidate_values)
                 emptiness_passed = not bool(kg_record.get("declared_nothing", False))
-                if not (novelty_passed and provenance_passed and emptiness_passed):
+                # First free admit anchors the KG: override-proof against
+                # creative_fallback and reject degenerate (single-op / uniform /
+                # low-entropy) roots. No-op for later layers.
+                first_root_passed = self._first_root_admission_ok(kg_record)
+                if not (
+                    novelty_passed
+                    and provenance_passed
+                    and emptiness_passed
+                    and first_root_passed
+                ):
                     kg_record["admission_tier"] = "guard_rejected"
                     kg_record["crossbreed_parent_eligible"] = False
                     return False
@@ -6607,10 +6741,20 @@ finally:
             pair_id = rec.get("pair_id")
             if not isinstance(pair_id, str):
                 continue
+            raw = rec.get("pairwise_distance")
+            if raw is None:
+                continue
             try:
-                distances[pair_id] = float(rec.get("pairwise_distance", 0.0))
+                dist = float(raw)
             except (TypeError, ValueError):
                 continue
+            # 0.0 is written by _update_pairwise_distance_index for pairs
+            # where the distance was not computed (missing from evaluate result).
+            # Treat 0.0 as "unknown" so it does not trigger near-duplicate gates.
+            # Genuinely identical layers are caught by hash-based exact-dup checks.
+            if dist == 0.0:
+                continue
+            distances[pair_id] = dist
         return distances
 
     @staticmethod
@@ -6634,14 +6778,19 @@ finally:
                     f"{min(exp_a['node_id'], exp_b['node_id'])}_"
                     f"{max(exp_a['node_id'], exp_b['node_id'])}"
                 )
-                distance = distance_index.get(dist_pair_id, 0.0)
+                # None = distance unknown (missing from index): treat as not a
+                # near-duplicate so that incomplete indices never silently block
+                # all pairing.
+                distance = distance_index.get(dist_pair_id)
+                if distance is not None and distance < _NEAR_DUPLICATE_JACCARD_THRESHOLD:
+                    continue  # near-duplicate pair — skip
                 # log1p shrinks BIC outliers (e.g. the |bic|=6.68 fold parent
                 # that monopolised the queue under linear scoring); the λ·dist
                 # term rewards orthogonal parents.
                 score = (
                     math.log1p(bic_a)
                     + math.log1p(bic_b)
-                    + _PAIR_DISTANCE_WEIGHT * distance
+                    + _PAIR_DISTANCE_WEIGHT * (distance if distance is not None else 0.0)
                 )
                 out.append({
                     "pair_id": self._ordered_pair_id(exp_a["node_id"], exp_b["node_id"]),
