@@ -2016,13 +2016,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "   - Tests geological relationships and patterns\n"
                         "   - Saves results to files: df.to_csv('/tmp/results.csv'), np.save('/tmp/arr.npy', arr)\n"
                         "   NOTE: ONLY files written to /tmp/ become artifacts. In-memory variables are discarded.\n"
-                        "   - KEY DELIVERABLE (the spatial spec): when your analysis localizes the feature, write\n"
-                        "     /tmp/feature_points.csv with columns longitude,latitude,depth_m,value,coordinate_source --\n"
-                        "     ONE ROW PER LOCATION the feature occupies (every located prospect/contact/sample your\n"
-                        "     analysis supports), NOT a single representative point. 'value' carries the per-location\n"
-                        "     quantity (concentration, probability, score); 'coordinate_source' is 'artifact' when the\n"
-                        "     coordinate came from the dataset, else 'geonames'/'web'/'creative_fallback'. The next phase\n"
-                        "     maps this table directly to voxels. (This is a data table, not voxel creation.)\n"
+                        "   - KEY DELIVERABLE (the spatial spec): when your analysis localizes the feature, build a\n"
+                        "     pandas DataFrame named EXACTLY `feature_points` with EXACTLY these columns:\n"
+                        "     longitude, latitude, depth_m, value, coordinate_source -- ONE ROW PER LOCATION the\n"
+                        "     feature occupies (every located prospect/contact/sample your analysis supports), NOT a\n"
+                        "     single representative point. It is auto-saved as an artifact for the next phase. 'value'\n"
+                        "     carries the per-location quantity (concentration, probability, score); 'coordinate_source'\n"
+                        "     is 'artifact' when the coordinate came from the dataset, else 'geonames'/'web'/\n"
+                        "     'creative_fallback'. The next phase maps this table directly to voxels. (This is a data\n"
+                        "     table, not voxel creation.)\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -3010,21 +3012,31 @@ except Exception as user_code_error:
         in artifact_files; falls back to <artifact_directory>/feature_points.csv."""
         import csv as _csv
         import os as _os
+        import re as _re
+
+        # The execution sandbox captures a top-level `feature_points` DataFrame as
+        # 'feature_points_dataframe.csv' (varname + type suffix), so match both that and a
+        # plainly-written 'feature_points.csv'.
+        def _is_fp(name) -> bool:
+            return bool(_re.fullmatch(r"feature_points(_dataframe)?\.csv", _os.path.basename(str(name))))
 
         path = None
         for f in artifact_files or []:
-            if str(f).endswith("feature_points.csv"):
+            if _is_fp(f):
                 if _os.path.exists(str(f)):
                     path = str(f)
-                elif artifact_directory:
+                    break
+                if artifact_directory:
                     cand = _os.path.join(artifact_directory, _os.path.basename(str(f)))
                     if _os.path.exists(cand):
                         path = cand
-                break
+                        break
         if path is None and artifact_directory:
-            cand = _os.path.join(artifact_directory, "feature_points.csv")
-            if _os.path.exists(cand):
-                path = cand
+            for _nm in ("feature_points.csv", "feature_points_dataframe.csv"):
+                cand = _os.path.join(artifact_directory, _nm)
+                if _os.path.exists(cand):
+                    path = cand
+                    break
         if path is None:
             return [], False
 

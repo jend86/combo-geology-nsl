@@ -24,6 +24,19 @@ def test_load_feature_points_from_full_path(tmp_path):
     assert rows[1]["value"] == "0.5"
 
 
+def test_load_feature_points_dataframe_capture_name(tmp_path):
+    # the execution sandbox captures a `feature_points` DataFrame variable as
+    # feature_points_dataframe.csv -- the helper MUST match this real artifact name
+    p = tmp_path / "feature_points_dataframe.csv"
+    p.write_text(
+        "longitude,latitude,depth_m,value,coordinate_source\n"
+        "68.04,51.99,40,1.0,artifact\n"
+    )
+    rows, truncated = T._load_feature_points([str(p)], str(tmp_path))
+    assert len(rows) == 1
+    assert rows[0]["latitude"] == "51.99"
+
+
 def test_load_feature_points_missing_returns_empty(tmp_path):
     rows, truncated = T._load_feature_points([str(tmp_path / "results.npy")], str(tmp_path))
     assert rows == []
