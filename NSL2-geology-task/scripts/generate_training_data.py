@@ -36,7 +36,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rebuild-harness",
         action="store_true",
-        help="Force a no-cache rebuild of the harness image, even if an image with the same tag already exists locally. **Required** after editing docker/<harness>/Dockerfile or anything inside its build context - otherwise the cached image is reused silently and your changes do not run. No-op for configs without a [harness.container.build] block (image is pulled, not built). Escape hatch: `docker rmi <image-tag>` then re-run. See docs/design/harness-image-provisioning.md.",
+        help="Force a no-cache rebuild of the harness image, even if an image with the same tag already exists locally. **Required** after editing docker/<harness>/Dockerfile or anything inside its build context - otherwise the cached image is reused silently and your changes do not run. No-op for configs without a [harness.container.build] block (image is pulled, not built). Escape hatch: `docker rmi <image-tag>` then re-run. Prefer this flag after any harness build-context edit.",
     )
     return parser.parse_args()
 

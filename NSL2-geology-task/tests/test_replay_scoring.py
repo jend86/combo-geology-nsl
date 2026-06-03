@@ -66,14 +66,16 @@ def _build_fake_run(tmp: Path, n_layers: int = 3) -> tuple[Path, Path, list[dict
         np.save(layers_dir / f"{layer_name}.npy", values)
         seed = _seed_for_node(node_id)
         result = evaluate_new_layer(score_store, layer_name, values, "float", seed=seed)
+        bic_delta = result["bic_delta"]
         rows.append({
             "node_id": node_id,
             "layer_name": layer_name,
-            "bic_delta": float(result["bic_delta"]),
+            "bic_delta": float(bic_delta) if bic_delta is not None else None,
             "masking_test_passed": bool(result["masking_test_passed"]),
             "masking_test_improvement": float(result["masking_test_improvement"]),
             "masking_test_direction": result["masking_test_direction"],
             "stage_completed": result["stage_completed"],
+            "admission_path": result.get("admission_path", "normal"),
             "scoring_version": "two_stage_v2",
             "timestamp": "2026-05-25T00:00:00",
         })
@@ -143,9 +145,13 @@ def test_replay_reproduces_seeded_scoring(tmp_path: Path) -> None:
     for original, replayed in zip(rows, report):
         # Replay should reproduce the exact bic_delta (same seed, same code path)
         assert replayed["status"] == "ok", replayed
-        assert replayed["replay"]["bic_delta"] == pytest.approx(
-            original["bic_delta"], abs=1e-9
-        ), f"replay diverged from original for {original['node_id']}"
+        assert replayed["replay"]["admission_path"] == original["admission_path"]
+        if original["bic_delta"] is None:
+            assert replayed["replay"]["bic_delta"] is None
+        else:
+            assert replayed["replay"]["bic_delta"] == pytest.approx(
+                original["bic_delta"], abs=1e-9
+            ), f"replay diverged from original for {original['node_id']}"
 
 
 # ---------------------------------------------------------------------------

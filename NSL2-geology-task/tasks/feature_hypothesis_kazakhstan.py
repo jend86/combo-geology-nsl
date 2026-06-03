@@ -475,6 +475,12 @@ class FeatureHypothesisKazakhstanState:
     stage_1_mae_tolerance: float | None = None
     stage_1_bic_rescue_threshold: float | None = None
     stage_completed: str = "stage_2_completed"
+    admission_path: str = "normal"
+    proposal_evidence_tier: str = "mixed"
+    confidence: float | None = None
+    evidence_strength: float | None = None
+    admission_tier: str | None = None
+    crossbreed_parent_eligible: bool | None = None
     
     # Crossbreeding context
     parent_experiments: list[str] = field(default_factory=list)
@@ -2188,8 +2194,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
             f"{crossbreed_ctx.get('prompt', '')}\n\n"
             f"{crossbreed_grounding}"
             "Include a data_spec as before.\n\n"
+            "Declare evidence_tier='weak' when support is indirect, text-only, single-record, or contradicted by prospect metadata. Declaring weak costs no reward; it only raises the system's parentage caution.\n\n"
             "Close with:\n"
-            "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., "
+            "  record_phase(phase='hypothesise', hypothesis=..., data_spec=..., evidence_tier=..., self_assessment=..., "
             f"parent_experiments={parent_ids})"
         )
 
@@ -2258,6 +2265,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         },
                         "hypothesis": {"type": "string"},
                         "data_spec": {"type": "object"},
+                        "evidence_tier": {
+                            "type": "string",
+                            "enum": ["weak", "mixed", "strong"],
+                            "description": "Agent-declared evidence strength; telemetry only.",
+                        },
+                        "self_assessment": {
+                            "type": "object",
+                            "description": "Evidence confidence/basis/limitations/sources; telemetry only.",
+                        },
                         "feature_layer_name": {"type": "string"},
                         "parent_experiments": {"type": "array", "items": {"type": "string"}},
                     },
@@ -2705,6 +2721,8 @@ except Exception as user_code_error:
             "corpora_sampled": args.get("corpora_sampled"),
             "hypothesis": args.get("hypothesis"),
             "data_spec": args.get("data_spec"),
+            "evidence_tier": self._normalise_evidence_tier(args.get("evidence_tier")),
+            "self_assessment": args.get("self_assessment") if isinstance(args.get("self_assessment"), dict) else {},
             "feature_layer_name": args.get("feature_layer_name"),
             "parent_experiments": args.get("parent_experiments"),
             "timestamp": time.time(),
@@ -3144,6 +3162,16 @@ except Exception as user_code_error:
                 "bic_delta": evaluate.get("bic_delta"),
                 "admitted": evaluate.get("admitted", False),
                 "mutual_info": evaluate.get("mutual_info", {}),
+                "admission_path": evaluate.get("admission_path"),
+                "proposal_evidence_tier": self._normalise_evidence_tier(hypothesise.get("evidence_tier")),
+                "self_assessment": hypothesise.get("self_assessment", {}),
+                "confidence": (hypothesise.get("self_assessment") or {}).get("confidence")
+                if isinstance(hypothesise.get("self_assessment"), dict)
+                else None,
+                "evidence_strength": evaluate.get("evidence_strength"),
+                "admission_tier": evaluate.get("admission_tier"),
+                "crossbreed_parent_eligible": evaluate.get("crossbreed_parent_eligible"),
+                "relative_mae_mean": evaluate.get("relative_mae_mean"),
             },
             success=True,
         )
@@ -3382,6 +3410,12 @@ finally:
         stage_1_mae_tolerance = evaluate.get('stage_1_mae_tolerance')
         stage_1_bic_rescue_threshold = evaluate.get('stage_1_bic_rescue_threshold')
         stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
+        admission_path = evaluate.get('admission_path', 'normal')
+        proposal_evidence_tier = self._normalise_evidence_tier(hypothesise.get("evidence_tier"))
+        self_assessment = hypothesise.get("self_assessment")
+        if not isinstance(self_assessment, dict):
+            self_assessment = {}
+        confidence = self_assessment.get("confidence")
         
         training_record = {
             'prompt': training_pair.get('prompt', ''),
@@ -3399,6 +3433,16 @@ finally:
             'stage_1_mae_tolerance': stage_1_mae_tolerance,
             'stage_1_bic_rescue_threshold': stage_1_bic_rescue_threshold,
             'stage_completed': stage_completed,
+            'admission_path': admission_path,
+            'proposal_evidence_tier': proposal_evidence_tier,
+            'self_assessment': self_assessment,
+            'confidence': confidence,
+            'evidence_strength': evaluate.get('evidence_strength'),
+            'admission_tier': evaluate.get('admission_tier'),
+            'crossbreed_parent_eligible': evaluate.get('crossbreed_parent_eligible'),
+            'relative_mae_mean': evaluate.get('relative_mae_mean'),
+            'relative_mae_min': evaluate.get('relative_mae_min'),
+            'relative_mae_max': evaluate.get('relative_mae_max'),
             'metadata': {
                 'hypothesis': hypothesise.get('hypothesis', ''),
                 'grid_bounds': ctx.episode_context.get('grid_spec', {}),
@@ -3413,6 +3457,7 @@ finally:
                     'stage_1_mae_tolerance': stage_1_mae_tolerance,
                     'stage_1_bic_rescue_threshold': stage_1_bic_rescue_threshold,
                     'stage_completed': stage_completed,
+                    'admission_path': admission_path,
                     'scoring_version': 'two_stage_v2'
                 }
             }
@@ -3449,6 +3494,7 @@ finally:
             admitted=admitted,
             bic_delta=bic_delta,
             stage_completed=stage_completed,
+            admission_path=admission_path,
         )
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
@@ -3499,7 +3545,18 @@ finally:
                     "stage_1_mae_tolerance": stage_1_mae_tolerance,
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_completed": stage_completed,
+                    "admission_path": admission_path,
                     "scoring_version": "two_stage_v2",
+                    "proposal_evidence_tier": proposal_evidence_tier,
+                    "self_assessment": self_assessment,
+                    "confidence": confidence,
+                    "relative_mae_mean": evaluate.get('relative_mae_mean'),
+                    "relative_mae_min": evaluate.get('relative_mae_min'),
+                    "relative_mae_max": evaluate.get('relative_mae_max'),
+                    "bic_delta_raw": evaluate.get('bic_delta_raw'),
+                    "n_effective_samples": evaluate.get('n_effective_samples'),
+                    "candidate_nonzero_voxels": evaluate.get('candidate_nonzero_voxels'),
+                    "candidate_fill_fraction": evaluate.get('candidate_fill_fraction'),
                     "artifact_links": {
                         "layer_file": f"store/teniz_basin/admitted/layers/{feature_layer_name}.npy" if feature_layer_name else None,
                         "spatial_ops": f"store/teniz_basin/scratch/{episode_id}/spatial.db:experiment_{episode_id}" if episode_id else None
@@ -3534,7 +3591,47 @@ finally:
                     admitted_dir=admitted_dir,
                     layer_name=feature_layer_name or None,
                 )
+                for key in (
+                    "evidence_strength",
+                    "admission_tier",
+                    "crossbreed_parent_eligible",
+                    "corroboration_count",
+                    "artifact_backed_fraction",
+                    "declared_nothing",
+                    "emptiness_rejection_reason",
+                    "declared_footprint_size",
+                    "candidate_value_entropy",
+                    "candidate_unique_nonzero_values",
+                    "spatial_operation_provenance_count",
+                    "coordinate_source_counts",
+                    "novelty_guard_passed",
+                    "novelty_rejection_reason",
+                    "provenance_guard_passed",
+                    "provenance_rejection_reason",
+                ):
+                    if key in kg_record:
+                        evaluate[key] = kg_record[key]
+                phase_records["evaluate"] = evaluate
                 duplicate_rejected = not admitted_to_kg
+                if (
+                    not admitted_to_kg
+                    and kg_record.get("admission_tier") == "guard_rejected"
+                ):
+                    guard_evaluate = dict(evaluate)
+                    guard_evaluate.update({
+                        key: value
+                        for key, value in kg_record.items()
+                        if key not in {"prompt", "response"}
+                    })
+                    guard_evaluate["admitted"] = False
+                    guard_evaluate["stage_completed"] = "guard_rejected"
+                    rejected_quarantine = self._quarantine_rejected_candidate(
+                        store_dir=store_dir,
+                        episode_id=episode_id,
+                        layer_name=feature_layer_name,
+                        evaluate=guard_evaluate,
+                        phase_records=phase_records,
+                    )
                 if admitted_to_kg:
                     self._update_crossbreed_index(
                         knowledge_dir,
@@ -4415,6 +4512,14 @@ finally:
             stage_1_mae_tolerance=evaluate.get("stage_1_mae_tolerance"),
             stage_1_bic_rescue_threshold=evaluate.get("stage_1_bic_rescue_threshold"),
             stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
+            admission_path=evaluate.get("admission_path", "normal"),
+            proposal_evidence_tier=self._normalise_evidence_tier(hypothesise.get("evidence_tier")),
+            confidence=(hypothesise.get("self_assessment") or {}).get("confidence")
+            if isinstance(hypothesise.get("self_assessment"), dict)
+            else None,
+            evidence_strength=evaluate.get("evidence_strength"),
+            admission_tier=evaluate.get("admission_tier"),
+            crossbreed_parent_eligible=evaluate.get("crossbreed_parent_eligible"),
             prompt_response_pair=terminal_record.get("training_pair", {}),
         )
     
@@ -4437,6 +4542,23 @@ finally:
         admitted = final.admitted
         stage_completed = final.stage_completed
 
+        if bic_delta is None and final.admission_path == "first_layer_auto" and admitted:
+            return TaskReward(
+                value=1.0,
+                success=True,
+                breakdown={
+                    "stage_1_passed": True,
+                    "stage_2_passed": False,
+                    "first_layer_auto": True,
+                    "bic_delta": None,
+                    "proposal_evidence_tier": final.proposal_evidence_tier,
+                    "evidence_strength": final.evidence_strength,
+                    "admission_tier": final.admission_tier,
+                    "crossbreed_parent_eligible": final.crossbreed_parent_eligible,
+                    "region": "kazakhstan",
+                },
+            )
+
         if bic_delta is None:
             # No feature layer created
             return TaskReward(
@@ -4452,7 +4574,7 @@ finally:
         # auto_pass / first_layer cannot compute a before/after MAE delta, so they
         # take full Stage 1 credit (no baseline to compare against).
         if masking_test_passed and admitted:
-            if masking_test_direction in ("auto_pass", "first_layer"):
+            if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0
             else:
                 stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
@@ -4474,11 +4596,15 @@ finally:
                     "stage2_reward": stage2_reward,
                     "final_reward": value,
                     "both_stages_passed": True,
+                    "proposal_evidence_tier": final.proposal_evidence_tier,
+                    "evidence_strength": final.evidence_strength,
+                    "admission_tier": final.admission_tier,
+                    "crossbreed_parent_eligible": final.crossbreed_parent_eligible,
                     "region": "kazakhstan",
                 },
             )
         elif masking_test_passed and not admitted:
-            if masking_test_direction in ("auto_pass", "first_layer"):
+            if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0
             else:
                 stage1_reward = min(1.0, max(0.0, masking_test_improvement / 1e-4))
@@ -4497,6 +4623,10 @@ finally:
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
                     "partial_success": True,
+                    "proposal_evidence_tier": final.proposal_evidence_tier,
+                    "evidence_strength": final.evidence_strength,
+                    "admission_tier": final.admission_tier,
+                    "crossbreed_parent_eligible": final.crossbreed_parent_eligible,
                     "region": "kazakhstan",
                 },
             )
@@ -4513,6 +4643,10 @@ finally:
                     "stage_2_passed": admitted,
                     "bic_delta": bic_delta,
                     "no_predictive_value": True,
+                    "proposal_evidence_tier": final.proposal_evidence_tier,
+                    "evidence_strength": final.evidence_strength,
+                    "admission_tier": final.admission_tier,
+                    "crossbreed_parent_eligible": final.crossbreed_parent_eligible,
                     "region": "kazakhstan",
                 },
             )
@@ -4658,22 +4792,8 @@ finally:
     
     def _has_crossbreed_pairs(self, variation: FeatureHypothesisKazakhstanVariation) -> bool:
         """Check if there are crossbreed pairs available."""
-        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
-        if not experiments_file.exists():
-            return False
         try:
-            # Count successful experiments in JSONL format
-            admitted_count = 0
-            with open(experiments_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            exp = json.loads(line)
-                            if exp.get("bic_delta", 0) < 0:  # Successful experiments only
-                                admitted_count += 1
-                        except json.JSONDecodeError:
-                            continue
+            admitted_count = len(self._load_successful_experiments(Path(variation.kg_dir)))
             # Floor raised 2 → 5 so the full source-rotation list is explored
             # at least once before crossbreeding begins (file-rotation tuning).
             return admitted_count >= 5
@@ -5043,7 +5163,15 @@ finally:
             "          'analysis': '...',\n"
             "          'output': '...'\n"
             "      }\n"
+            "      evidence_tier='weak' | 'mixed' | 'strong',\n"
+            "      self_assessment={\n"
+            "          'confidence': 0.0-1.0,\n"
+            "          'evidence_basis': '...',\n"
+            "          'known_limitations': [...],\n"
+            "          'evidence_sources': [...]\n"
+            "      }\n"
             "  )\n\n"
+            "Declare evidence_tier='weak' when support is indirect, text-only, single-record, or contradicted by prospect metadata. Declaring weak is allowed and costs no reward; it only makes the system more cautious about crossbreed parentage.\n"
             "Your hypothesis MUST be grounded in what you found in the assigned source above.\n"
             "Do NOT introduce topics not present in the assigned source."
         )
@@ -5057,24 +5185,8 @@ finally:
         import json
         
         try:
-            experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
             crossbreed_file = Path(variation.kg_dir) / _KG_CROSSBREED_INDEX
-
-            if not experiments_file.exists():
-                return {}
-            
-            # Load all successful experiments
-            experiments = []
-            with open(experiments_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            exp = json.loads(line)
-                            if exp.get("bic_delta", 0) < 0:  # Only successful experiments
-                                experiments.append(exp)
-                        except json.JSONDecodeError:
-                            continue
+            experiments = self._load_successful_experiments(Path(variation.kg_dir))
             
             if len(experiments) < 2:
                 return {}
@@ -5147,25 +5259,8 @@ finally:
         variation: FeatureHypothesisKazakhstanVariation,
     ) -> dict[str, Any]:
         """Simple fallback crossbreed selection - just first two admitted."""
-        experiments_file = Path(variation.kg_dir) / _KG_EXPERIMENTS
-        if not experiments_file.exists():
-            return {}
-        
         try:
-            # Load first two successful experiments from JSONL
-            experiments = []
-            with open(experiments_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            exp = json.loads(line)
-                            if exp.get("bic_delta", 0) < 0:  # Only successful experiments
-                                experiments.append(exp)
-                                if len(experiments) >= 2:
-                                    break  # Just need first two
-                        except json.JSONDecodeError:
-                            continue
+            experiments = self._load_successful_experiments(Path(variation.kg_dir))[:2]
             
             if len(experiments) < 2:
                 return {}
@@ -5307,6 +5402,9 @@ finally:
         "stage_2_completed",
         "mae_bic_completed",
     })
+    _QUARANTINE_STAGE_ALLOWLIST: frozenset[str] = _STAGE_COMPLETED_ALLOWLIST | frozenset({
+        "guard_rejected",
+    })
 
     @classmethod
     def _should_persist_to_kg(
@@ -5316,6 +5414,7 @@ finally:
         admitted: bool,
         bic_delta: float | None,
         stage_completed: str,
+        admission_path: str | None = None,
     ) -> bool:
         """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
         experiments enter the kg pool.
@@ -5331,6 +5430,8 @@ finally:
             return False
         if not bool(admitted):
             return False
+        if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
+            return True
         if bic_delta is None or bic_delta >= 0:
             return False
         return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
@@ -5344,7 +5445,7 @@ finally:
         """
         bic_delta = evaluate.get("bic_delta")
         stage_completed = str(evaluate.get("stage_completed", ""))
-        if bic_delta is None or stage_completed not in cls._STAGE_COMPLETED_ALLOWLIST:
+        if bic_delta is None or stage_completed not in cls._QUARANTINE_STAGE_ALLOWLIST:
             return False
         return not cls._should_persist_to_kg(
             masking_test_passed=bool(evaluate.get("masking_test_passed", True)),
@@ -5355,6 +5456,8 @@ finally:
 
     @staticmethod
     def _rejection_stage(evaluate: dict[str, Any]) -> str:
+        if evaluate.get("stage_completed") == "guard_rejected" or evaluate.get("admission_tier") == "guard_rejected":
+            return "guard"
         if not bool(evaluate.get("masking_test_passed", True)):
             return "stage_1"
         if not bool(evaluate.get("admitted", False)):
@@ -5763,6 +5866,297 @@ finally:
         rounded = np.round(np.asarray(values, dtype=float), 6)
         return "sha256:" + hashlib.sha256(rounded.tobytes()).hexdigest()
 
+    _PARENTAGE_BASE_THRESHOLD = 0.50
+    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
+    _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
+
+    @staticmethod
+    def _normalise_evidence_tier(value: Any) -> str:
+        tier = str(value or "mixed").strip().lower()
+        return tier if tier in {"weak", "mixed", "strong"} else "mixed"
+
+    @classmethod
+    def _parentage_threshold_for(cls, record: dict[str, Any]) -> float:
+        threshold = cls._PARENTAGE_BASE_THRESHOLD
+        if cls._normalise_evidence_tier(record.get("proposal_evidence_tier")) == "weak":
+            threshold += cls._PARENTAGE_WEAK_THRESHOLD_BONUS
+        return threshold
+
+    @classmethod
+    def _is_crossbreed_parent_eligible(cls, record: dict[str, Any]) -> bool:
+        if not bool(record.get("novelty_guard_passed", True)):
+            return False
+        if not bool(record.get("provenance_guard_passed", True)):
+            return False
+        if bool(record.get("declared_nothing", False)):
+            return False
+        try:
+            strength = float(record.get("evidence_strength", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        return strength >= cls._parentage_threshold_for(record)
+
+    @classmethod
+    def _stamp_candidate_triviality(cls, kg_record: dict, *, values: Any) -> None:
+        import numpy as np
+
+        candidate = np.asarray(values, dtype=float)
+        nonzero_values = candidate[candidate != 0]
+        if nonzero_values.size:
+            unique_nonzero = np.unique(np.round(nonzero_values, 6))
+            value_min = float(np.min(nonzero_values))
+            value_max = float(np.max(nonzero_values))
+            if unique_nonzero.size <= 1:
+                entropy = 0.0
+            else:
+                _, counts = np.unique(np.round(nonzero_values, 6), return_counts=True)
+                probs = counts / counts.sum()
+                entropy = float(-np.sum(probs * np.log2(probs + 1e-12)))
+            support = candidate != 0
+        else:
+            unique_nonzero = np.array([])
+            value_min = None
+            value_max = None
+            entropy = 0.0
+            support = np.zeros(candidate.shape, dtype=bool)
+
+        z_levels = int(np.any(support, axis=(0, 1)).sum()) if candidate.ndim == 3 else 0
+        depth_levels_filled = bool(candidate.ndim == 3 and z_levels == candidate.shape[2] and z_levels > 0)
+        op_count = int(kg_record.get("spatial_operation_provenance_count", 0) or 0)
+        nonzero = int(kg_record.get("candidate_nonzero_voxels", np.count_nonzero(candidate)) or 0)
+        declared_footprint_size = nonzero if nonzero > 0 else op_count
+        declared_nothing = op_count == 0 and nonzero == 0
+
+        kg_record.update({
+            "candidate_unique_nonzero_values": int(unique_nonzero.size),
+            "candidate_nonzero_value_min": value_min,
+            "candidate_nonzero_value_max": value_max,
+            "candidate_value_entropy": entropy,
+            "single_spatial_operation": op_count == 1,
+            "uniform_nonzero_value": bool(nonzero_values.size > 0 and unique_nonzero.size <= 1),
+            "depth_levels_filled": depth_levels_filled,
+            "declared_footprint_size": int(declared_footprint_size),
+            "declared_nothing": declared_nothing,
+            "emptiness_rejection_reason": "declared_nothing" if declared_nothing else "none",
+        })
+
+    @classmethod
+    def _compute_evidence_strength(cls, record: dict[str, Any]) -> float:
+        counts = record.get("coordinate_source_counts") or {}
+        if not isinstance(counts, dict):
+            counts = {}
+        op_count = int(record.get("spatial_operation_provenance_count", 0) or 0)
+        artifact_count = sum(
+            int(counts.get(source, 0) or 0)
+            for source in cls._ARTIFACT_BACKED_SOURCES
+        )
+        artifact_fraction = float(artifact_count / op_count) if op_count else 0.0
+        op_score = min(op_count / 3.0, 1.0)
+        entropy_score = min(float(record.get("candidate_value_entropy", 0.0) or 0.0), 1.0)
+        corroboration_score = min(float(record.get("corroboration_count", 0) or 0) / 3.0, 1.0)
+        null_regret_penalty = min(max(float(record.get("null_regret", 0.0) or 0.0), 0.0), 1.0)
+        depth_penalty = 1.0 if record.get("depth_levels_filled") and record.get("single_spatial_operation") else 0.0
+        strength = (
+            0.45 * artifact_fraction
+            + 0.25 * op_score
+            + 0.20 * entropy_score
+            + 0.10 * corroboration_score
+            - 0.20 * null_regret_penalty
+            - 0.10 * depth_penalty
+        )
+        strength = max(0.0, min(1.0, strength))
+        record["artifact_backed_fraction"] = artifact_fraction
+        record["evidence_strength"] = strength
+        return strength
+
+    @classmethod
+    def _stamp_parentage(cls, kg_record: dict) -> None:
+        kg_record.setdefault("corroboration_count", 0)
+        kg_record.setdefault("proposal_evidence_tier", "mixed")
+        cls._compute_evidence_strength(kg_record)
+        parent_eligible = cls._is_crossbreed_parent_eligible(kg_record)
+        kg_record["crossbreed_parent_eligible"] = parent_eligible
+        kg_record["admission_tier"] = "kg_parent_eligible" if parent_eligible else "kg_evidence"
+
+    def _run_corroboration_promotion(
+        self,
+        kg_dir: Path,
+        kg_record: dict[str, Any],
+        *,
+        candidate_values: Any,
+        admitted_dir: Path | str | None,
+    ) -> None:
+        """Promote older evidence-only records corroborated by a new admission.
+
+        This intentionally uses a conservative, auditable signal: the new layer
+        must be artifact-backed, overlap the older layer's nonzero support, and
+        agree with its values better than the older layer's own mean-null.
+        """
+        if float(kg_record.get("artifact_backed_fraction", 0.0) or 0.0) <= 0.0:
+            return
+        if admitted_dir is None:
+            return
+
+        import numpy as np
+
+        candidate = np.asarray(candidate_values, dtype=float)
+        candidate_support = candidate != 0
+        if not np.any(candidate_support):
+            return
+
+        layers_dir = Path(admitted_dir) / "layers"
+        if not layers_dir.exists():
+            return
+
+        records_path = kg_dir / _KG_EXPERIMENTS
+        records = self._read_jsonl_records(records_path)
+        changed = False
+        now = time.time()
+        current_node = kg_record.get("node_id")
+
+        for record in records:
+            if record.get("node_id") == current_node:
+                continue
+            if record.get("admission_tier") != "kg_evidence":
+                continue
+            if record.get("crossbreed_parent_eligible") is True:
+                continue
+            layer_name = record.get("layer_name")
+            if not isinstance(layer_name, str) or not layer_name:
+                continue
+            layer_path = layers_dir / f"{layer_name}.npy"
+            if not layer_path.exists():
+                continue
+            try:
+                existing = np.load(layer_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"feature_hypothesis: promotion skipped {layer_path}: {exc}")
+                continue
+            if existing.shape != candidate.shape:
+                continue
+
+            existing = np.asarray(existing, dtype=float)
+            overlap = candidate_support & (existing != 0)
+            if not np.any(overlap):
+                continue
+
+            target = existing[overlap]
+            predictor = candidate[overlap]
+            mae_null = float(np.mean(np.abs(target - float(np.mean(target)))))
+            if mae_null <= 1e-10:
+                continue
+            relative_mae = float(np.mean(np.abs(target - predictor)) / mae_null)
+            if relative_mae >= 1.0:
+                continue
+
+            record["corroboration_count"] = int(record.get("corroboration_count", 0) or 0) + 1
+            record["last_corroborated_by"] = current_node
+            record["last_corroboration_relative_mae"] = relative_mae
+            self._compute_evidence_strength(record)
+            parent_eligible = self._is_crossbreed_parent_eligible(record)
+            record["crossbreed_parent_eligible"] = parent_eligible
+            if parent_eligible:
+                record["admission_tier"] = "kg_parent_eligible"
+                record["promoted_to_parent_at"] = now
+            changed = True
+
+        if changed:
+            self._atomic_write_jsonl(records_path, records)
+
+    def _rescore_first_layer_auto_roots(
+        self,
+        kg_dir: Path,
+        *,
+        admitted_dir: Path | str | None,
+    ) -> None:
+        if admitted_dir is None:
+            return
+
+        try:
+            import numpy as np
+            from voxel_features.scoring import (
+                _bic_with_common_effective_samples,
+                _single_layer_null_bic,
+                geological_coherence_score,
+            )
+            from voxel_features.spatial import SpatialVoxelStore
+            from voxel_features.store import GridSpec
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"feature_hypothesis: first-layer rescore imports failed: {exc}")
+            return
+
+        admitted_path = Path(admitted_dir)
+        index_path = admitted_path / "index.json"
+        if not index_path.exists():
+            return
+        try:
+            index_data = json.loads(index_path.read_text(encoding="utf-8"))
+            grid = GridSpec.from_dict(index_data["grid"])
+            store = SpatialVoxelStore(admitted_path, grid)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"feature_hypothesis: first-layer rescore store open failed: {exc}")
+            return
+
+        layer_names = list(store.layer_names)
+        if len(layer_names) < 2:
+            return
+
+        records_path = kg_dir / _KG_EXPERIMENTS
+        records = self._read_jsonl_records(records_path)
+        changed = False
+        shape = tuple(store.grid.shape)
+
+        for record in records:
+            if record.get("admission_path") != "first_layer_auto":
+                continue
+            if record.get("bic_delta") is not None:
+                continue
+            layer_name = record.get("layer_name")
+            if not isinstance(layer_name, str) or layer_name not in layer_names:
+                continue
+
+            try:
+                all_values = [store.get_layer_values(name).flatten() for name in layer_names]
+                all_dtypes = [store.get_layer(name).dtype for name in layer_names]
+                score_with = geological_coherence_score(all_values, all_dtypes, store.grid, shape)
+                without_names = [name for name in layer_names if name != layer_name]
+                without_values = [store.get_layer_values(name).flatten() for name in without_names]
+                without_dtypes = [store.get_layer(name).dtype for name in without_names]
+                if len(without_values) == 1:
+                    score_without = _single_layer_null_bic(
+                        without_values[0], without_dtypes[0], store.grid, shape
+                    )
+                else:
+                    score_without = geological_coherence_score(
+                        without_values, without_dtypes, store.grid, shape
+                    )
+                n_eff_with = int(score_with.get("n_effective_samples", 0) or 0)
+                n_eff_without = int(score_without.get("n_effective_samples", 0) or 0)
+                comparison_n = min(max(n_eff_with, n_eff_without, 1), 10_000)
+                bic_with = _bic_with_common_effective_samples(
+                    score_with, len(all_values), comparison_n
+                )
+                bic_without = _bic_with_common_effective_samples(
+                    score_without, len(without_values), comparison_n
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"feature_hypothesis: first-layer rescore skipped {layer_name}: {exc}"
+                )
+                continue
+
+            bic_delta_raw = float(bic_with - bic_without)
+            bic_delta = bic_delta_raw / float(comparison_n)
+            record["bic_delta"] = bic_delta
+            record["bic_delta_raw"] = bic_delta_raw
+            record["bic_comparison_n_effective_samples"] = comparison_n
+            record["n_effective_samples"] = n_eff_with
+            record["first_layer_rescored_at"] = time.time()
+            changed = True
+
+        if changed:
+            self._atomic_write_jsonl(records_path, records)
+
     @classmethod
     def _stamp_candidate_novelty(
         cls,
@@ -5774,10 +6168,15 @@ finally:
         import numpy as np
 
         candidate = np.asarray(values, dtype=float)
-        candidate_support_hash = cls._support_hash(candidate)
-        candidate_tensor_hash = cls._tensor_hash(candidate)
         nonzero = int(np.count_nonzero(candidate))
         total = int(candidate.size)
+        operation_support_hash = kg_record.get("spatial_operation_support_hash")
+        if nonzero == 0 and isinstance(operation_support_hash, str) and operation_support_hash:
+            candidate_support_hash = operation_support_hash
+            candidate_tensor_hash = operation_support_hash
+        else:
+            candidate_support_hash = cls._support_hash(candidate)
+            candidate_tensor_hash = cls._tensor_hash(candidate)
 
         nearest_layer_name = None
         nearest_tensor_distance = None
@@ -5858,7 +6257,8 @@ finally:
                             _names.append(_base)
                         cursor.execute(
                             """
-                            SELECT feature_name, source_file, source_excerpt, coordinate_source
+                            SELECT operation_type, feature_name, coordinates, parameters,
+                                   source_file, source_excerpt, coordinate_source
                             FROM spatial_operations
                             WHERE feature_name IN ({placeholders})
                             """.format(placeholders=",".join("?" for _ in _names)),
@@ -5878,10 +6278,22 @@ finally:
         all_creative_fallback = bool(operations) and fallback_count == len(operations)
         override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
         guard_passed = (not all_creative_fallback) or override_enabled
+        operation_signatures = [
+            "|".join(
+                str(op.get(key) or "")
+                for key in ("operation_type", "feature_name", "coordinates", "parameters")
+            )
+            for op in operations
+        ]
+        operation_hash = "sha256:" + hashlib.sha256(
+            "\n".join(sorted(operation_signatures)).encode("utf-8")
+        ).hexdigest()
 
         kg_record.update({
             "spatial_operation_provenance_count": len(operations),
             "coordinate_source_counts": source_counts,
+            "spatial_operation_support_hash": operation_hash if operations else None,
+            "spatial_operation_signatures": operation_signatures,
             "translate_fallback_used": fallback_count > 0,
             "provenance_guard_passed": guard_passed,
             "provenance_rejection_reason": "all_creative_fallback"
@@ -5931,11 +6343,6 @@ finally:
         pre_admit = None
         if candidate_values is not None:
             def check_guards() -> bool:
-                novelty_passed = self._stamp_candidate_novelty(
-                    kg_record,
-                    values=candidate_values,
-                    admitted_dir=admitted_dir,
-                )
                 if self._allow_creative_fallback_admission:
                     kg_record["allow_creative_fallback_admission"] = True
                 provenance_passed = self._stamp_candidate_provenance(
@@ -5943,7 +6350,19 @@ finally:
                     scratch_dir=scratch_dir,
                     layer_name=layer_name,
                 )
-                return novelty_passed and provenance_passed
+                novelty_passed = self._stamp_candidate_novelty(
+                    kg_record,
+                    values=candidate_values,
+                    admitted_dir=admitted_dir,
+                )
+                self._stamp_candidate_triviality(kg_record, values=candidate_values)
+                emptiness_passed = not bool(kg_record.get("declared_nothing", False))
+                if not (novelty_passed and provenance_passed and emptiness_passed):
+                    kg_record["admission_tier"] = "guard_rejected"
+                    kg_record["crossbreed_parent_eligible"] = False
+                    return False
+                self._stamp_parentage(kg_record)
+                return True
 
             pre_admit = check_guards
 
@@ -5960,12 +6379,24 @@ finally:
 
             on_admit = promote_layer
 
-        return JsonDedupLedger(
+        admitted = JsonDedupLedger(
             kg_path,
             ledger_filename=_KG_ADMITTED_INDEX,
             records_filename=_KG_EXPERIMENTS,
             lock_filename=_KG_LOCK,
         ).admit(kg_record, fingerprint=fp, pre_admit=pre_admit, on_admit=on_admit)
+        if admitted and candidate_values is not None:
+            self._run_corroboration_promotion(
+                kg_path,
+                kg_record,
+                candidate_values=candidate_values,
+                admitted_dir=admitted_dir,
+            )
+            self._rescore_first_layer_auto_roots(
+                kg_path,
+                admitted_dir=admitted_dir,
+            )
+        return admitted
 
     @staticmethod
     def _promote_scratch_layer(
@@ -6150,11 +6581,17 @@ finally:
 
     @classmethod
     def _load_successful_experiments(cls, kg_dir: Path) -> list[dict[str, Any]]:
-        return [
-            rec
-            for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS)
-            if rec.get("bic_delta", 0) < 0
-        ]
+        out: list[dict[str, Any]] = []
+        for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS):
+            if rec.get("crossbreed_parent_eligible") is not True:
+                continue
+            try:
+                bic_delta = float(rec.get("bic_delta"))
+            except (TypeError, ValueError):
+                continue
+            if bic_delta < 0:
+                out.append(rec)
+        return out
 
     @classmethod
     def _load_distance_index(cls, kg_dir: Path) -> dict[str, float]:

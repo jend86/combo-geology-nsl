@@ -51,8 +51,16 @@ if TYPE_CHECKING:
     from voxel_features.store import VoxelStore, GridSpec
 
 
-_STAGE1_MAE_TOLERANCE = 1e-5
+_RELATIVE_MAE_FLOOR = 1e-3
+_RELATIVE_MAE_NULL_EPS = 1e-10
+_MAX_EFFECTIVE_SAMPLES = 10_000
+
+_STAGE1_MAE_TOLERANCE = 1e-3
 _STAGE1_BIC_RESCUE_THRESHOLD = -1.0
+
+
+def _effective_sample_count(total_non_zero: int, n_layers: int) -> int:
+    return int(min(max(int(total_non_zero), int(n_layers) * 10), _MAX_EFFECTIVE_SAMPLES))
 
 
 def _entropy_continuous(values: np.ndarray, n_bins: int = 50) -> float:
@@ -921,7 +929,7 @@ def compute_out_of_sample_mae(
     test_mask: np.ndarray
 ) -> float:
     """
-    Compute Mean Absolute Error on held-out test data.
+    Compute relative Mean Absolute Error on held-out test data.
     
     Uses unified continuous approach: all layers treated as continuous
     (boolean geological features automatically handled as 0/1).
@@ -933,7 +941,8 @@ def compute_out_of_sample_mae(
         test_mask: Boolean mask for test voxels
         
     Returns:
-        Mean Absolute Error on test data
+        MAE divided by the target's predict-by-train-mean null MAE. Constant
+        targets return 1.0 so they cannot manufacture likelihood.
     """
     n_test = np.sum(test_mask)
     
@@ -954,10 +963,15 @@ def compute_out_of_sample_mae(
         test_predictors = np.column_stack([layer[test_mask] for layer in predictor_layers])
         predictions = test_predictors @ model_params['coefficients'] + model_params['intercept']
     
-    # Compute Mean Absolute Error
-    mae = np.mean(np.abs(test_target - predictions))
-    
-    return float(mae)
+    mae_pred = float(np.mean(np.abs(test_target - predictions)))
+    train_target = target_layer[train_mask]
+    null_prediction = float(np.mean(train_target)) if train_target.size else float(np.mean(test_target))
+    mae_null = float(np.mean(np.abs(test_target - null_prediction)))
+
+    if mae_null <= _RELATIVE_MAE_NULL_EPS:
+        return 1.0
+
+    return float(max(mae_pred / mae_null, _RELATIVE_MAE_FLOOR))
 
 
 # =============================================================================
@@ -988,10 +1002,7 @@ def mae_to_laplace_likelihood(
     # System-wide MAE (average of pairwise MAEs)
     system_mae = np.mean(mae_values)
     
-    # Handle edge case of perfect prediction (MAE = 0)
-    if system_mae <= 1e-10:
-        # Perfect prediction gets very high likelihood
-        return n_samples * 10.0  # Arbitrary large positive value
+    system_mae = max(float(system_mae), _RELATIVE_MAE_FLOOR)
     
     # Laplace likelihood: L = (1/(2*b))^n * exp(-sum(|x_i - mu_i|)/b)
     # where b = MAE for maximum likelihood estimation
@@ -1008,7 +1019,8 @@ def compute_geological_bic(
     mae_matrix: np.ndarray, 
     n_layers: int, 
     n_effective_samples: int,
-    spatial_correction: float = 1.0
+    spatial_correction: float = 1.0,
+    target_relative_maes: np.ndarray | None = None,
 ) -> float:
     """
     Compute BIC score from MAE matrix using Laplace likelihood.
@@ -1018,7 +1030,7 @@ def compute_geological_bic(
     assessment and information criterion evaluation.
     
     Args:
-        mae_matrix: Symmetric matrix of pairwise MAE values
+        mae_matrix: Matrix of relative-MAE values
         n_layers: Number of geological layers
         n_effective_samples: Effective sample size from interpolated data
         spatial_correction: Moran's I spatial autocorrelation correction
@@ -1030,28 +1042,28 @@ def compute_geological_bic(
         # Single layer or no layers - no meaningful BIC
         return 0.0
     
-    # Extract off-diagonal MAE values (exclude self-correlations)
-    mask = ~np.eye(n_layers, dtype=bool)
-    off_diagonal_maes = mae_matrix[mask]
-    
-    # Remove any NaN or infinite values
-    valid_maes = off_diagonal_maes[np.isfinite(off_diagonal_maes)]
+    if target_relative_maes is not None:
+        relative_maes = np.asarray(target_relative_maes, dtype=float)
+    else:
+        # Fallback for tests/legacy callers: use directed off-diagonal entries.
+        mask = ~np.eye(n_layers, dtype=bool)
+        relative_maes = np.asarray(mae_matrix, dtype=float)[mask]
+
+    valid_maes = relative_maes[np.isfinite(relative_maes) & (relative_maes >= 0)]
     
     if len(valid_maes) == 0:
         # No valid predictions - return neutral BIC
         return 0.0
     
-    # Convert MAE to Laplace log-likelihood
-    log_likelihood = mae_to_laplace_likelihood(valid_maes, n_effective_samples)
-    
-    # Apply spatial autocorrelation correction
+    valid_maes = np.clip(valid_maes, _RELATIVE_MAE_FLOOR, None)
+    n_eff = int(max(n_effective_samples, 1))
+    log_likelihood = float(np.sum(-n_eff * (np.log(2.0 * valid_maes) + 1.0)))
     corrected_log_likelihood = log_likelihood * spatial_correction
-    
-    # Calculate number of parameters (pairwise prediction coefficients)
-    n_parameters = n_layers * (n_layers - 1) // 2
-    
-    # BIC = -2 * log_likelihood + k * log(n)
-    bic = -2 * corrected_log_likelihood + n_parameters * np.log(max(n_effective_samples, n_layers))
+
+    # Directed per-target regressions: each target is predicted from the rest.
+    n_parameters = n_layers * max(n_layers - 1, 1)
+
+    bic = -2 * corrected_log_likelihood + n_parameters * np.log(max(n_eff, n_layers))
     
     return float(bic)
 
@@ -1078,12 +1090,12 @@ def _single_layer_null_bic(
     rng = np.random.default_rng(seed) if seed is not None else None
     interpolated = compute_geological_interpolation(layer_values, grid, shape, rng=rng)
     non_zero = interpolated[interpolated != 0]
-    n_eff = int(max(len(non_zero), 10))
+    n_eff = _effective_sample_count(len(non_zero), 1)
 
     if len(non_zero) < 2 or np.std(non_zero) <= 1e-12:
         # Degenerate layer (empty, constant, or one point); no meaningful null.
         return {
-            "system_coherence": 1.0,
+            "system_coherence": 0.0,
             "spatial_correction": 1.0,
             "coherence_matrix": np.array([[0.0]]),
             "bic": 0.0,
@@ -1093,7 +1105,11 @@ def _single_layer_null_bic(
             "masking_test_improvement": 0.0,
             "masking_test_direction": "single_layer_null",
             "stage_completed": "mae_bic_completed",
-            "system_mae": 0.0,
+            "system_mae": 1.0,
+            "relative_mae_mean": 1.0,
+            "relative_mae_min": 1.0,
+            "relative_mae_max": 1.0,
+            "relative_mae_by_target": np.array([1.0]),
             "n_effective_samples": n_eff,
             "single_layer_null_mad": 0.0,
         }
@@ -1105,17 +1121,21 @@ def _single_layer_null_bic(
     bic = _single_layer_null_bic_from_mad(mad, n_eff, spatial_correction)
 
     return {
-        "system_coherence": float(np.exp(-mad)),
+        "system_coherence": 0.0,
         "spatial_correction": spatial_correction,
         "coherence_matrix": np.array([[0.0]]),
         "bic": float(bic),
-        "total_cv_mse": float(1.0 - np.exp(-mad)),
+        "total_cv_mse": 1.0,
         "per_layer_mse": {},
         "masking_test_passed": True,
         "masking_test_improvement": 0.0,
         "masking_test_direction": "single_layer_null",
         "stage_completed": "mae_bic_completed",
-        "system_mae": mad,
+        "system_mae": 1.0,
+        "relative_mae_mean": 1.0,
+        "relative_mae_min": 1.0,
+        "relative_mae_max": 1.0,
+        "relative_mae_by_target": np.array([1.0]),
         "n_effective_samples": n_eff,
         "single_layer_null_mad": mad,
     }
@@ -1128,10 +1148,8 @@ def _single_layer_null_bic_from_mad(
 ) -> float:
     """Compute one-layer predict-by-mean BIC for a supplied sample count."""
     n_eff = int(max(n_effective_samples, 1))
-    if mad <= 1e-10:
-        log_likelihood = n_eff * 10.0
-    else:
-        log_likelihood = -n_eff * float(np.log(2 * mad)) - n_eff
+    relative_mae = 1.0
+    log_likelihood = -n_eff * (float(np.log(2.0 * relative_mae)) + 1.0)
 
     corrected_log_likelihood = log_likelihood * spatial_correction
     # 1 parameter: the layer's mean.
@@ -1166,6 +1184,7 @@ def _bic_with_common_effective_samples(
             n_layers=n_layers,
             n_effective_samples=n_eff,
             spatial_correction=spatial_correction,
+            target_relative_maes=score.get("relative_mae_by_target"),
         )
 
     # Test doubles and legacy callers may only provide a scalar BIC.
@@ -1176,7 +1195,7 @@ def system_mae_to_coherence(
     mae_matrix: np.ndarray
 ) -> float:
     """
-    Convert system MAE to a coherence-like metric for compatibility.
+    Convert system relative MAE to a coherence-like metric for compatibility.
     
     Lower MAE = higher coherence, scaled to [0, 1] range.
     This maintains compatibility with existing code that expects
@@ -1205,14 +1224,8 @@ def system_mae_to_coherence(
     if len(valid_maes) == 0:
         return 0.0
     
-    # System MAE (average prediction error)
-    system_mae = np.mean(valid_maes)
-    
-    # Convert to coherence: coherence = exp(-MAE)
-    # This maps MAE=0 -> coherence=1, MAE=1 -> coherence~0.37, etc.
-    coherence = np.exp(-system_mae)
-    
-    return float(coherence)
+    system_relative_mae = float(np.mean(valid_maes))
+    return float(np.clip(1.0 - system_relative_mae, 0.0, 1.0))
 
 
 # =============================================================================
@@ -1227,7 +1240,7 @@ def compute_pairwise_mae(
     rng: np.random.Generator | None = None,
 ) -> np.ndarray:
     """
-    Compute pairwise MAE values between all layer combinations.
+    Compute directed pairwise relative-MAE values between all layer combinations.
 
     Replaces compute_pairwise_r_squared with unified continuous approach.
     All geological layers (boolean faults, continuous grades) treated as
@@ -1240,7 +1253,8 @@ def compute_pairwise_mae(
         rng: Optional numpy Generator forwarded to ``create_geological_cv_split``.
 
     Returns:
-        Symmetric matrix of MAE values (lower = better prediction)
+        Directed matrix of relative-MAE values (lower = better prediction,
+        1.0 = target-specific null). Diagonal is 0.0 for self-prediction.
     """
     n_layers = len(layer_values)
     if n_layers == 0:
@@ -1260,7 +1274,8 @@ def compute_pairwise_mae(
             # No test data - return zero MAE matrix
             return mae_matrix
     
-    # Compute pairwise MAEs
+    # Compute directed pairwise relative MAEs. Do not average directions:
+    # each target has its own null denominator.
     for i in range(n_layers):
         for j in range(n_layers):
             if i == j:
@@ -1282,13 +1297,46 @@ def compute_pairwise_mae(
                     test_mask=test_mask
                 )
                 
-                # Use average bidirectional MAE
-                avg_mae = (mae_i_from_j + mae_j_from_i) / 2.0
-                
-                mae_matrix[i, j] = avg_mae
-                mae_matrix[j, i] = avg_mae  # Symmetric matrix
+                mae_matrix[i, j] = mae_i_from_j
+                mae_matrix[j, i] = mae_j_from_i
     
     return mae_matrix
+
+
+def compute_target_relative_maes(
+    layer_values: list[np.ndarray],
+    grid: 'GridSpec',
+    *,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """Predict each target layer from all other layers and return relative MAE.
+
+    This is the BIC objective: one relative-MAE term per target, each normalized
+    by that target's predict-by-mean null.
+    """
+    n_layers = len(layer_values)
+    if n_layers <= 1:
+        return np.array([], dtype=float)
+
+    train_mask, test_mask = create_geological_cv_split(layer_values, rng=rng)
+    split_stats = validate_geological_split(train_mask, test_mask, layer_values)
+    if not split_stats["validation_passed"] and split_stats["test_size"] == 0:
+        return np.ones(n_layers, dtype=float)
+
+    out = np.ones(n_layers, dtype=float)
+    for target_idx in range(n_layers):
+        predictors = [
+            values
+            for idx, values in enumerate(layer_values)
+            if idx != target_idx
+        ]
+        out[target_idx] = compute_out_of_sample_mae(
+            target_layer=layer_values[target_idx],
+            predictor_layers=predictors,
+            train_mask=train_mask,
+            test_mask=test_mask,
+        )
+    return out
 
 
 
@@ -1672,6 +1720,10 @@ def geological_coherence_score(
             "masking_test_direction": "not_applicable",
             "stage_completed": "mae_bic_completed",
             "system_mae": 0.0,
+            "relative_mae_mean": 0.0,
+            "relative_mae_min": 0.0,
+            "relative_mae_max": 0.0,
+            "relative_mae_by_target": np.array([]),
             "n_effective_samples": 0,
         }
     
@@ -1689,6 +1741,10 @@ def geological_coherence_score(
             "masking_test_direction": "single_layer",
             "stage_completed": "mae_bic_completed",
             "system_mae": 0.0,
+            "relative_mae_mean": 0.0,
+            "relative_mae_min": 0.0,
+            "relative_mae_max": 0.0,
+            "relative_mae_by_target": np.array([]),
             "n_effective_samples": 0,
         }
     
@@ -1706,23 +1762,37 @@ def geological_coherence_score(
     
     # Calculate effective samples based on non-zero values in interpolated data
     total_non_zero = sum(np.count_nonzero(layer) for layer in interpolated_layers)
-    effective_samples = max(total_non_zero, n_layers * 10)  # At least 10 samples per layer
+    effective_samples = _effective_sample_count(total_non_zero, n_layers)
     
     # Handle case where no geological data exists
     if all(np.count_nonzero(layer) == 0 for layer in interpolated_layers):
+        relative_maes = np.ones(n_layers, dtype=float)
+        mae_matrix = np.ones((n_layers, n_layers), dtype=float)
+        np.fill_diagonal(mae_matrix, 0.0)
+        bic = compute_geological_bic(
+            mae_matrix=mae_matrix,
+            n_layers=n_layers,
+            n_effective_samples=effective_samples,
+            spatial_correction=1.0,
+            target_relative_maes=relative_maes,
+        )
         return {
             "system_coherence": 0.0,
             "spatial_correction": 1.0,
-            "coherence_matrix": np.zeros((n_layers, n_layers)),
-            "bic": float('inf'),  # Infinite BIC for empty data
+            "coherence_matrix": mae_matrix,
+            "bic": bic,
             "total_cv_mse": 1.0,
             "per_layer_mse": {},
-            "masking_test_passed": False,
+            "masking_test_passed": True,
             "masking_test_improvement": 0.0,
             "masking_test_direction": "no_data",
             "stage_completed": "mae_bic_completed",
-            "system_mae": float('inf'),
-            "n_effective_samples": 0,
+            "system_mae": 1.0,
+            "relative_mae_mean": 1.0,
+            "relative_mae_min": 1.0,
+            "relative_mae_max": 1.0,
+            "relative_mae_by_target": relative_maes,
+            "n_effective_samples": effective_samples,
         }
     
     # Compute pairwise MAE matrix using unified continuous approach.
@@ -1730,9 +1800,19 @@ def geological_coherence_score(
     # ``mae_before`` and ``mae_after`` see the same CV split.
     pairwise_rng = np.random.default_rng(seed) if seed is not None else None
     mae_matrix = compute_pairwise_mae(interpolated_layers, layer_dtypes, grid, rng=pairwise_rng)
+    target_rng = np.random.default_rng(seed) if seed is not None else None
+    target_relative_maes = compute_target_relative_maes(interpolated_layers, grid, rng=target_rng)
+    if target_relative_maes.size:
+        system_mae = float(np.mean(target_relative_maes))
+        relative_mae_min = float(np.min(target_relative_maes))
+        relative_mae_max = float(np.max(target_relative_maes))
+    else:
+        system_mae = 0.0
+        relative_mae_min = 0.0
+        relative_mae_max = 0.0
 
     # Convert MAE matrix to coherence score for compatibility
-    system_coherence = system_mae_to_coherence(mae_matrix)
+    system_coherence = float(np.clip(1.0 - system_mae, 0.0, 1.0))
 
     # Spatial autocorrelation correction using original data
     moran_rng = np.random.default_rng(seed) if seed is not None else None
@@ -1743,14 +1823,12 @@ def geological_coherence_score(
         mae_matrix=mae_matrix,
         n_layers=n_layers,
         n_effective_samples=effective_samples,
-        spatial_correction=spatial_correction
+        spatial_correction=spatial_correction,
+        target_relative_maes=target_relative_maes,
     )
     
     # Legacy compatibility mappings
     total_cv_mse = 1.0 - system_coherence * spatial_correction
-    
-    # System-wide MAE (mean of off-diagonal pairwise MAEs)
-    system_mae = float(np.mean(mae_matrix[~np.eye(n_layers, dtype=bool)]))
     
     return {
         "system_coherence": system_coherence,
@@ -1764,6 +1842,10 @@ def geological_coherence_score(
         "masking_test_direction": "unified_continuous",
         "stage_completed": "mae_bic_completed",
         "system_mae": system_mae,
+        "relative_mae_mean": system_mae,
+        "relative_mae_min": relative_mae_min,
+        "relative_mae_max": relative_mae_max,
+        "relative_mae_by_target": target_relative_maes,
         "n_effective_samples": effective_samples,
     }
 
@@ -2089,52 +2171,47 @@ def evaluate_new_layer(
         else:
             effective_seed = 42
 
-    # First layer: no pairwise comparison is possible, admit unconditionally —
-    # but score it with a REAL predict-by-mean null model, not the old -1.0
-    # sentinel. The sentinel auto-satisfied admission and flipped the pipeline to
-    # crossbreed after only ~5/18 sources (rabbit-hole bias), and gave the greedy
-    # BIC init no signal to rank foundation layers. Higher null BIC = more
-    # spatially variable = more informative; bic_delta = -null_bic stays negative.
+    # First layer: no cross-layer comparison is possible, so admit it as evidence
+    # without assigning a synthetic BIC magnitude. Parent selection filters these
+    # records until a later corroboration/rescoring pass assigns a real bic_delta.
     if not existing_layers:
-        null_result = _single_layer_null_bic(
-            new_values_flat, layer_dtype, store.grid, grid_shape,
-            seed=effective_seed,
-        )
         store.add_layer(
             name=layer_name,
             values=layer_values,
             dtype=layer_dtype,
         )
-        null_bic = null_result.get("bic", 0.0)
-        n_eff = null_result.get("n_effective_samples", 0)
-        sys_mae = null_result.get("system_mae", 0.0)
         return {
-            "bic_before": null_bic,
-            "bic_after": 0.0,
-            "bic_delta": -null_bic,
-            "bic_delta_raw": -null_bic,
-            "bic_before_observed": null_bic,
-            "bic_after_observed": 0.0,
-            "bic_comparison_n_effective_samples": n_eff,
-            "n_effective_samples": n_eff,
+            "bic_before": None,
+            "bic_after": None,
+            "bic_delta": None,
+            "bic_delta_raw": None,
+            "bic_before_observed": None,
+            "bic_after_observed": None,
+            "bic_comparison_n_effective_samples": 0,
+            "n_effective_samples": 0,
             "n_effective_samples_before": 0,
-            "n_effective_samples_after": n_eff,
-            "n_effective_samples_delta": n_eff,
+            "n_effective_samples_after": 0,
+            "n_effective_samples_delta": 0,
             "candidate_nonzero_voxels": candidate_nonzero_voxels,
             "candidate_fill_fraction": candidate_fill_fraction,
-            "cv_mse_before": sys_mae,
+            "cv_mse_before": 0.0,
             "cv_mse_after": 0.0,
-            "cv_mse_delta": -sys_mae,
+            "cv_mse_delta": 0.0,
+            "relative_mae_mean": None,
+            "relative_mae_min": None,
+            "relative_mae_max": None,
             "mutual_info": {},
+            "pairwise_distance": {},
             "admitted": True,
             "predicted_value": 1.0,
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
-            "masking_test_direction": "null_model_baseline",
+            "masking_test_direction": "first_layer_auto",
             "stage_1_tolerance_used": False,
             "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
             "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
-            "stage_completed": "mae_bic_completed",
+            "stage_completed": "first_layer_auto",
+            "admission_path": "first_layer_auto",
         }
 
     # Get existing layer values and dtypes
@@ -2175,7 +2252,7 @@ def evaluate_new_layer(
     n_eff_before = int(score_before.get("n_effective_samples", 0) or 0)
     n_eff_after = int(score_after.get("n_effective_samples", 0) or 0)
     n_eff_delta = n_eff_after - n_eff_before
-    bic_comparison_n_eff = max(n_eff_before, n_eff_after, 1)
+    bic_comparison_n_eff = min(max(n_eff_before, n_eff_after, 1), _MAX_EFFECTIVE_SAMPLES)
 
     bic_before = _bic_with_common_effective_samples(
         score_before,
@@ -2281,9 +2358,13 @@ def evaluate_new_layer(
         "cv_mse_before": cv_mse_before,
         "cv_mse_after": cv_mse_after,
         "cv_mse_delta": cv_mse_delta,
+        "relative_mae_mean": score_after.get("relative_mae_mean", score_after.get("system_mae")),
+        "relative_mae_min": score_after.get("relative_mae_min"),
+        "relative_mae_max": score_after.get("relative_mae_max"),
         "mutual_info": mi_scores,
         "pairwise_distance": pairwise_distances,
         "admitted": admitted,
+        "admission_path": "normal",
         # For hypothesis agent training: positive = improvement (higher = better)
         "predicted_value": -bic_delta,
         # Stage 1 fields from two-stage scoring

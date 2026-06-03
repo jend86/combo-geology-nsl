@@ -745,7 +745,7 @@ def main(argv: list[str] | None = None) -> Path:
         "silently and your changes do not run. No-op for configs "
         "without a [harness.container.build] block (image is pulled, "
         "not built). Escape hatch: `docker rmi <image-tag>` then "
-        "re-run. See docs/design/harness-image-provisioning.md.",
+        "re-run. Prefer this flag after any harness build-context edit.",
     )
     args = parser.parse_args(argv)
 

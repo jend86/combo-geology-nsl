@@ -51,6 +51,39 @@ def _seed_two_layers(store: VoxelStore, base: np.ndarray) -> None:
     assert result["admitted"], "second-layer seed failed"
 
 
+def test_constant_target_relative_mae_is_neutral_not_zero() -> None:
+    target = np.ones(10, dtype=float)
+    predictor = np.arange(10, dtype=float)
+    train_mask = np.array([True] * 5 + [False] * 5)
+    test_mask = ~train_mask
+
+    relative_mae = scoring.compute_out_of_sample_mae(
+        target,
+        [predictor],
+        train_mask,
+        test_mask,
+    )
+
+    assert relative_mae == pytest.approx(1.0)
+
+
+def test_effective_samples_are_capped_at_10000(monkeypatch: pytest.MonkeyPatch) -> None:
+    shape = (20_001, 1, 1)
+    grid = GridSpec(origin=(0.0, 0.0, 0.0), maximum=(1.0, 1.0, 1.0), shape=shape)
+    layers = [np.ones(shape, dtype=np.float32).ravel(), np.ones(shape, dtype=np.float32).ravel()]
+
+    monkeypatch.setattr(
+        scoring,
+        "compute_pairwise_mae",
+        lambda *args, **kwargs: np.array([[0.0, 0.5], [0.5, 0.0]]),
+    )
+    monkeypatch.setattr(scoring, "compute_moran_correction", lambda *args, **kwargs: 1.0)
+
+    result = scoring.geological_coherence_score(layers, ["float", "float"], grid, shape, seed=7)
+
+    assert result["n_effective_samples"] == 10_000
+
+
 class _ControlledStore:
     def __init__(self) -> None:
         self.grid = SimpleNamespace(shape=(2, 2, 1))
@@ -219,21 +252,21 @@ def test_informative_layer_passes_stage1(tmp_path: Path) -> None:
 def test_stage1_tolerance_rescues_material_bic_gain(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _controlled_stage1_result(
         monkeypatch,
-        mae_improvement=-7.5e-6,
+        mae_improvement=-7.5e-4,
         bic_delta=-1.2,
     )
 
     assert result["masking_test_passed"] is True
     assert result["admitted"] is True
     assert result["stage_1_tolerance_used"] is True
-    assert result["stage_1_mae_tolerance"] == pytest.approx(1e-5)
+    assert result["stage_1_mae_tolerance"] == pytest.approx(1e-3)
     assert result["stage_1_bic_rescue_threshold"] == pytest.approx(-1.0)
 
 
 def test_stage1_tolerance_does_not_rescue_tiny_bic_gain(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _controlled_stage1_result(
         monkeypatch,
-        mae_improvement=-7.5e-6,
+        mae_improvement=-7.5e-4,
         bic_delta=-0.5,
     )
 
@@ -245,7 +278,7 @@ def test_stage1_tolerance_does_not_rescue_tiny_bic_gain(monkeypatch: pytest.Monk
 def test_stage1_tolerance_does_not_rescue_large_mae_loss(monkeypatch: pytest.MonkeyPatch) -> None:
     result = _controlled_stage1_result(
         monkeypatch,
-        mae_improvement=-2e-5,
+        mae_improvement=-2e-3,
         bic_delta=-1.2,
     )
 
@@ -324,7 +357,7 @@ def test_second_layer_bic_delta_uses_common_effective_sample_count(
         lambda *args, **kwargs: {
             "bic": 1_000.0,
             "total_cv_mse": 1.0,
-            "system_mae": 0.2,
+            "system_mae": 1.0,
             "n_effective_samples": 10,
             "single_layer_null_mad": 0.2,
             "spatial_correction": 1.0,
@@ -336,9 +369,10 @@ def test_second_layer_bic_delta_uses_common_effective_sample_count(
         lambda *args, **kwargs: {
             "bic": 900.0,
             "total_cv_mse": 1.0,
-            "system_mae": 0.25,
+            "system_mae": 1.25,
             "n_effective_samples": 1_000,
-            "coherence_matrix": np.array([[0.0, 0.25], [0.25, 0.0]]),
+            "coherence_matrix": np.array([[0.0, 1.25], [1.25, 0.0]]),
+            "relative_mae_by_target": np.array([1.25, 1.25]),
             "spatial_correction": 1.0,
         },
     )
@@ -376,13 +410,11 @@ def test_first_layer_returns_stage1_fields(tmp_path: Path) -> None:
         assert key in result, f"missing key {key} in first-layer admit"
 
     assert result["admitted"] is True
-    # Rabbit-hole-bias fix: the first layer is scored with a real predict-by-mean
-    # null model, not the old -1.0 sentinel. Direction renamed accordingly and
-    # bic_delta is now a genuine negative score.
-    assert result["masking_test_direction"] == "null_model_baseline"
-    assert result["stage_completed"] == "mae_bic_completed"
-    assert result["bic_delta"] != -1.0
-    assert result["bic_delta"] < 0.0
+    assert result["admission_path"] == "first_layer_auto"
+    assert result["masking_test_direction"] == "first_layer_auto"
+    assert result["stage_completed"] == "first_layer_auto"
+    assert result["bic_delta"] is None
+    assert result["bic_delta_raw"] is None
 
 
 def test_stale_nsltask_scoring_mirror_is_removed() -> None:

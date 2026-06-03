@@ -51,6 +51,7 @@ def _seed_experiments(kg_dir: Path, node_ids: list[str]) -> None:
                 "bic_delta": -(10.0 + i),  # all successful (bic_delta < 0)
                 "layer_name": f"layer_{node_id}",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
 
 
@@ -90,6 +91,29 @@ class TestQueueEnumeration:
 
         parent_tuples = {tuple(entry["parents"]) for entry in entries}
         assert parent_tuples == {("a", "b"), ("b", "a")}
+
+    def test_filters_to_parent_eligible_records(self, tmp_path: Path) -> None:
+        task = _task(tmp_path)
+        kg_dir = Path(_variation(tmp_path).kg_dir)
+        kg_dir.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {"node_id": "eligible_a", "bic_delta": -2.0, "crossbreed_parent_eligible": True},
+            {"node_id": "eligible_b", "bic_delta": -3.0, "crossbreed_parent_eligible": True},
+            {"node_id": "evidence_only", "bic_delta": -100.0, "crossbreed_parent_eligible": False},
+            {"node_id": "missing_field_old_row", "bic_delta": -100.0},
+            {"node_id": "first_layer_auto", "bic_delta": None, "crossbreed_parent_eligible": True},
+        ]
+        with (kg_dir / "experiments.jsonl").open("w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+
+        entries = task._enumerate_pairs(kg_dir)
+        parent_pairs = {tuple(entry["parents"]) for entry in entries}
+
+        assert parent_pairs == {
+            ("eligible_a", "eligible_b"),
+            ("eligible_b", "eligible_a"),
+        }
 
 
 class TestQueuePop:
@@ -179,6 +203,7 @@ class TestQueueScoring:
                 "bic_delta": -1.0,
                 "layer_name": "l_low",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
             fh.write(json.dumps({
                 "node_id": "exp_h",
@@ -186,6 +211,7 @@ class TestQueueScoring:
                 "bic_delta": -100.0,
                 "layer_name": "l_high",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
             fh.write(json.dumps({
                 "node_id": "exp_mid",
@@ -193,6 +219,7 @@ class TestQueueScoring:
                 "bic_delta": -50.0,
                 "layer_name": "l_mid",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
 
         task = _task(tmp_path)
@@ -221,12 +248,13 @@ def _seed_crossbreed_child(
         fh.write(json.dumps({
             "node_id": child_id,
             "hypothesis": f"crossbreed_{child_id}",
-            "bic_delta": bic_delta,
-            "layer_name": f"layer_{child_id}",
-            "parent_node_1": parent_1,
-            "parent_node_2": parent_2,
-            "mutual_info": {},
-        }) + "\n")
+                "bic_delta": bic_delta,
+                "layer_name": f"layer_{child_id}",
+                "parent_node_1": parent_1,
+                "parent_node_2": parent_2,
+                "mutual_info": {},
+                "crossbreed_parent_eligible": True,
+            }) + "\n")
 
 
 def _read_queue_entries(kg_dir: Path) -> list[dict]:
@@ -280,6 +308,7 @@ class TestQueueAttemptDecay:
                     "bic_delta": bic,
                     "layer_name": f"layer_{node_id}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
 
         task = _task(tmp_path)
@@ -373,6 +402,7 @@ class TestQueueConsummatedTier:
                     "bic_delta": bic,
                     "layer_name": f"layer_{node_id}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
         # Consummate {a, b} via an admitted child whose parents were stored
         # in (b, a) order — verifies unordered matching.
@@ -463,6 +493,7 @@ class TestScoreFormulaLog1pAndDistance:
                 "bic_delta": -6.68,
                 "layer_name": "l_fold",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
             fh.write(json.dumps({
                 "node_id": "next",
@@ -470,6 +501,7 @@ class TestScoreFormulaLog1pAndDistance:
                 "bic_delta": -2.16,
                 "layer_name": "l_next",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
 
         entries = task._enumerate_pairs(kg_dir)
@@ -496,6 +528,7 @@ class TestScoreFormulaLog1pAndDistance:
                     "bic_delta": -1.0,
                     "layer_name": f"l_{node_id}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
         # (a, b) is highly orthogonal; (c, d) is highly redundant.
         _seed_pairwise_distance(kg_dir, {
@@ -533,6 +566,7 @@ class TestScoreFormulaLog1pAndDistance:
                     "bic_delta": bic,
                     "layer_name": f"l_{node_id}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
 
         entries = task._enumerate_pairs(kg_dir)
@@ -570,6 +604,7 @@ class TestParentFatigue:
                 "bic_delta": -6.68,
                 "layer_name": "l_fold",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
             for i in range(5):
                 fh.write(json.dumps({
@@ -578,6 +613,7 @@ class TestParentFatigue:
                     "bic_delta": -1.5,
                     "layer_name": f"l_p{i}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
 
         # 6 admits → 30 ordered pairs. 10 of them contain fold as either
@@ -618,6 +654,7 @@ class TestParentFatigue:
                 "bic_delta": -6.68,
                 "layer_name": "l_fold",
                 "mutual_info": {},
+                "crossbreed_parent_eligible": True,
             }) + "\n")
             for i in range(5):
                 fh.write(json.dumps({
@@ -626,6 +663,7 @@ class TestParentFatigue:
                     "bic_delta": -1.5,
                     "layer_name": f"l_p{i}",
                     "mutual_info": {},
+                    "crossbreed_parent_eligible": True,
                 }) + "\n")
 
         # Read entries manually, score them with empty parent_uses (i.e.

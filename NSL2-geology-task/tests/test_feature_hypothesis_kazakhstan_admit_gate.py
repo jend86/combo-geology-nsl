@@ -39,6 +39,15 @@ class TestStageCompletedAllowlist:
             stage_completed="mae_bic_completed",
         )
 
+    def test_first_layer_auto_admits_without_bic_delta(self) -> None:
+        assert _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=None,
+            stage_completed="first_layer_auto",
+            admission_path="first_layer_auto",
+        )
+
     @pytest.mark.parametrize(
         "stage",
         ["", "stage_1_only", "aborted", "stage_2_partial", "unknown"],
@@ -86,3 +95,36 @@ class TestOtherGateConditions:
             bic_delta=bic,
             stage_completed="mae_bic_completed",
         )
+
+
+class TestEvidenceParentage:
+    def test_weak_raises_threshold_but_strong_does_not_lower_it(self) -> None:
+        weak = {"proposal_evidence_tier": "weak"}
+        mixed = {"proposal_evidence_tier": "mixed"}
+        strong = {"proposal_evidence_tier": "strong"}
+
+        assert FeatureHypothesisKazakhstanTask._parentage_threshold_for(weak) > (
+            FeatureHypothesisKazakhstanTask._parentage_threshold_for(mixed)
+        )
+        assert FeatureHypothesisKazakhstanTask._parentage_threshold_for(strong) == pytest.approx(
+            FeatureHypothesisKazakhstanTask._PARENTAGE_BASE_THRESHOLD
+        )
+
+    def test_parentage_uses_system_strength_not_agent_strength_claim(self) -> None:
+        thin_strong_claim = {
+            "proposal_evidence_tier": "strong",
+            "evidence_strength": 0.1,
+            "novelty_guard_passed": True,
+            "provenance_guard_passed": True,
+            "declared_nothing": False,
+        }
+        grounded_weak_claim = {
+            "proposal_evidence_tier": "weak",
+            "evidence_strength": 0.95,
+            "novelty_guard_passed": True,
+            "provenance_guard_passed": True,
+            "declared_nothing": False,
+        }
+
+        assert FeatureHypothesisKazakhstanTask._is_crossbreed_parent_eligible(thin_strong_claim) is False
+        assert FeatureHypothesisKazakhstanTask._is_crossbreed_parent_eligible(grounded_weak_claim) is True

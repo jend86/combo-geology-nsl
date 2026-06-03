@@ -1,20 +1,21 @@
 """Build local harness images referenced by configs in config/*.toml.
 
-Bridge to Approach B (see docs/design/harness-image-provisioning.md).
-Once B lands, entry points provision automatically and this script
-becomes optional.
+Compatibility helper for configs before automatic harness provisioning. Modern
+entry points call ``ensure_configured_harness`` and build from
+``[harness.container.build]`` automatically; this script remains useful for
+manual prebuilds.
 
 Two discovery paths, in priority order:
 
-1. **Config-driven** (forward-compat with B): if a config declares
+1. **Config-driven**: if a config declares
    `[harness.container.build]` with a context path, build
    `harness.container.image` from that context.
-2. **Known-image fallback**: today's configs carry only
+2. **Known-image fallback**: legacy configs carry only
    `harness.container.image` (no build block). Match that tag against
    KNOWN_LOCAL_IMAGES below to recover the build context.
 
-Once Approach B ships and configs grow proper build sections, path 1
-covers everything and path 2 can be dropped.
+Once configs all have proper build sections, path 1 covers everything and path 2
+can be dropped.
 
 Usage:
     uv run python scripts/build_harness_images.py
@@ -37,10 +38,10 @@ from src.harness.provisioning import (
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Fallback for pre-B configs that reference an image but have no build
+# Fallback for legacy configs that reference an image but have no build
 # block. Key = image tag as it appears in the TOML; value = (context
 # dir relative to repo root, build_args dict). Drop entries here as the
-# configs migrate to Approach B.
+# configs migrate to explicit build sections.
 KNOWN_LOCAL_IMAGES: dict[str, tuple[str, dict[str, str]]] = {
     "ghcr.io/nsl2/ms-agent:0.1.0": ("docker/ms-agent", {}),
     "nsl/ms-agent:0.1.0": ("docker/ms-agent", {}),

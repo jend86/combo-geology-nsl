@@ -89,6 +89,7 @@ def _write_spatial_point_layer(
     layer_name: str,
     *,
     coordinate_source: str,
+    value: float = 1.0,
 ) -> None:
     store = SpatialVoxelStore(scratch_dir, _grid())
     store.add_point_feature(
@@ -96,7 +97,7 @@ def _write_spatial_point_layer(
         longitude=1.0,
         latitude=1.0,
         depth=0.5,
-        value=1.0,
+        value=value,
         radius_m=1.0,
         coordinate_source=coordinate_source,  # type: ignore[arg-type]
         source_file="analysis.csv" if coordinate_source == "artifact" else None,
@@ -383,6 +384,84 @@ class TestAdmitWithDedup:
         assert record["coordinate_source_counts"] == {"creative_fallback": 1}
         assert not (kg_dir / "experiments.jsonl").exists()
         assert not (admitted_dir / "layers" / f"{layer_name}.npy").exists()
+
+    def test_all_zero_layer_without_spatial_ops_rejected_as_declared_nothing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        layer_name = "empty_zero_surface"
+        scratch_dir = store_dir / "scratch" / layer_name
+        admitted_dir = store_dir / "admitted"
+        _write_scratch_layer(scratch_dir, layer_name, np.zeros(_grid().shape, dtype=float))
+        record = _kg_record(
+            hypothesis="No footprint was declared.",
+            parents=["pa", "pb"],
+            node_id="exp_empty_zero",
+            layer_name=layer_name,
+        )
+
+        admitted = task._admit_with_dedup(
+            kg_dir,
+            record,
+            parents=["pa", "pb"],
+            hypothesis=record["hypothesis"],
+            scratch_dir=scratch_dir,
+            admitted_dir=admitted_dir,
+            layer_name=layer_name,
+        )
+
+        assert admitted is False
+        assert record["declared_nothing"] is True
+        assert record["emptiness_rejection_reason"] == "declared_nothing"
+        assert record["admission_tier"] == "guard_rejected"
+        assert not (kg_dir / "experiments.jsonl").exists()
+        assert not (admitted_dir / "layers" / f"{layer_name}.npy").exists()
+
+    def test_zero_value_spatial_operation_is_declared_footprint_not_empty(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        layer_name = "declared_absence_point"
+        scratch_dir = store_dir / "scratch" / layer_name
+        admitted_dir = store_dir / "admitted"
+        _write_spatial_point_layer(
+            scratch_dir,
+            layer_name,
+            coordinate_source="artifact",
+            value=0.0,
+        )
+        record = _kg_record(
+            hypothesis="Artifact declares absence at this footprint.",
+            parents=["pa", "pb"],
+            node_id="exp_declared_absence",
+            layer_name=layer_name,
+        )
+
+        admitted = task._admit_with_dedup(
+            kg_dir,
+            record,
+            parents=["pa", "pb"],
+            hypothesis=record["hypothesis"],
+            scratch_dir=scratch_dir,
+            admitted_dir=admitted_dir,
+            layer_name=layer_name,
+        )
+
+        assert admitted is True
+        assert record["candidate_nonzero_voxels"] == 0
+        assert record["spatial_operation_provenance_count"] == 1
+        assert record["declared_nothing"] is False
+        assert record["emptiness_rejection_reason"] == "none"
+        assert record["declared_footprint_size"] > 0
+        assert record["admission_tier"] in {"kg_evidence", "kg_parent_eligible"}
 
     def test_artifact_backed_layer_passes_provenance_guard(
         self,

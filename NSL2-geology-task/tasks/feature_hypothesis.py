@@ -3072,6 +3072,118 @@ finally:
         rounded = np.round(np.asarray(values, dtype=float), 6)
         return "sha256:" + hashlib.sha256(rounded.tobytes()).hexdigest()
 
+    _PARENTAGE_BASE_THRESHOLD = 0.50
+    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
+    _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
+
+    @staticmethod
+    def _normalise_evidence_tier(value: Any) -> str:
+        tier = str(value or "mixed").strip().lower()
+        return tier if tier in {"weak", "mixed", "strong"} else "mixed"
+
+    @classmethod
+    def _parentage_threshold_for(cls, record: dict[str, Any]) -> float:
+        threshold = cls._PARENTAGE_BASE_THRESHOLD
+        if cls._normalise_evidence_tier(record.get("proposal_evidence_tier")) == "weak":
+            threshold += cls._PARENTAGE_WEAK_THRESHOLD_BONUS
+        return threshold
+
+    @classmethod
+    def _is_crossbreed_parent_eligible(cls, record: dict[str, Any]) -> bool:
+        if not bool(record.get("novelty_guard_passed", True)):
+            return False
+        if not bool(record.get("provenance_guard_passed", True)):
+            return False
+        if bool(record.get("declared_nothing", False)):
+            return False
+        try:
+            strength = float(record.get("evidence_strength", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            strength = 0.0
+        return strength >= cls._parentage_threshold_for(record)
+
+    @classmethod
+    def _stamp_candidate_triviality(cls, kg_record: dict, *, values: Any) -> None:
+        import numpy as np
+
+        candidate = np.asarray(values, dtype=float)
+        nonzero_values = candidate[candidate != 0]
+        if nonzero_values.size:
+            unique_nonzero = np.unique(np.round(nonzero_values, 6))
+            value_min = float(np.min(nonzero_values))
+            value_max = float(np.max(nonzero_values))
+            if unique_nonzero.size <= 1:
+                entropy = 0.0
+            else:
+                _, counts = np.unique(np.round(nonzero_values, 6), return_counts=True)
+                probs = counts / counts.sum()
+                entropy = float(-np.sum(probs * np.log2(probs + 1e-12)))
+            support = candidate != 0
+        else:
+            unique_nonzero = np.array([])
+            value_min = None
+            value_max = None
+            entropy = 0.0
+            support = np.zeros(candidate.shape, dtype=bool)
+
+        z_levels = int(np.any(support, axis=(0, 1)).sum()) if candidate.ndim == 3 else 0
+        depth_levels_filled = bool(candidate.ndim == 3 and z_levels == candidate.shape[2] and z_levels > 0)
+        op_count = int(kg_record.get("spatial_operation_provenance_count", 0) or 0)
+        nonzero = int(kg_record.get("candidate_nonzero_voxels", np.count_nonzero(candidate)) or 0)
+        declared_footprint_size = nonzero if nonzero > 0 else op_count
+        declared_nothing = op_count == 0 and nonzero == 0
+
+        kg_record.update({
+            "candidate_unique_nonzero_values": int(unique_nonzero.size),
+            "candidate_nonzero_value_min": value_min,
+            "candidate_nonzero_value_max": value_max,
+            "candidate_value_entropy": entropy,
+            "single_spatial_operation": op_count == 1,
+            "uniform_nonzero_value": bool(nonzero_values.size > 0 and unique_nonzero.size <= 1),
+            "depth_levels_filled": depth_levels_filled,
+            "declared_footprint_size": int(declared_footprint_size),
+            "declared_nothing": declared_nothing,
+            "emptiness_rejection_reason": "declared_nothing" if declared_nothing else "none",
+        })
+
+    @classmethod
+    def _compute_evidence_strength(cls, record: dict[str, Any]) -> float:
+        counts = record.get("coordinate_source_counts") or {}
+        if not isinstance(counts, dict):
+            counts = {}
+        op_count = int(record.get("spatial_operation_provenance_count", 0) or 0)
+        artifact_count = sum(
+            int(counts.get(source, 0) or 0)
+            for source in cls._ARTIFACT_BACKED_SOURCES
+        )
+        artifact_fraction = float(artifact_count / op_count) if op_count else 0.0
+        op_score = min(op_count / 3.0, 1.0)
+        entropy_score = min(float(record.get("candidate_value_entropy", 0.0) or 0.0), 1.0)
+        corroboration_score = min(float(record.get("corroboration_count", 0) or 0) / 3.0, 1.0)
+        null_regret_penalty = min(max(float(record.get("null_regret", 0.0) or 0.0), 0.0), 1.0)
+        depth_penalty = 1.0 if record.get("depth_levels_filled") and record.get("single_spatial_operation") else 0.0
+        strength = (
+            0.45 * artifact_fraction
+            + 0.25 * op_score
+            + 0.20 * entropy_score
+            + 0.10 * corroboration_score
+            - 0.20 * null_regret_penalty
+            - 0.10 * depth_penalty
+        )
+        strength = max(0.0, min(1.0, strength))
+        record["artifact_backed_fraction"] = artifact_fraction
+        record["evidence_strength"] = strength
+        return strength
+
+    @classmethod
+    def _stamp_parentage(cls, kg_record: dict) -> None:
+        kg_record.setdefault("corroboration_count", 0)
+        kg_record.setdefault("proposal_evidence_tier", "mixed")
+        cls._compute_evidence_strength(kg_record)
+        parent_eligible = cls._is_crossbreed_parent_eligible(kg_record)
+        kg_record["crossbreed_parent_eligible"] = parent_eligible
+        kg_record["admission_tier"] = "kg_parent_eligible" if parent_eligible else "kg_evidence"
+
     @classmethod
     def _stamp_candidate_novelty(
         cls,
@@ -3083,10 +3195,15 @@ finally:
         import numpy as np
 
         candidate = np.asarray(values, dtype=float)
-        candidate_support_hash = cls._support_hash(candidate)
-        candidate_tensor_hash = cls._tensor_hash(candidate)
         nonzero = int(np.count_nonzero(candidate))
         total = int(candidate.size)
+        operation_support_hash = kg_record.get("spatial_operation_support_hash")
+        if nonzero == 0 and isinstance(operation_support_hash, str) and operation_support_hash:
+            candidate_support_hash = operation_support_hash
+            candidate_tensor_hash = operation_support_hash
+        else:
+            candidate_support_hash = cls._support_hash(candidate)
+            candidate_tensor_hash = cls._tensor_hash(candidate)
 
         nearest_layer_name = None
         nearest_tensor_distance = None
@@ -3166,7 +3283,8 @@ finally:
                             _names.append(_base)
                         cursor.execute(
                             """
-                            SELECT feature_name, source_file, source_excerpt, coordinate_source
+                            SELECT operation_type, feature_name, coordinates, parameters,
+                                   source_file, source_excerpt, coordinate_source
                             FROM spatial_operations
                             WHERE feature_name IN ({placeholders})
                             """.format(placeholders=",".join("?" for _ in _names)),
@@ -3186,10 +3304,22 @@ finally:
         all_creative_fallback = bool(operations) and fallback_count == len(operations)
         override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
         guard_passed = (not all_creative_fallback) or override_enabled
+        operation_signatures = [
+            "|".join(
+                str(op.get(key) or "")
+                for key in ("operation_type", "feature_name", "coordinates", "parameters")
+            )
+            for op in operations
+        ]
+        operation_hash = "sha256:" + hashlib.sha256(
+            "\n".join(sorted(operation_signatures)).encode("utf-8")
+        ).hexdigest()
 
         kg_record.update({
             "spatial_operation_provenance_count": len(operations),
             "coordinate_source_counts": source_counts,
+            "spatial_operation_support_hash": operation_hash if operations else None,
+            "spatial_operation_signatures": operation_signatures,
             "translate_fallback_used": fallback_count > 0,
             "provenance_guard_passed": guard_passed,
             "provenance_rejection_reason": "all_creative_fallback"
@@ -3236,17 +3366,24 @@ finally:
         pre_admit = None
         if candidate_values is not None:
             def check_guards() -> bool:
-                novelty_passed = self._stamp_candidate_novelty(
-                    kg_record,
-                    values=candidate_values,
-                    admitted_dir=admitted_dir,
-                )
                 provenance_passed = self._stamp_candidate_provenance(
                     kg_record,
                     scratch_dir=scratch_dir,
                     layer_name=layer_name,
                 )
-                return novelty_passed and provenance_passed
+                novelty_passed = self._stamp_candidate_novelty(
+                    kg_record,
+                    values=candidate_values,
+                    admitted_dir=admitted_dir,
+                )
+                self._stamp_candidate_triviality(kg_record, values=candidate_values)
+                emptiness_passed = not bool(kg_record.get("declared_nothing", False))
+                if not (novelty_passed and provenance_passed and emptiness_passed):
+                    kg_record["admission_tier"] = "guard_rejected"
+                    kg_record["crossbreed_parent_eligible"] = False
+                    return False
+                self._stamp_parentage(kg_record)
+                return True
 
             pre_admit = check_guards
 
@@ -3402,11 +3539,17 @@ finally:
 
     @classmethod
     def _load_successful_experiments(cls, kg_dir: Path) -> list[dict[str, Any]]:
-        return [
-            rec
-            for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS)
-            if rec.get("bic_delta", 0) < 0
-        ]
+        out: list[dict[str, Any]] = []
+        for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS):
+            if rec.get("crossbreed_parent_eligible") is not True:
+                continue
+            try:
+                bic_delta = float(rec.get("bic_delta"))
+            except (TypeError, ValueError):
+                continue
+            if bic_delta < 0:
+                out.append(rec)
+        return out
 
     @classmethod
     def _load_distance_index(cls, kg_dir: Path) -> dict[str, float]:

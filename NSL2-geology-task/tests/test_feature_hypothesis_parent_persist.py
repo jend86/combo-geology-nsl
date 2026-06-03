@@ -61,6 +61,7 @@ def _seed_experiments(kg_dir: Path, node_ids: list[str]) -> None:
                 "mutual_info": {},
                 "masking_test_passed": True,
                 "stage_completed": "stage_2_completed",
+                "crossbreed_parent_eligible": True,
             }) + "\n")
 
 

@@ -4,9 +4,8 @@
 Scrapes the endpoint back-to-back every ``--window`` seconds and reports the
 *windowed* deltas — preemptions, prefix-cache hit ratio, cached-prompt ratio,
 and token throughput — instead of the cumulative-since-boot counters (which
-are dominated by cold-start and mislead tuning). This is the §2 "diagnostic
-loop" instrument from docs/design/local-vllm-tuning-2026-05-31.md, and it runs
-against the live run with no restart.
+are dominated by cold-start and mislead tuning). Use it as the live diagnostic
+loop for capacity tuning; it runs against the active server with no restart.
 
 Usage (inside the nix dev shell):
 
