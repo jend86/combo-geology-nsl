@@ -100,7 +100,7 @@ def _first_root_record(node_id: str, layer_name: str) -> dict:
     }
 
 
-def _admit(task, kg_dir, store_dir, layer_name, record) -> bool:
+def _admit(task, kg_dir, store_dir, layer_name, record, *, seed_phase: bool = True) -> bool:
     scratch_dir = store_dir / "scratch" / layer_name
     admitted_dir = store_dir / "admitted"
     return task._admit_with_dedup(
@@ -111,6 +111,7 @@ def _admit(task, kg_dir, store_dir, layer_name, record) -> bool:
         scratch_dir=scratch_dir,
         admitted_dir=admitted_dir,
         layer_name=layer_name,
+        seed_phase=seed_phase,
     )
 
 
@@ -167,10 +168,10 @@ def test_graded_multi_op_first_root_admits(tmp_path: Path) -> None:
     assert (kg_dir / "experiments.jsonl").exists()
 
 
-def test_second_root_with_positive_bic_admits_inside_window(tmp_path: Path) -> None:
+def test_second_root_with_positive_bic_admits_in_survey(tmp_path: Path) -> None:
     # The co-location stall: with one seed already in the pool, a distributed
     # candidate at a DIFFERENT support is rejected by the scorer (positive BIC).
-    # Inside the first-K window the persist gate bypasses that, and the
+    # In the survey phase the persist gate bypasses that, and the
     # geometry/provenance floor (multi-op, artifact-backed) lets it seed.
     task = _task(tmp_path)
     kg_dir = tmp_path / "kg"

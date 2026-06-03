@@ -61,80 +61,104 @@ class TestStageCompletedAllowlist:
         )
 
 
-class TestEarlyRootPersistBypass:
-    """The first K admits seed the KG and must NOT be gated by the co-location
-    scorer: Stage-1 MAE and Stage-2 BIC both reject distributed layers at
-    supports distinct from the seed (observed live: every post-seed candidate
-    scored relative_mae~=1.0, bic_delta~=+3.38). When ``early_root=True`` the
-    persist gate admits on the strength of *completed* scoring alone; the real
-    quality gate is the geometry/provenance floor in ``_admit_with_dedup``
-    (``_early_root_admission_ok``). See docs/design/scoring-colocation-
-    monoculture-2026-06-03.md.
+class TestSeedPhasePersistBypass:
+    """Every SURVEY-phase admit seeds the KG and must NOT be gated by the
+    co-location scorer: Stage-1 MAE and Stage-2 BIC both reject distributed
+    layers at supports distinct from the seed (observed live: every post-seed
+    candidate scored relative_mae~=1.0, bic_delta~=+3.38). When
+    ``seed_phase=True`` (workflow_kind == "survey") the persist gate admits on
+    the strength of *completed* scoring alone; the real quality gate is the
+    geometry/provenance floor in ``_admit_with_dedup``
+    (``_seed_phase_admission_ok``). In crossbreed the basin has been surveyed,
+    co-location exists, and the scorer governs again. See
+    docs/design/scoring-colocation-monoculture-2026-06-03.md.
     """
 
-    def test_early_root_bypasses_positive_bic(self) -> None:
+    def test_seed_phase_bypasses_positive_bic(self) -> None:
         # The exact shape the live run stalled on: scorer rejected
-        # (admitted=False, bic_delta>0) but within the first-K window it persists.
+        # (admitted=False, bic_delta>0) but in the survey phase it persists.
         assert _GATE(
             masking_test_passed=True,
             admitted=False,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
-            early_root=True,
+            seed_phase=True,
         )
 
-    def test_early_root_bypasses_stage1_failure(self) -> None:
-        # By the 3rd+ layer Stage-1 MAE is live and also rejects distributed
-        # layers; the first-K window bypasses Stage-1 too.
+    def test_seed_phase_bypasses_stage1_failure(self) -> None:
+        # Stage-1 MAE also rejects distributed layers once >=2 layers exist; the
+        # survey-phase bypass skips Stage-1 too.
         assert _GATE(
             masking_test_passed=False,
             admitted=False,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
-            early_root=True,
+            seed_phase=True,
         )
 
-    def test_early_root_still_requires_completed_scoring(self) -> None:
-        # Aborted/partial episodes must never seed the pool even inside the
-        # window — the stage_completed allowlist is the one invariant kept.
+    def test_seed_phase_still_requires_completed_scoring(self) -> None:
+        # Aborted/partial episodes must never seed the pool even in survey —
+        # the stage_completed allowlist is the one invariant kept.
         for stage in ("", "aborted", "stage_2_partial", "stage_1_only"):
             assert not _GATE(
                 masking_test_passed=True,
                 admitted=False,
                 bic_delta=3.38,
                 stage_completed=stage,
-                early_root=True,
+                seed_phase=True,
             )
 
-    def test_early_root_admits_natural_pass_too(self) -> None:
-        # A first-K candidate that *also* clears BIC naturally still admits.
+    def test_seed_phase_admits_natural_pass_too(self) -> None:
+        # A survey candidate that *also* clears BIC naturally still admits.
         assert _GATE(
             masking_test_passed=True,
             admitted=True,
             bic_delta=-50.0,
             stage_completed="mae_bic_completed",
-            early_root=True,
+            seed_phase=True,
         )
 
-    def test_early_root_false_restores_strict_gate(self) -> None:
-        # Once the pool holds >= K layers the bypass is off: a positive-BIC
+    def test_crossbreed_restores_strict_gate(self) -> None:
+        # In crossbreed (seed_phase=False) the bypass is off: a positive-BIC
         # rejected candidate is blocked exactly as before (regression pin).
         assert not _GATE(
             masking_test_passed=True,
             admitted=False,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
-            early_root=False,
+            seed_phase=False,
         )
 
-    def test_early_root_default_is_false(self) -> None:
-        # Callers that don't pass early_root get the strict gate by default.
+    def test_seed_phase_default_is_false(self) -> None:
+        # Callers that don't pass seed_phase get the strict gate by default.
         assert not _GATE(
             masking_test_passed=True,
             admitted=False,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
         )
+
+
+class TestSeedPhaseDetection:
+    """``_in_seed_phase`` maps the episode's ``workflow_kind`` to the bypass.
+    Survey (and a missing kind, matching the rest of the task's default) seeds;
+    crossbreed does not.
+    """
+
+    def test_survey_is_seed_phase(self) -> None:
+        assert FeatureHypothesisKazakhstanTask._in_seed_phase(
+            {"workflow_kind": "survey"}
+        ) is True
+
+    def test_crossbreed_is_not_seed_phase(self) -> None:
+        assert FeatureHypothesisKazakhstanTask._in_seed_phase(
+            {"workflow_kind": "crossbreed"}
+        ) is False
+
+    def test_missing_workflow_kind_defaults_to_seed(self) -> None:
+        # The task defaults workflow_kind to "survey" everywhere it is read;
+        # the geometry/provenance floor still guards, so this is safe.
+        assert FeatureHypothesisKazakhstanTask._in_seed_phase({}) is True
 
 
 class TestOtherGateConditions:
@@ -247,22 +271,23 @@ class TestEvidenceParentage:
         assert FeatureHypothesisKazakhstanTask._is_crossbreed_parent_eligible(boolean_near_dup) is False
 
 
-class TestEarlyRootHardening:
-    """The first K (``_EARLY_ROOT_COUNT``) KG admits seed the KG and the very
-    first rides a BIC bypass, so they are held to a GEOMETRY/PROVENANCE floor a
-    single arbitrary central blob cannot clear (Approach 1 + B,
-    docs/design/scoring-colocation-monoculture-2026-06-03):
+class TestSeedPhaseHardening:
+    """Every SURVEY-phase admit seeds the KG (and rides the scorer bypass), so
+    each is held to a GEOMETRY/PROVENANCE floor a single arbitrary central blob
+    cannot clear (docs/design/scoring-colocation-monoculture-2026-06-03):
 
-    1. An all-creative_fallback early root is rejected regardless of
+    1. An all-creative_fallback seed is rejected regardless of
        allow_creative_fallback_admission (the seed must rest on real provenance).
-    2. A single-op early root (the single central blob that drives the
-       co-location monoculture) is rejected.
+    2. A single-op seed (the single central blob that drives the co-location
+       monoculture) is rejected.
     3. Value uniformity / low entropy are NOT gated — a *distributed* uniform
-       layer is a perfectly good seed (this is the Approach-1 relaxation).
-    4. Once the pool already holds >= K layers the gate is a no-op.
+       layer is a perfectly good seed (the agent reliably places distributed
+       coords but rarely grades values; an entropy floor deadlocked the run).
+    4. In crossbreed (seed_phase=False) the floor is a no-op — the scorer
+       governs and single-op/uniform are telemetry only.
     """
 
-    def _healthy_early_root(self) -> dict:
+    def _healthy_seed(self) -> dict:
         # Multi-op, artifact-backed root — should pass even if uniform-valued.
         return {
             "spatial_operation_provenance_count": 4,
@@ -270,55 +295,54 @@ class TestEarlyRootHardening:
             "single_spatial_operation": False,
         }
 
-    def test_pool_at_or_past_K_is_unconstrained(self) -> None:
-        # Once K roots exist, even a single-op all-fallback layer is no-op'd.
+    def test_crossbreed_phase_is_unconstrained(self) -> None:
+        # Outside survey, even a single-op all-fallback layer is no-op'd.
         trivial = {
             "spatial_operation_provenance_count": 1,
             "coordinate_source_counts": {"creative_fallback": 1},
             "single_spatial_operation": True,
         }
-        K = FeatureHypothesisKazakhstanTask._EARLY_ROOT_COUNT
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(trivial, pool_size=K) is True
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            trivial, seed_phase=False
+        ) is True
         assert trivial["first_root_rejection_reason"] == "none"
 
-    def test_healthy_early_root_admits(self) -> None:
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(
-            self._healthy_early_root(), pool_size=0
+    def test_healthy_seed_admits(self) -> None:
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            self._healthy_seed(), seed_phase=True
         ) is True
 
-    def test_distributed_uniform_early_root_admits(self) -> None:
-        # Approach 1: a multi-op uniform-valued, zero-entropy layer is a fine
-        # seed — it must NOT be rejected (this is what deadlocked the prior run).
-        record = self._healthy_early_root()
+    def test_distributed_uniform_seed_admits(self) -> None:
+        # A multi-op uniform-valued, zero-entropy layer is a fine seed — it must
+        # NOT be rejected (this is what deadlocked the prior run).
+        record = self._healthy_seed()
         record["uniform_nonzero_value"] = True
         record["candidate_value_entropy"] = 0.0
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=2) is True
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is True
         assert record["first_root_rejection_reason"] == "none"
 
-    def test_all_creative_fallback_early_root_rejected_despite_override(self) -> None:
-        record = self._healthy_early_root()
+    def test_all_creative_fallback_seed_rejected_despite_override(self) -> None:
+        record = self._healthy_seed()
         record["spatial_operation_provenance_count"] = 3
         record["coordinate_source_counts"] = {"creative_fallback": 3}
         record["allow_creative_fallback_admission"] = True
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=0) is False
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is False
         assert record["first_root_rejection_reason"] == "all_creative_fallback"
 
-    def test_single_spatial_operation_early_root_rejected(self) -> None:
-        record = self._healthy_early_root()
+    def test_single_spatial_operation_seed_rejected(self) -> None:
+        record = self._healthy_seed()
         record["single_spatial_operation"] = True
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=3) is False
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is False
         assert record["first_root_rejection_reason"] == "single_spatial_operation"
 
-    def test_window_applies_to_each_of_first_K(self) -> None:
-        # A single-op layer is gated at every pool_size below K, not just 0.
-        K = FeatureHypothesisKazakhstanTask._EARLY_ROOT_COUNT
-        for ps in range(K):
-            record = {"single_spatial_operation": True, "spatial_operation_provenance_count": 1,
-                      "coordinate_source_counts": {"artifact": 1}}
-            assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(record, pool_size=ps) is False
-
-    def test_partial_fallback_early_root_passes(self) -> None:
+    def test_partial_fallback_seed_passes(self) -> None:
         # 1 of 4 ops is fallback → not all_creative_fallback → passes.
-        assert FeatureHypothesisKazakhstanTask._early_root_admission_ok(
-            self._healthy_early_root(), pool_size=0
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            self._healthy_seed(), seed_phase=True
         ) is True
