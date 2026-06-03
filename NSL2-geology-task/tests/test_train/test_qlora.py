@@ -98,11 +98,11 @@ class TestLoadSftDataset(unittest.TestCase):
             self._make_jsonl([self._make_row(), self._make_row()], path)
             dataset = _load_sft_dataset([path], tokenizer)
         self.assertGreater(len(dataset), 0)
-        self.assertIn("prompt", dataset.column_names)
-        self.assertIn("completion", dataset.column_names)
-        self.assertNotIn("text", dataset.column_names)
+        self.assertIn("text", dataset.column_names)
+        self.assertNotIn("prompt", dataset.column_names)
+        self.assertNotIn("completion", dataset.column_names)
 
-    def test_load_sft_dataset_splits_prompt_and_completion(self):
+    def test_load_sft_dataset_templates_full_text(self):
         from src.train.qlora import _load_sft_dataset
 
         tokenizer = self._make_tokenizer()
@@ -111,8 +111,7 @@ class TestLoadSftDataset(unittest.TestCase):
             self._make_jsonl([self._make_row(prompt="Question", raw_response="Answer")], path)
             dataset = _load_sft_dataset([path], tokenizer)
 
-        self.assertEqual(dataset[0]["prompt"], "<user>Question</user><asst>")
-        self.assertEqual(dataset[0]["completion"], "Answer</asst>")
+        self.assertEqual(dataset[0]["text"], "<user>Question</user><asst>Answer</asst>")
 
     def test_load_sft_dataset_multiple_files(self):
         from src.train.qlora import _load_sft_dataset
@@ -149,8 +148,6 @@ class TestLoadSftDataset(unittest.TestCase):
         self.assertEqual(len(dataset), 1)
 
     def test_load_sft_dataset_expands_virtual_epochs_with_rehearsal(self):
-        from datasets import Dataset
-
         from src.train.qlora import _load_sft_dataset
 
         tokenizer = self._make_tokenizer()
@@ -160,18 +157,16 @@ class TestLoadSftDataset(unittest.TestCase):
                 [self._make_row(prompt="Kazakhstan task", raw_response="Hypothesis")],
                 path,
             )
-            rehearsal = Dataset.from_list(
-                [
-                    {
-                        "text": (
-                            f"Geology rehearsal passage {i}. "
-                            "Sediment, structure, basin, and mineral systems interact. "
-                            "This sentence provides enough continuation text."
-                        )
-                    }
-                    for i in range(8)
-                ]
-            )
+            rehearsal = [
+                {
+                    "text": (
+                        f"Geology rehearsal passage {i}. "
+                        "Sediment, structure, basin, and mineral systems interact. "
+                        "This sentence provides enough continuation text."
+                    )
+                }
+                for i in range(8)
+            ]
 
             with patch("src.train.qlora.load_dataset", return_value=rehearsal) as mock_load:
                 dataset = _load_sft_dataset(
@@ -193,16 +188,51 @@ class TestLoadSftDataset(unittest.TestCase):
         )
         self.assertEqual(len(dataset), 6)
         self.assertEqual(
-            sum(row["prompt"] == "<user>Kazakhstan task</user><asst>" for row in dataset),
+            sum(row["text"] == "<user>Kazakhstan task</user><asst>Hypothesis</asst>" for row in dataset),
             2,
         )
-        rehearsal_prompts = [
-            row["prompt"] for row in dataset if "Continue the following" in row["prompt"]
-        ]
-        self.assertEqual(len(rehearsal_prompts), 4)
+        rehearsal_rows = [row for row in dataset if "Continue the following" in row["text"]]
+        self.assertEqual(len(rehearsal_rows), 4)
         self.assertTrue(
-            all("Geology rehearsal passage" in row["completion"] for row in dataset if row["prompt"] in rehearsal_prompts)
+            all("Geology rehearsal passage" in row["text"] for row in rehearsal_rows)
         )
+
+    @patch("src.train.qlora.logger.warning")
+    def test_warn_if_dataset_would_truncate_suggests_preserving_length(
+        self,
+        mock_warning: MagicMock,
+    ) -> None:
+        from src.train.qlora import _warn_if_dataset_would_truncate
+
+        tokenizer = MagicMock()
+        tokenizer.side_effect = lambda text, **_kwargs: {"input_ids": list(range(len(text.split())))}
+        dataset = [
+            {"text": "short row"},
+            {"text": "one two three four five six"},
+        ]
+
+        _warn_if_dataset_would_truncate(dataset, tokenizer, max_seq_length=4)
+
+        mock_warning.assert_called_once()
+        warning = mock_warning.call_args.args[0]
+        self.assertIn("would truncate", warning)
+        self.assertIn("max_seq_length=4", warning)
+        self.assertIn("at least 6", warning)
+
+    @patch("src.train.qlora.logger.warning")
+    def test_warn_if_dataset_would_truncate_stays_quiet_when_preserved(
+        self,
+        mock_warning: MagicMock,
+    ) -> None:
+        from src.train.qlora import _warn_if_dataset_would_truncate
+
+        tokenizer = MagicMock()
+        tokenizer.side_effect = lambda text, **_kwargs: {"input_ids": list(range(len(text.split())))}
+        dataset = [{"text": "one two three"}]
+
+        _warn_if_dataset_would_truncate(dataset, tokenizer, max_seq_length=3)
+
+        mock_warning.assert_not_called()
 
 
 class TestQloraGpuCleanup(unittest.TestCase):
@@ -304,7 +334,7 @@ class TestTrainSft(unittest.TestCase):
 
         trainer_instance.train.assert_called_once()
         trainer_args = mock_sft_trainer_cls.call_args.kwargs["args"]
-        self.assertIs(trainer_args.completion_only_loss, True)
+        self.assertEqual(trainer_args.dataset_text_field, "text")
         model.save_pretrained.assert_called_once()
         tokenizer.save_pretrained.assert_called_once()
         model.save_pretrained_merged.assert_not_called()
@@ -518,8 +548,6 @@ class TestTrainSft(unittest.TestCase):
         mock_save_training_artifact,
         mock_sft_trainer_cls,
     ):
-        from datasets import Dataset
-
         from src.train.qlora import train_sft
 
         model = MagicMock()
@@ -541,17 +569,15 @@ class TestTrainSft(unittest.TestCase):
             self._make_jsonl([self._make_row()], data_path)
             output_dir = Path(tmpdir) / "adapter"
             mock_save_training_artifact.return_value = output_dir.resolve()
-            rehearsal = Dataset.from_list(
-                [
-                    {
-                        "text": (
-                            f"Rehearsal passage {i}. "
-                            "Geological context and environmental process text continue here."
-                        )
-                    }
-                    for i in range(8)
-                ]
-            )
+            rehearsal = [
+                {
+                    "text": (
+                        f"Rehearsal passage {i}. "
+                        "Geological context and environmental process text continue here."
+                    )
+                }
+                for i in range(8)
+            ]
 
             with patch("src.train.qlora.load_dataset", return_value=rehearsal):
                 train_sft(

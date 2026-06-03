@@ -7,18 +7,19 @@ import os
 import random
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, Sequence, cast
 
-from datasets import Dataset, load_dataset
 from dotenv import dotenv_values, find_dotenv
 from loguru import logger
-from trl.trainer.sft_config import SFTConfig
-from trl.trainer.sft_trainer import SFTTrainer
 
 
 DEFAULT_MAX_SEQ_LENGTH = 2048
 TrainingExportFormat = Literal["lora", "merged_16bit", "gguf"]
 ConfiguredTrainingExportFormat = Literal["auto", "lora", "merged_16bit", "gguf"]
+SFTConfig: Any | None = None
+SFTTrainer: Any | None = None
+load_dataset: Any | None = None
 LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -58,6 +59,61 @@ class _FastLanguageModelProxy:
 
 
 FastLanguageModel = _FastLanguageModelProxy()
+
+
+class _SimpleDataset(list[dict[str, str]]):
+    @classmethod
+    def from_list(cls, rows: list[dict[str, str]]) -> "_SimpleDataset":
+        return cls(rows)
+
+    @property
+    def column_names(self) -> list[str]:
+        names: list[str] = []
+        for row in self:
+            for key in row:
+                if key not in names:
+                    names.append(key)
+        return names
+
+
+class _SimpleSFTConfig:
+    def __init__(self, **kwargs: Any) -> None:
+        for key, value in kwargs.items():
+            if key == "lr_scheduler_type" and isinstance(value, str):
+                value = SimpleNamespace(value=value)
+            setattr(self, key, value)
+
+
+def _dataset_from_list(rows: list[dict[str, str]]) -> Any:
+    try:
+        from datasets import Dataset
+    except ImportError:
+        return _SimpleDataset.from_list(rows)
+    return Dataset.from_list(rows)
+
+
+def _load_sft_classes() -> tuple[Any, Any]:
+    global SFTConfig, SFTTrainer
+    if SFTTrainer is not None and SFTConfig is None:
+        return _SimpleSFTConfig, SFTTrainer
+    if SFTConfig is None:
+        from trl.trainer.sft_config import SFTConfig as _SFTConfig
+
+        SFTConfig = _SFTConfig
+    if SFTTrainer is None:
+        from trl.trainer.sft_trainer import SFTTrainer as _SFTTrainer
+
+        SFTTrainer = _SFTTrainer
+    return SFTConfig, SFTTrainer
+
+
+def _load_dataset(name: str, *, split: str) -> Any:
+    global load_dataset
+    if load_dataset is None:
+        from datasets import load_dataset as _hf_load_dataset
+
+        load_dataset = _hf_load_dataset
+    return load_dataset(name, split=split)
 
 
 def _export_timestamp() -> str:
@@ -272,6 +328,46 @@ def _load_self_generated_sft_rows(
     return rows
 
 
+def _tokenized_length(tokenizer: Any, text: str) -> int:
+    encoded = tokenizer(text, truncation=False, padding=False)
+    input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+    if input_ids and isinstance(input_ids[0], list):
+        return len(input_ids[0])
+    return len(input_ids)
+
+
+def _warn_if_dataset_would_truncate(
+    dataset: Any,
+    tokenizer: Any,
+    *,
+    max_seq_length: int,
+) -> None:
+    longest_tokens = 0
+    longest_index = -1
+    truncated_count = 0
+    for index, row in enumerate(dataset):
+        text = row.get("text") if isinstance(row, dict) else None
+        if not isinstance(text, str):
+            continue
+        token_count = _tokenized_length(tokenizer, text)
+        if token_count > longest_tokens:
+            longest_tokens = token_count
+            longest_index = index
+        if token_count > max_seq_length:
+            truncated_count += 1
+
+    if truncated_count == 0:
+        return
+
+    logger.warning(
+        f"Training dataset would truncate {truncated_count}/{len(dataset)} rows with "
+        f"max_seq_length={max_seq_length}; longest row is {longest_tokens} tokens "
+        f"at dataset index {longest_index}. Set max_seq_length to at least "
+        f"{longest_tokens} to preserve every row, or deliberately pre-clip/export "
+        "shorter training examples before SFT."
+    )
+
+
 def _load_rehearsal_sft_rows(
     *,
     tokenizer: Any,
@@ -287,7 +383,7 @@ def _load_rehearsal_sft_rows(
     if rows_per_epoch <= 0:
         return [[] for _ in range(virtual_epochs)]
 
-    rehearsal_dataset = load_dataset(dataset_name, split=split)
+    rehearsal_dataset = _load_dataset(dataset_name, split=split)
     valid_texts: list[str] = []
     for row in rehearsal_dataset:
         value = row.get(text_field)
@@ -378,7 +474,7 @@ def _load_sft_dataset(
         expanded_rows.extend(rows)
         expanded_rows.extend(rehearsal_rows_by_epoch[epoch])
 
-    return Dataset.from_list(expanded_rows)
+    return _dataset_from_list(expanded_rows)
 
 
 def train_sft(
@@ -429,6 +525,8 @@ def train_sft(
     else:
         report_to = "none"
 
+    sft_config_cls, sft_trainer_cls = _load_sft_classes()
+
     model, tokenizer = _load_base_model(
         base_model,
         max_seq_length=max_seq_length,
@@ -457,6 +555,11 @@ def train_sft(
         rehearsal_prompt_chars=rehearsal_prompt_chars,
         rehearsal_max_chars=rehearsal_max_chars,
     )
+    _warn_if_dataset_would_truncate(
+        dataset,
+        tokenizer,
+        max_seq_length=max_seq_length,
+    )
     row_count = len(dataset)
     effective_warmup_steps = 0 if warmup_ratio > 0 else warmup_steps
 
@@ -468,9 +571,12 @@ def train_sft(
     # reachable from the trainer) on the torch 2.10 stack. Force every map here to run
     # in-process (num_proc=None takes datasets' non-Pool branch); the dataset is small, so
     # single-process tokenization costs only seconds.
-    import datasets.arrow_dataset as _hf_arrow
+    try:
+        import datasets.arrow_dataset as _hf_arrow
+    except ImportError:
+        _hf_arrow = None
 
-    if not getattr(_hf_arrow.Dataset.map, "_nsl_inproc", False):
+    if _hf_arrow is not None and not getattr(_hf_arrow.Dataset.map, "_nsl_inproc", False):
         _orig_dataset_map = _hf_arrow.Dataset.map
 
         def _inproc_map(self, *map_args, **map_kwargs):
@@ -480,9 +586,9 @@ def train_sft(
         _inproc_map._nsl_inproc = True
         _hf_arrow.Dataset.map = _inproc_map
 
-    trainer = SFTTrainer(
+    trainer = sft_trainer_cls(
         model=model,
-        args=SFTConfig(
+        args=sft_config_cls(
             output_dir=str(resolved_output_dir),
             max_steps=max_steps,
             num_train_epochs=1,
