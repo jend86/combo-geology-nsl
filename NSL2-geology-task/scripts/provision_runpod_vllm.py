@@ -2,9 +2,8 @@
 """Provision / inspect / tear down a RunPod L40S pod serving gemma-4-31B-AWQ via vLLM.
 
 Supplemental *external* inference endpoint for the Kazakhstan feature-hypothesis
-run (Approach C — one L40S, target 16 external slots). Companion to
-``docs/design/runpod-l40s-provisioning-2026-06-01.md`` and
-``docs/design/external-inference-endpoints-2026-05-31.md``.
+run: one L40S targeting 16 external concurrent slots alongside any local
+endpoint capacity.
 
 The pod runs the SAME pinned vLLM image as the local box for chat-template / tool
 parser parity, single-GPU (TP=1/PP=1 — no pipeline bubble), AWQ auto-detected,
@@ -35,7 +34,17 @@ import time
 import urllib.error
 import urllib.request
 
-PINNED_VLLM_IMAGE = "vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada"
+# Pinned to the stable RELEASE matching the local box's known-good lineage.
+# The journey here (2026-06-01): the local box runs nightly-01d4d1ad (vLLM
+# 0.20.2rc1.dev9) and serves gemma-4-31B-AWQ perfectly -- but that SHA tag was
+# PRUNED from Docker Hub (unpullable on a fresh RunPod host). Switching to floating
+# :nightly made it pullable but pulled a NEWER build that REGRESSED gemma-4: vLLM
+# crash-looped at startup (uptime resetting ~20-30s, VRAM 0%, never served). :latest
+# is now v0.22.0 -- also past the regression. The fix is a stable release on the SAME
+# 0.20.2 lineage as the working local image: release tags are NOT pruned, and v0.20.2
+# final is rc1+N commits => it INCLUDES 01d4d1ad's gemma-4 support while predating the
+# regression window. Re-verify pullable + that it still serves gemma-4 before bumping.
+PINNED_VLLM_IMAGE = "vllm/vllm-openai:v0.20.2"
 DEFAULT_MODEL = "QuantTrio/gemma-4-31B-it-AWQ"
 GPU_TYPE_L40S = "NVIDIA L40S"  # exact gpuTypeId from RunPod gpuTypes()
 
@@ -95,9 +104,18 @@ def _docker_args(args: argparse.Namespace) -> str:
             "--max-model-len", str(args.max_model_len),
             "--max-num-seqs", str(args.max_num_seqs),
             "--max-num-batched-tokens", str(args.max_num_batched_tokens),
-            "--kv-cache-dtype", "fp8",
+            # KV dtype is arch-sensitive: fp8(=e4m3) needs Ada/Hopper (sm_89+, L40S/4090).
+            # On Ampere (A40, sm_86) use 'auto': e4m3 dies at config validation ("fp8e4nv not
+            # supported in this architecture", ~20s) AND fp8_e5m2 passes config but asserts in
+            # the attention forward (backend allows only fp8/e4m3/nvfp4) in v0.20.2. See flag.
+            "--kv-cache-dtype", args.kv_cache_dtype,
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
+            # Skip torch.compile/cudagraph capture: a fresh pod has no compile cache,
+            # so default compilation adds minutes + OOM risk at startup for a 31B. The
+            # local box caches cudagraphs (compilation-config); an ephemeral pod can't,
+            # so eager trades ~10-20% decode for a fast, reliable boot.
+            "--enforce-eager",
             "--enable-auto-tool-choice",
             "--tool-call-parser", "gemma4",
         ]
@@ -115,6 +133,13 @@ def cmd_up(args: argparse.Namespace) -> int:
     if hf_token:
         env["HF_TOKEN"] = hf_token
         env["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+    if args.network_volume_id:
+        # Persist the HF model cache on the network volume so future pods skip the
+        # ~18 GB cold download (binds in ~2-3 min instead of ~20+). The volume is
+        # region-locked: it must live in a storage DC (EU-RO-1 / EUR-IS-1) and the
+        # pod is auto-placed there by the SDK. See runpod-network-volume-region-lock.
+        env["HF_HOME"] = f"{args.volume_mount_path.rstrip('/')}/hf"
 
     docker_args = _docker_args(args)
     print(f"Creating pod '{args.name}' on {args.gpu_type} ({args.cloud})...")
@@ -136,6 +161,8 @@ def cmd_up(args: argparse.Namespace) -> int:
             env=env,
             support_public_ip=True,
             start_ssh=True,
+            network_volume_id=args.network_volume_id or None,
+            volume_mount_path=args.volume_mount_path,
         )
     except Exception as exc:  # noqa: BLE001 — surface RunPod stock/quota errors plainly
         print(f"ERROR: create_pod failed: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -242,9 +269,19 @@ def main() -> int:
     up.add_argument("--max-model-len", type=int, default=65536)
     up.add_argument("--max-num-batched-tokens", type=int, default=8192,
                     help=">= 2496 (gemma-4 multimodal floor); NOT the local 4096 decode hack")
+    up.add_argument("--kv-cache-dtype", default="fp8",
+                    help="fp8(=e4m3) needs Ada/Hopper sm_89+ (L40S/4090). On Ampere sm_86 (A40) "
+                         "use 'auto' (fp16 KV): e4m3 fails the arch check AND fp8_e5m2 trips an "
+                         "attention-backend assert (allows only fp8/e4m3/nvfp4) in v0.20.2.")
     up.add_argument("--gpu-mem-util", type=float, default=0.92)
     up.add_argument("--container-disk", type=int, default=60, help="GB; holds image + ~18 GB AWQ weights")
     up.add_argument("--ports", default="8000/tcp,22/tcp")
+    up.add_argument("--network-volume-id", default=None,
+                    help="attach a RunPod network volume to persist the HF model cache "
+                         "(sets HF_HOME=<mount>/hf; pod auto-placed in the volume's DC). "
+                         "Volume must live in a storage DC: EU-RO-1 or EUR-IS-1.")
+    up.add_argument("--volume-mount-path", default="/runpod-volume",
+                    help="mount path for --network-volume-id (HF_HOME becomes <path>/hf)")
     up.add_argument("--running-timeout", type=float, default=420.0, help="seconds to wait for a public port")
     up.add_argument("--ready-timeout", type=float, default=1200.0, help="seconds to wait for /v1/models")
     up.set_defaults(func=cmd_up)
