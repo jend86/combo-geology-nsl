@@ -58,9 +58,20 @@ def _single_uniform_point(scratch_dir: Path, layer_name: str, *, coordinate_sour
     )
 
 
-def _multi_point(scratch_dir: Path, layer_name: str, *, uniform: bool = False) -> None:
+def _multi_point(
+    scratch_dir: Path,
+    layer_name: str,
+    *,
+    uniform: bool = False,
+    variant: int = 0,
+) -> None:
     store = SpatialVoxelStore(scratch_dir, _grid())
-    coords = [(0.5, 0.5, 0.5), (1.5, 1.5, 0.5), (2.5, 2.5, 1.5), (3.5, 0.5, 1.5)]
+    if variant == 0:
+        coords = [(0.5, 0.5, 0.5), (1.5, 1.5, 0.5), (2.5, 2.5, 1.5), (3.5, 0.5, 1.5)]
+    else:
+        # A disjoint support (different lon-lat columns) so the candidate is a
+        # genuinely distinct layer, not a near-duplicate of variant 0.
+        coords = [(0.5, 3.5, 0.5), (1.5, 2.5, 1.5), (2.5, 0.5, 0.5), (3.5, 3.5, 1.5)]
     values = [1.0, 1.0, 1.0, 1.0] if uniform else [0.2, 0.5, 0.8, 1.0]
     for i, ((lon, lat, depth), value) in enumerate(zip(coords, values)):
         store.add_point_feature(
@@ -154,6 +165,45 @@ def test_graded_multi_op_first_root_admits(tmp_path: Path) -> None:
     assert record["single_spatial_operation"] is False
     assert record["admission_tier"] in {"kg_evidence", "kg_parent_eligible"}
     assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_second_root_with_positive_bic_admits_inside_window(tmp_path: Path) -> None:
+    # The co-location stall: with one seed already in the pool, a distributed
+    # candidate at a DIFFERENT support is rejected by the scorer (positive BIC).
+    # Inside the first-K window the persist gate bypasses that, and the
+    # geometry/provenance floor (multi-op, artifact-backed) lets it seed.
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+
+    # Seed the pool with one admitted layer so this candidate is root #2.
+    seed_name = "seed_root"
+    _multi_point(store_dir / "scratch" / seed_name, seed_name)
+    assert _admit(task, kg_dir, store_dir, seed_name, _first_root_record("exp_seed", seed_name))
+    assert (store_dir / "admitted" / "layers" / f"{seed_name}.npy").exists()
+
+    # Root #2: distributed, artifact-backed, but the scorer rejected it
+    # (admitted=False, positive bic_delta, full two-stage scoring completed).
+    layer_name = "second_root"
+    _multi_point(store_dir / "scratch" / layer_name, layer_name, variant=1)
+    record = {
+        "node_id": "exp_second",
+        "hypothesis": "second distinct distributed support",
+        "parent_node_1": None,
+        "parent_node_2": None,
+        "bic_delta": 3.38,
+        "admitted": False,
+        "masking_test_passed": True,
+        "admission_path": "two_stage_v2",
+        "stage_completed": "mae_bic_completed",
+        "layer_name": layer_name,
+    }
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record)
+
+    assert admitted is True
+    assert record["first_root_rejection_reason"] == "none"
+    assert (store_dir / "admitted" / "layers" / f"{layer_name}.npy").exists()
 
 
 def test_distributed_uniform_multi_op_first_root_admits(tmp_path: Path) -> None:

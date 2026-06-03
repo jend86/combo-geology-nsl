@@ -61,6 +61,82 @@ class TestStageCompletedAllowlist:
         )
 
 
+class TestEarlyRootPersistBypass:
+    """The first K admits seed the KG and must NOT be gated by the co-location
+    scorer: Stage-1 MAE and Stage-2 BIC both reject distributed layers at
+    supports distinct from the seed (observed live: every post-seed candidate
+    scored relative_mae~=1.0, bic_delta~=+3.38). When ``early_root=True`` the
+    persist gate admits on the strength of *completed* scoring alone; the real
+    quality gate is the geometry/provenance floor in ``_admit_with_dedup``
+    (``_early_root_admission_ok``). See docs/design/scoring-colocation-
+    monoculture-2026-06-03.md.
+    """
+
+    def test_early_root_bypasses_positive_bic(self) -> None:
+        # The exact shape the live run stalled on: scorer rejected
+        # (admitted=False, bic_delta>0) but within the first-K window it persists.
+        assert _GATE(
+            masking_test_passed=True,
+            admitted=False,
+            bic_delta=3.38,
+            stage_completed="mae_bic_completed",
+            early_root=True,
+        )
+
+    def test_early_root_bypasses_stage1_failure(self) -> None:
+        # By the 3rd+ layer Stage-1 MAE is live and also rejects distributed
+        # layers; the first-K window bypasses Stage-1 too.
+        assert _GATE(
+            masking_test_passed=False,
+            admitted=False,
+            bic_delta=3.38,
+            stage_completed="mae_bic_completed",
+            early_root=True,
+        )
+
+    def test_early_root_still_requires_completed_scoring(self) -> None:
+        # Aborted/partial episodes must never seed the pool even inside the
+        # window — the stage_completed allowlist is the one invariant kept.
+        for stage in ("", "aborted", "stage_2_partial", "stage_1_only"):
+            assert not _GATE(
+                masking_test_passed=True,
+                admitted=False,
+                bic_delta=3.38,
+                stage_completed=stage,
+                early_root=True,
+            )
+
+    def test_early_root_admits_natural_pass_too(self) -> None:
+        # A first-K candidate that *also* clears BIC naturally still admits.
+        assert _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=-50.0,
+            stage_completed="mae_bic_completed",
+            early_root=True,
+        )
+
+    def test_early_root_false_restores_strict_gate(self) -> None:
+        # Once the pool holds >= K layers the bypass is off: a positive-BIC
+        # rejected candidate is blocked exactly as before (regression pin).
+        assert not _GATE(
+            masking_test_passed=True,
+            admitted=False,
+            bic_delta=3.38,
+            stage_completed="mae_bic_completed",
+            early_root=False,
+        )
+
+    def test_early_root_default_is_false(self) -> None:
+        # Callers that don't pass early_root get the strict gate by default.
+        assert not _GATE(
+            masking_test_passed=True,
+            admitted=False,
+            bic_delta=3.38,
+            stage_completed="mae_bic_completed",
+        )
+
+
 class TestOtherGateConditions:
     def test_masking_test_failure_blocks(self) -> None:
         assert not _GATE(

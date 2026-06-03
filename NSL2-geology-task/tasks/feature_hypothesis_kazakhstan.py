@@ -3495,12 +3495,27 @@ finally:
         # Stage 1: predictive capacity test; Stage 2: BIC improvement.
         # See ``_should_persist_to_kg`` for the gate semantics, including
         # the stage_completed string allowlist.
+        #
+        # The first _EARLY_ROOT_COUNT admits seed the KG and bypass the
+        # co-location scorer's verdict (it rejects distributed layers at
+        # supports distinct from the seed). Window = admitted layers BEFORE
+        # this one; no-op once the pool already holds >= K. The geometry/
+        # provenance floor in _admit_with_dedup is the real quality gate.
+        early_root_pool_size = 0
+        if store_dir:
+            try:
+                early_root_pool_size = sum(
+                    1 for _ in (Path(store_dir) / "admitted" / "layers").glob("*.npy")
+                )
+            except OSError:
+                early_root_pool_size = 0
         both_stages_passed = self._should_persist_to_kg(
             masking_test_passed=masking_test_passed,
             admitted=admitted,
             bic_delta=bic_delta,
             stage_completed=stage_completed,
             admission_path=admission_path,
+            early_root=early_root_pool_size < self._EARLY_ROOT_COUNT,
         )
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
@@ -3552,6 +3567,14 @@ finally:
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_completed": stage_completed,
                     "admission_path": admission_path,
+                    # True when this admit rode the early-root seed bypass
+                    # (scorer rejected it, but pool < K). Lets analysis separate
+                    # bypass-seeded roots from naturally BIC-passing admits.
+                    "early_root_bypass": bool(
+                        early_root_pool_size < self._EARLY_ROOT_COUNT
+                        and not (bic_delta is not None and bic_delta < 0)
+                    ),
+                    "early_root_pool_size": early_root_pool_size,
                     "scoring_version": "two_stage_v2",
                     "proposal_evidence_tier": proposal_evidence_tier,
                     "self_assessment": self_assessment,
@@ -5472,23 +5495,37 @@ finally:
         bic_delta: float | None,
         stage_completed: str,
         admission_path: str | None = None,
+        early_root: bool = False,
     ) -> bool:
         """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
         experiments enter the kg pool.
 
-        All four conditions must hold:
+        Normal path — all four conditions must hold:
           - ``masking_test_passed`` — stage 1 predictive-capacity check.
           - ``admitted`` — stage 2 scorer admitted the layer (bic_delta < 0).
           - ``bic_delta is not None and bic_delta < 0`` — defense in depth.
           - ``stage_completed`` in the allowlist — proves stage 2 actually ran
             (vs. partial / aborted scoring).
+
+        ``early_root`` (the first ``_EARLY_ROOT_COUNT`` admits, decided by pool
+        size at the call site) bypasses the Stage-1/Stage-2 *verdicts*. The
+        co-location objective rejects distributed layers at supports distinct
+        from the seed (live: post-seed candidates scored relative_mae~=1.0,
+        bic_delta~=+3.38), so the first K seed the KG on completed scoring
+        alone. The only invariant kept is the ``stage_completed`` allowlist, so
+        aborted/partial episodes can never seed; the geometry/provenance floor
+        in ``_admit_with_dedup`` (``_early_root_admission_ok``) is the real
+        quality gate. ``first_layer_auto`` (empty pool, no scoring possible)
+        keeps its own bypass below.
         """
+        if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
+            return True
+        if early_root:
+            return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
         if not bool(masking_test_passed):
             return False
         if not bool(admitted):
             return False
-        if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
-            return True
         if bic_delta is None or bic_delta >= 0:
             return False
         return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
