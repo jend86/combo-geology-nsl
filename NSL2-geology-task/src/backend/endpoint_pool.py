@@ -301,6 +301,43 @@ class EndpointPool:
             self.mark_healthy(endpoint_id)
         return healthy
 
+    def _recover_unhealthy_once(self) -> None:
+        """Re-probe every currently-quarantined endpoint once; probe() restores
+        any that answer 200. The unhealthy snapshot is taken under the lock, but
+        the probes run WITHOUT it (probe does its own brief locking) so a slow
+        network call never blocks leasing."""
+        with self._condition:
+            unhealthy = [
+                endpoint_id
+                for endpoint_id in self._order
+                if not self._states[endpoint_id].healthy
+            ]
+        for endpoint_id in unhealthy:
+            self.probe(endpoint_id)
+
+    def start_health_monitor(self, *, interval_s: float = 30.0) -> None:
+        """Spawn a daemon thread that re-probes quarantined endpoints every
+        ``interval_s``. Without this, mark_unhealthy is terminal — probe() had no
+        callers, so a single transient APIConnectionError permanently dropped an
+        endpoint for the rest of the run (observed 2026-06-04: the sole L40S was
+        lost on a blip, leaving 26 episodes on 4 local slots). Healthy endpoints
+        are skipped; the thread is a daemon so it dies with the orchestrator."""
+        if getattr(self, "_health_monitor_started", False):
+            return
+        self._health_monitor_started = True
+
+        def _loop() -> None:
+            while True:
+                time.sleep(interval_s)
+                try:
+                    self._recover_unhealthy_once()
+                except Exception:  # pragma: no cover - defensive; loop must not die
+                    logger.debug("endpoint health monitor pass failed", exc_info=True)
+
+        threading.Thread(
+            target=_loop, name="endpoint-health-monitor", daemon=True
+        ).start()
+
     def _healthy_capacity_locked(self) -> int:
         return sum(
             state.capacity for state in self._states.values() if state.healthy

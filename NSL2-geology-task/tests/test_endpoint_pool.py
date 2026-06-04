@@ -94,6 +94,41 @@ def test_reactive_quarantine_skips_unhealthy_home_until_probe_marks_healthy() ->
         pool.release(lease)
 
 
+def test_health_monitor_recovery_pass_reprobes_only_unhealthy_endpoints() -> None:
+    # A transient APIConnectionError quarantines an endpoint. Without a re-probe
+    # nothing ever restores it (probe() had zero callers), so a single blip
+    # permanently loses capacity for the whole run. _recover_unhealthy_once must
+    # re-probe ONLY the quarantined endpoints and restore the ones that pass.
+    pool = EndpointPool([_state("ep0", 4), _state("ep1", 22)])
+    pool.mark_unhealthy("ep1", "APIConnectionError: connection reset")
+    assert not pool.is_healthy("ep1")
+
+    probed: list[str] = []
+
+    def _fake_probe(endpoint_id: str, *, timeout: float = 2.0) -> bool:
+        probed.append(endpoint_id)
+        pool.mark_healthy(endpoint_id)  # mirrors real probe()'s success side effect
+        return True
+
+    pool.probe = _fake_probe  # type: ignore[assignment]
+    pool._recover_unhealthy_once()
+
+    assert probed == ["ep1"]  # healthy ep0 is never re-probed
+    assert pool.is_healthy("ep1")
+    assert pool.healthy_capacity() == 26
+
+
+def test_health_monitor_recovery_pass_leaves_endpoint_quarantined_when_probe_fails() -> None:
+    pool = EndpointPool([_state("ep0", 4), _state("ep1", 22)])
+    pool.mark_unhealthy("ep1", "still down")
+
+    pool.probe = lambda endpoint_id, *, timeout=2.0: False  # type: ignore[assignment]
+    pool._recover_unhealthy_once()
+
+    assert not pool.is_healthy("ep1")
+    assert pool.healthy_capacity() == 4
+
+
 def test_endpoint_unavailable_result_marks_endpoint_unhealthy_immediately() -> None:
     # A genuine endpoint outage (connection refused / unreachable) carries the
     # inference_unavailable prefix and DOES quarantine the endpoint, so the

@@ -1,0 +1,152 @@
+# L40S dual-endpoint variant — supplements the local 2x4090 box with ONE RunPod
+# L40S 48GB vLLM endpoint. L40S is Ada (sm_89) so fp8 (e4m3) KV works natively
+# (unlike the Ampere A40, see runpod-a40-fp8-kv-ampere); the provision script
+# defaults --kv-cache-dtype fp8 + --max-num-seqs 32 for capacity 28.
+#
+# Slot split (user-directed 2026-06-03): 4 local + 28 L40S = 32 parallel_episodes.
+# NOTE: 32 concurrent episodes is ABOVE the ~26-stable / 30-livelock ceiling found
+# for this 125 GB host (orchestrator holds ~3.5 GB in-flight per concurrent episode,
+# regardless of where inference runs — see orchestrator-memory-leak). Run under the
+# RAM-floor supervisor (scripts/run_supervised_resume.sh) as the safety net and watch
+# RSS ramp early: a fast climb to the floor with ZERO completions is the livelock
+# signature — drop parallel_episodes toward 26 if seen.
+#
+# FRESH run: knowledge/ + store/ + generations/ were archived to
+# data/.../feature-hypothesis/_archive_2026-06-03_pre-survey-bypass/ so generation_0
+# has no checkpoint -> starts clean (exercises the survey-phase admit-all bypass from
+# an empty pool). resume_from_checkpoint stays true only to resume THIS run if killed.
+#
+# endpoints-mode => the framework launches NO local vLLM. The local nsl-vllm-8000
+# container must stay alive (it does; runs without --api-key). The L40S serves the
+# SAME QuantTrio/gemma-4-31B-it-AWQ repo so the model name matches for free.
+#
+# Run (generation-only, same entrypoint as prior live runs):
+#   source ~/.config/nsl-runpod/secrets.env          # RUNPOD_VLLM_KEY for the pool
+#   nix develop -c uv run python scripts/run_generation_only.py \
+#     config/config-feature-hypothesis-kazakhstan-l40s.toml
+# (or under the RAM-floor supervisor: scripts/run_supervised_resume.sh)
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+# 600 (was 300) 2026-06-04: the L40S decode-starves under load (0.2-1.6 tok/s @ batch 28),
+# so single turns blow past 300s and KILL the episode before it can upsert -> 39% of all
+# episodes terminated inference_timeout at 0% success. Decode is PROGRESSING (duty_cycle 1.0,
+# tokens flowing), not stalled, so a longer ceiling lets slow turns finish. Real outages
+# (APIConnectionError) quarantine separately and are unaffected. worker_join = timeout+30 = 630.
+timeout = 600
+
+[vllm]
+# endpoints-mode: NO local container launched. Capacity-floor abort fires only if
+# healthy capacity drops below this. 4 => survive on the L40S alone (28 >= 4); a
+# floor set too high vs capacity caused a spurious abort before (endpoint-timeout-not-outage).
+min_healthy_endpoint_capacity = 4
+
+[[vllm.endpoints]]
+id       = "local-4090"
+base_url = "http://127.0.0.1:8000"
+capacity = 4                          # existing nsl-vllm-8000 box; no api_key (runs without --api-key)
+
+[[vllm.endpoints]]
+id          = "runpod-l40s-1"
+base_url    = "http://202.181.159.228:11996"   # L40S pod lz1o6n9e6xerhx (v0.20.2, fp8 KV)
+capacity    = 22                      # 22 (was 28) 2026-06-04: /metrics showed 28 running => KV 87% + 20 preemptions => decode 0.2-1.6 tok/s => timeouts. 22 => KV ~68%, ~0 preempt. Tune from /metrics preemptions.
+api_key_env = "RUNPOD_VLLM_KEY"       # pod injects VLLM_API_KEY; bearer the pool sends
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+# Hold survey until >=9 layers are banked before crossbreed/greedy-init. The
+# survey->crossbreed flip was otherwise gated on source coverage alone
+# (min_features=0), flipping at ~4 layers with a greedy init computed on 3.
+min_features = 9
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+# Tool-output truncation cap (chars); full output stays available via artifact paths.
+tool_output_max_chars = 2500
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 28
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 4 local + 22 L40S = 26 slots (was 32). Dropped 2026-06-04: 32 over-subscribed the single L40S
+# (28 concurrent 31B-AWQ => decode starvation => 39% inference_timeout deaths @ 0% success). 26
+# matches the config's own "toward 26 on preemption" guidance + the supervisor's RAM profile.
+# RAM is NOT binding at this episode count (ep ~68, avail ~97G); the leak only bites in the hundreds.
+parallel_episodes = 26
+target_training_rows = 4500
+max_episodes = 10000
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+# Fresh start (no generation_0 checkpoint exists); true only to resume THIS run if interrupted.
+resume_from_checkpoint = true
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[training]
+# Inert under num_generations=1 (generation-only; no finetune in this run).
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
+wandb_project = "feature-hypothesis-kazakhstan"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+# Generation-only (no finetuning).
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "regional-analysis", "bic-scoring", "gemma4", "dedup-gate", "bootstrap-ramp", "survey-phase-bypass", "runpod-l40s"]

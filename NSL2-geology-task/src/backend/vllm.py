@@ -582,6 +582,10 @@ def _build_external_endpoint_pool_session(app_config: AppConfig) -> BackendSessi
         states,
         min_healthy_capacity=_min_healthy_endpoint_capacity(app_config),
     )
+    # Re-probe quarantined endpoints periodically so a transient APIConnectionError
+    # (network blip) self-heals instead of permanently dropping the endpoint for the
+    # rest of the run. mark_unhealthy was otherwise terminal (probe() had no callers).
+    pool.start_health_monitor()
     primary = ordered_sessions[0]
     primary.genner = pool.default_genner
     primary.smoke_test = _build_pool_smoke_test(pool, sessions_by_endpoint)
