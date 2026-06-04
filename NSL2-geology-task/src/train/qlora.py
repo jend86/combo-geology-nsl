@@ -329,7 +329,12 @@ def _load_self_generated_sft_rows(
 
 
 def _tokenized_length(tokenizer: Any, text: str) -> int:
-    encoded = tokenizer(text, truncation=False, padding=False)
+    # Gemma 4 is a VLM: its processor's __call__ maps the first positional arg to
+    # `images`, not `text` (transformers>=5.5 / unsloth_zoo patched call), so
+    # `tokenizer(text)` sends the string to the image slot and crashes on text[0].
+    # Unwrap to the inner text tokenizer for a plain token count.
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    encoded = text_tokenizer(text, truncation=False, padding=False)
     input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
     if input_ids and isinstance(input_ids[0], list):
         return len(input_ids[0])
@@ -509,6 +514,15 @@ def train_sft(
     gguf_quantize: str = "f16",
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
+
+    # Import unsloth FIRST — before trl/transformers/peft are pulled in by
+    # _load_sft_classes / _load_base_model below. Unsloth patches the gemma-4
+    # modeling code (incl. the VLM image-token path) at import time; if trl or
+    # transformers import first, the patches don't apply and the text-only SFT
+    # forward index-asserts on device ("index out of bounds: 0 <= tmp < 1" in the
+    # embedding lookup). This restores the proven nsl2 import order. See memory
+    # sft-qlora-prompt-completion-crash.
+    import unsloth  # noqa: F401
 
     if wandb_project:
         if not os.environ.get("WANDB_API_KEY"):
