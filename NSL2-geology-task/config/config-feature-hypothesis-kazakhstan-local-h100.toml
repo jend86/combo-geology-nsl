@@ -61,12 +61,17 @@ timeout = 300
 # L40S 28 >= 4); abort only if BOTH collapse (see endpoint-timeout-not-outage).
 min_healthy_endpoint_capacity = 4
 
-# LOCAL-ONLY (2026-06-03): L40S torn down; iterating on voxel-triviality/root-quality fixes against
-# the local 4090 only. Re-add the runpod-l40s-1 endpoint (provision_runpod_vllm.py up) for the full run.
+# FULL RUN (2026-06-03, new scoring dynamics): 6 local + 26 L40S = 32 slots.
 [[vllm.endpoints]]
 id       = "local-4090"
 base_url = "http://127.0.0.1:8000"
 capacity = 6                          # nsl-vllm-8000 (PP=2, fp8 KV, max_num_seqs=10); runs without --api-key
+
+[[vllm.endpoints]]
+id          = "runpod-l40s-1"
+base_url    = "http://103.196.86.48:58562"   # L40S pod pzbkhh73ojoj27 (v0.20.2, fp8 KV, max-num-seqs=32, SECURE)
+capacity    = 26                              # 17GB AWQ weights + fp8 KV ~= 31GB on 48GB Ada; tune from /metrics preemptions
+api_key_env = "RUNPOD_VLLM_KEY"               # pod injects VLLM_API_KEY; bearer confirmed serving
 
 [task]
 class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
@@ -122,12 +127,13 @@ variation_strategy = "round_robin"
 generation_timeout_s = 172800  # 48 hrs
 max_consecutive_verification_failures = 2
 container_rebuild_interval = 10
-# parallel_episodes=6 (LOCAL-DEV LOOP 2026-06-03): matches the local-4090 capacity (6) now that the
-# L40S is torn down. Episodes are MUCH longer under the raised tool-call budget (250 calls / 150 turns),
-# so 6 concurrent is plenty for fast dev iteration and keeps RAM trivial (~6 x 3.5 G). Restore to ~28
-# (and re-add the L40S endpoint) for the full run once the voxel-triviality/root-quality fixes validate.
-# Prior treadmill history: orchestrator-memory-leak + kg-saturation-trajectory memories.
-parallel_episodes = 3
+# parallel_episodes=32 (FULL RUN 2026-06-03, new scoring dynamics): 6 local + 26 L40S = 32.
+# Capacity-weighted home map sends 26/32 of slots to the L40S, 6/32 to local-4090. RAM is the
+# binding ceiling (~3.5 G/slot working set => ~112 G across 32) -- WATCH steady-state `free -g`;
+# dial down toward 28 (lower L40S capacity + parallel_episodes together) if avail < 8 G / swap climbs.
+# Episodes are long under the raised tool-call budget (250 calls / 150 turns). Local-dev history:
+# orchestrator-memory-leak + kg-saturation-trajectory memories.
+parallel_episodes = 32
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20

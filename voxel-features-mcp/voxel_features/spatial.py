@@ -735,7 +735,21 @@ class SpatialVoxelStore(VoxelStore):
                     kind = str(rec.get("geometry_kind") or rec.get("geometry_type") or "point").strip().lower()
                     record_id = str(rec.get("record_id") or idx)
                     try:
-                        value = float(rec.get("value", 1.0))
+                        raw_value = rec.get("value", 1.0)
+                        try:
+                            value = float(raw_value)
+                        except (TypeError, ValueError):
+                            # Non-numeric value (e.g. a categorical suite-name string
+                            # the agent mis-mapped into `value`): treat as PRESENCE
+                            # (1.0) rather than dropping the record. The voxel scorer
+                            # is numeric/presence-oriented, so presence at distributed
+                            # coords is the meaningful signal; dropping these produced
+                            # ~85% degenerate empty layers in the 2026-06-03 run.
+                            value = 1.0
+                            warnings.append(
+                                f"Record {record_id}: non-numeric value {raw_value!r} "
+                                "coerced to presence 1.0"
+                            )
                         rule = str(rec.get("combination_rule") or combination_rule)
                         region = self._record_region(rec, kind, bounds_policy)
                         if region is None or self._region_affected_voxels(region) == 0:

@@ -283,11 +283,21 @@ TOOLS = [
                 "name": {"type": "string", "description": "Feature layer name"},
                 "records": {
                     "type": "array",
-                    "description": "Geometry records with geometry_kind point, line, or box",
+                    "description": (
+                        "Geometry records (geometry_kind: point, line, or box). Each record's "
+                        "`value` MUST be NUMERIC: a continuous measurement (e.g. prospectivity "
+                        "0..1) or 1.0 for simple presence/occurrence. Do NOT put category labels "
+                        "or names (e.g. a suite name like 'Vladimirov Suite') in `value` — "
+                        "non-numeric values are coerced to presence 1.0 with a warning, which "
+                        "loses any intended magnitude. For categorical features use numeric class "
+                        "codes with dtype=categorical."
+                    ),
                     "items": {"type": "object"},
                 },
                 "mode": {"type": "string", "enum": ["replace_layer", "accumulate_layer"], "default": "replace_layer"},
-                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float"},
+                "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"], "default": "float",
+                          "description": "Layer value semantics. `value` records must be numeric regardless; "
+                                         "use `categorical` with numeric class codes, not name strings."},
                 "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"], "default": "max"},
                 "max_records": {"type": "integer", "default": 5000},
                 "bounds_policy": {"type": "string", "enum": ["skip", "clip", "fail"], "default": "skip"},
