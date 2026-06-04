@@ -3922,6 +3922,7 @@ finally:
                         node_id,
                         feature_layer_name,
                         evaluate.get('pairwise_distance', {}),
+                        admitted_dir=admitted_dir,
                     )
 
             except Exception as e:
@@ -4103,16 +4104,24 @@ finally:
         new_node_id: str,
         new_layer_name: str,
         new_pairwise_distance: dict[str, float],
+        admitted_dir: Path | str | None = None,
     ) -> None:
         """Append pairwise-distance records for the new admit's layer.
 
         Replaces `_update_crossbreed_index` as the source for queue
         ranking. Pair ids are alphabetically sorted so the symmetric
         distance is written once per unordered pair (matches
-        `_load_distance_index`'s lookup key). Existing experiments without
-        a layer name match in `new_pairwise_distance` are written at
-        distance=0.0 so the queue treats them neutrally rather than
-        skipping the entry.
+        `_load_distance_index`'s lookup key).
+
+        Distances are computed directly from the persisted admitted-layer
+        arrays via `voxel_features.scoring.pairwise_distance` (normalized
+        [0,1] — Jaccard for boolean, magnitude-normalized L1 for float). This
+        is the producer the pipeline always lacked: `evaluate['pairwise_distance']`
+        had no writer anywhere, so every pair previously fell to the `0.0`
+        default — which `_count_diverse_parents` reads as a near-duplicate,
+        collapsing the whole pool to one parent and permanently blocking
+        crossbreed. Pairs whose layer array is missing are *skipped* (left
+        "unknown" = diverse) rather than written at the misleading `0.0`.
         """
         from datetime import datetime
 
@@ -4132,15 +4141,48 @@ finally:
                         except json.JSONDecodeError:
                             continue
 
+            # Open the admitted store once so we can read every layer's voxel
+            # array for the real distance. Falls back to the scorer-provided
+            # dict if the store can't be opened.
+            store = None
+            store_layers: set[str] = set()
+            pairwise_distance = None
+            if admitted_dir is not None:
+                try:
+                    from voxel_features.store import VoxelStore
+                    from voxel_features.scoring import pairwise_distance
+                    store_path = Path(admitted_dir)
+                    if (store_path / "index.json").exists():
+                        store = VoxelStore(store_path)
+                        store_layers = set(store.layer_names)
+                except Exception:  # noqa: BLE001 — fall back to provided dict
+                    store = None
+                    store_layers = set()
+
             new_records: list[dict[str, Any]] = []
             for existing_exp in existing_experiments:
                 existing_id = existing_exp.get("node_id")
                 if not isinstance(existing_id, str) or existing_id == new_node_id:
                     continue
                 existing_layer = existing_exp.get("layer_name") or ""
-                # The evaluate result keyed pairwise_distance by the *other*
-                # layer name in the store at the time it was scored.
-                dist = float(new_pairwise_distance.get(existing_layer, 0.0))
+                dist: float | None = None
+                if (
+                    store is not None
+                    and new_layer_name in store_layers
+                    and existing_layer in store_layers
+                ):
+                    try:
+                        dist = float(pairwise_distance(store, new_layer_name, existing_layer))
+                    except Exception:  # noqa: BLE001
+                        dist = None
+                if dist is None:
+                    # Never write the 0.0 sentinel for an uncomputable pair —
+                    # _count_diverse_parents would read it as a near-duplicate.
+                    # Use any scorer-provided value, else skip (= unknown/diverse).
+                    provided = new_pairwise_distance.get(existing_layer)
+                    if provided is None:
+                        continue
+                    dist = float(provided)
                 pair_id = (
                     f"{min(new_node_id, existing_id)}_"
                     f"{max(new_node_id, existing_id)}"
@@ -6835,6 +6877,13 @@ finally:
             kg_record["admission_tier"] = "guard_rejected"
             kg_record["first_root_rejection_reason"] = "degenerate_empty_layer"
             return False
+        if scratch_dir is not None:
+            scratch_npy = Path(scratch_dir) / "layers" / f"{layer_name}.npy"
+            if not scratch_npy.exists():
+                kg_record["admission_tier"] = "guard_rejected"
+                kg_record["materialization_rejection_reason"] = "missing_scratch_layer"
+                kg_record["crossbreed_parent_eligible"] = False
+                return False
         fp = self._fingerprint(parents, hypothesis)
         candidate_values = None
         if (
@@ -6842,11 +6891,9 @@ finally:
             and isinstance(layer_name, str)
             and layer_name
         ):
-            scratch_npy = Path(scratch_dir) / "layers" / f"{layer_name}.npy"
-            if scratch_npy.exists():
-                import numpy as np
+            import numpy as np
 
-                candidate_values = np.load(scratch_npy)
+            candidate_values = np.load(scratch_npy)
 
         on_admit = None
         pre_admit = None

@@ -301,3 +301,48 @@ class TestAdmitPromotesScratchToAdmitted:
         # Admitted index has the layer entry; a fresh store_dir overlay sees it.
         verify = _store(tmp_path / "verify_scratch", admitted=admitted)
         assert "candidate" in verify.layer_names
+
+    def test_missing_scratch_npy_does_not_write_kg_row(self, tmp_path: Path) -> None:
+        store_dir = tmp_path / "store" / "teniz_basin"
+        scratch = store_dir / "scratch" / "ep_missing"
+        admitted = store_dir / "admitted"
+        kg_dir = tmp_path / "kg" / "teniz_basin"
+        (scratch / "layers").mkdir(parents=True)
+
+        from tasks.feature_hypothesis_kazakhstan import (
+            FeatureHypothesisKazakhstanTask,
+        )
+
+        task = FeatureHypothesisKazakhstanTask({
+            "store_dir": str(tmp_path / "store_root"),
+            "kg_dir": str(tmp_path / "kg_root"),
+        })
+
+        kg_record = {
+            "node_id": "exp_missing",
+            "hypothesis": "h missing layer",
+            "parent_node_1": None,
+            "parent_node_2": None,
+            "bic_delta": -10.0,
+            "admitted": True,
+            "masking_test_passed": True,
+            "stage_completed": "mae_bic_completed",
+            "layer_name": "candidate",
+        }
+
+        result = task._admit_with_dedup(
+            kg_dir,
+            kg_record,
+            parents=[],
+            hypothesis="h missing layer",
+            scratch_dir=scratch,
+            admitted_dir=admitted,
+            layer_name="candidate",
+        )
+
+        assert result is False
+        assert kg_record["admission_tier"] == "guard_rejected"
+        assert kg_record["materialization_rejection_reason"] == "missing_scratch_layer"
+        assert not (kg_dir / "experiments.jsonl").exists()
+        assert not (kg_dir / "admitted_index.json").exists()
+        assert not (admitted / "layers" / "candidate.npy").exists()
