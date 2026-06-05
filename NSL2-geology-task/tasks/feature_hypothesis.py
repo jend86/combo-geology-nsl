@@ -3227,7 +3227,10 @@ finally:
         return min(max(float(np.sum(np.abs(a - b))) / scale, 0.0), 1.0)
 
     _PARENTAGE_BASE_THRESHOLD = 0.50
-    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
+    # 0.25 -> 0.10 (2026-06-05): weak-tier 0.75 blocked diverse valid survey
+    # founders (evidence_strength ~0.65) and starved crossbreed of parents. 0.10
+    # (weak threshold 0.60) lets decent founders qualify naturally.
+    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.10
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
 
     @staticmethod
@@ -3769,8 +3772,15 @@ finally:
             for exp_b in experiments:
                 if exp_a["node_id"] == exp_b["node_id"]:
                     continue
-                bic_a = abs(float(exp_a.get("bic_delta", 0.0)))
-                bic_b = abs(float(exp_b.get("bic_delta", 0.0)))
+                # Seed/first-layer founders score against a tiny pool -> artificially
+                # large |bic| (first_layer_auto carries None). That magnitude is a
+                # scoring artifact, not a quality signal, so neutralize it: seeds rank
+                # by diversity (the λ·dist term), NOT by their inflated bic, so they
+                # cannot dominate the queue or crowd out normal admits.
+                bic_a = 0.0 if exp_a.get("admission_path") in ("diverse_seed", "first_layer_auto") \
+                    else abs(float(exp_a.get("bic_delta") or 0.0))
+                bic_b = 0.0 if exp_b.get("admission_path") in ("diverse_seed", "first_layer_auto") \
+                    else abs(float(exp_b.get("bic_delta") or 0.0))
                 # Distance is symmetric and uses the alphabetically-sorted
                 # pair id (matches `_update_pairwise_distance_index`).
                 dist_pair_id = (

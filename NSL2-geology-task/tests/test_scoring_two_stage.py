@@ -107,7 +107,30 @@ def test_diverse_seed_path_before_seed_target(tmp_path: Path) -> None:
     assert result["validity_passed"] is True
 
 
-def test_spatial_predictor_lift_admits_non_colocated_candidate(tmp_path: Path) -> None:
+def test_seed_bootstrap_extends_to_diverse_founder_pool(tmp_path: Path) -> None:
+    """The seed window admits validity-passing layers (bypassing predictor-lift) up
+    to _SPATIAL_SEED_POOL_TARGET, so the survey phase builds a diverse founder pool
+    instead of stalling once predictor-lift takes over. With the production target
+    (raised to match min_features), a valid candidate at L=4 is still a diverse_seed
+    — it was a predictor-lift "normal" candidate back when the target was 3.
+    """
+    assert scoring._SPATIAL_SEED_POOL_TARGET >= 5
+    store = _store(tmp_path / "seed_extend")
+    for i, center in enumerate([(16, 20), (24, 20), (16, 28), (24, 28)]):
+        store.add_layer(f"seed{i}", _blob(center), dtype="float")  # 4-layer pool
+    result = evaluate_new_layer(store, "fifth", _blob((20, 24)), "float", seed=7)
+    assert result["validity_passed"] is True
+    assert result["admission_path"] == "diverse_seed"
+    assert result["admitted"] is True
+
+
+def test_spatial_predictor_lift_admits_non_colocated_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Exercise the predictor-lift (normal) path at L=3 regardless of the production
+    # seed window, which is raised to build a diverse founder pool
+    # (see test_seed_bootstrap_extends_to_diverse_founder_pool).
+    monkeypatch.setattr(scoring, "_SPATIAL_SEED_POOL_TARGET", 3)
     store = _store(tmp_path / "normal_admit")
     _seed_normal_pool(store)
 
@@ -121,7 +144,11 @@ def test_spatial_predictor_lift_admits_non_colocated_candidate(tmp_path: Path) -
     assert result["admitted"] is True
 
 
-def test_unrelated_self_coherent_blob_fails_normal_admission(tmp_path: Path) -> None:
+def test_unrelated_self_coherent_blob_fails_normal_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Normal predictor-lift path at L=3; pin the seed window below the pool size.
+    monkeypatch.setattr(scoring, "_SPATIAL_SEED_POOL_TARGET", 3)
     store = _store(tmp_path / "normal_reject")
     _seed_normal_pool(store)
 

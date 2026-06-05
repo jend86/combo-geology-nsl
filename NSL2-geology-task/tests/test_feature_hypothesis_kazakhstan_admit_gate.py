@@ -105,13 +105,29 @@ class TestSeedPhasePersistBypass:
             seed_phase=True,
         )
 
-    def test_crossbreed_restores_strict_gate(self) -> None:
-        assert not _GATE(
+    def test_diverse_seed_persists_regardless_of_seed_phase(self) -> None:
+        # The scorer emits diverse_seed only in the seed window, so the label (not
+        # the racy seed_phase flag) governs: a validity-admitted +bic founder
+        # persists even when the episode's seed_phase raced to False. (Survey
+        # admits are parents regardless of score; the novelty guard blocks dups.)
+        assert _GATE(
             masking_test_passed=True,
             admitted=True,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
             admission_path="diverse_seed",
+            seed_phase=False,
+        )
+
+    def test_crossbreed_strict_gate_applies_to_normal_admits(self) -> None:
+        # The strict bic<0 gate still governs NORMAL (non-seed) admits regardless
+        # of phase — a +bic normal candidate is rejected.
+        assert not _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=3.38,
+            stage_completed="mae_bic_completed",
+            admission_path="normal",
             seed_phase=False,
         )
 

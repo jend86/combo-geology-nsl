@@ -264,6 +264,35 @@ class TestQueueScoring:
         # exp_h (100) + exp_mid (50).
         assert set(pair) == {"exp_h", "exp_mid"}
 
+    def test_seed_path_bic_neutralized_so_seeds_dont_dominate(self, tmp_path: Path) -> None:
+        # Survey/seed founders score against a tiny pool -> artificially large
+        # |bic| (e.g. -5.3), and first_layer_auto carries bic_delta=None. Both are
+        # now crossbreed-parent-eligible, but their magnitude is a scoring artifact
+        # that must NOT dominate the queue (seeds rank by diversity instead), and
+        # None must not crash enumeration.
+        kg_dir = Path(_variation(tmp_path).kg_dir)
+        kg_dir.mkdir(parents=True, exist_ok=True)
+        recs = [
+            {"node_id": "seed_a", "admission_path": "diverse_seed", "bic_delta": -5.3, "crossbreed_parent_eligible": True},
+            {"node_id": "seed_b", "admission_path": "diverse_seed", "bic_delta": -5.1, "crossbreed_parent_eligible": True},
+            {"node_id": "norm_a", "admission_path": "normal", "bic_delta": -0.5, "crossbreed_parent_eligible": True},
+            {"node_id": "norm_b", "admission_path": "normal", "bic_delta": -0.4, "crossbreed_parent_eligible": True},
+        ]
+        with (kg_dir / "experiments.jsonl").open("w") as fh:
+            for rec in recs:
+                fh.write(json.dumps(rec) + "\n")
+
+        task = _task(tmp_path)
+        entries = task._enumerate_pairs(kg_dir)
+
+        assert entries, "expected enumerated pairs"
+        # seed_a/seed_b carry the largest raw |bic| (5.3/5.1) but that magnitude is a
+        # tiny-pool scoring artifact -> neutralized. The two normal admits form the
+        # top pair; the seed-seed pair (highest raw |bic|) must rank below it.
+        assert set(entries[0]["parents"]) == {"norm_a", "norm_b"}
+        by_pair = {frozenset(e["parents"]): e["score"] for e in entries}
+        assert by_pair[frozenset({"seed_a", "seed_b"})] <= by_pair[frozenset({"norm_a", "norm_b"})]
+
 
 def _seed_crossbreed_child(
     kg_dir: Path,

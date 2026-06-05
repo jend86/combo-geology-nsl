@@ -1987,11 +1987,13 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         return EpisodeConstraints(
             # Episode-wide budget shared across ALL phases (explore+hypothesise+code+translate+
             # rewrite). The old 60/45 starved the Translate phase: after survey reading + code
-            # execution, only a few turns remained, forcing single-point "blob" layers. Raised for
-            # an abundance of tool calls so Translate can emit many per-record spatial ops.
-            # Per-turn context growth (not turn count) is the overflow lever -- in-loop compaction
-            # (context_compaction_*) + tool_output_max_chars handle that; watch overflow rate.
-            budgets=BudgetConstraints(max_task_tool_calls=250, max_llm_turns=150),
+            # execution, only a few turns remained, forcing single-point "blob" layers. 250 gave an
+            # abundance, but 250->150 (2026-06-05): the budget is SHOWN to the agent (base.py:165
+            # injects "task tool calls: at most N") so it guides behaviour. 150 stays functionally
+            # generous (a normal episode does not hit it) yet nudges shorter, tighter episodes ->
+            # smaller contexts -> less L40S prefill -> fewer inference_timeouts, WITHOUT compaction's
+            # quality/stall risk (the preferred context-size lever per user guidance).
+            budgets=BudgetConstraints(max_task_tool_calls=150, max_llm_turns=150),
             success=SuccessConstraints(terminal_capability_for_success="submit_rewrite"),
         )
 
@@ -5904,7 +5906,15 @@ finally:
         """
         if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
             return True
-        if seed_phase and admission_path == "diverse_seed":
+        # The scorer emits admission_path=="diverse_seed" ONLY in the seed window
+        # (L < _SPATIAL_SEED_POOL_TARGET), so the label itself proves "survey seed"
+        # — independent of the per-episode ``seed_phase`` flag, which races at
+        # populate (workflow_kind can read non-survey for an early concurrent
+        # episode) and was wrongly dropping validity-admitted +bic founders at the
+        # kg_gate. Survey founders must persist as parents regardless of bic sign
+        # (the novelty guard still blocks duplicates); ``seed_phase`` no longer
+        # gates this branch.
+        if admission_path == "diverse_seed":
             return (
                 stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
                 and bool(masking_test_passed)
@@ -6371,7 +6381,12 @@ finally:
         return min(max(float(np.sum(np.abs(a - b))) / scale, 0.0), 1.0)
 
     _PARENTAGE_BASE_THRESHOLD = 0.50
-    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
+    # 0.25 -> 0.10 (2026-06-05): weak-tier threshold was 0.75, but live survey
+    # founders carry evidence_strength ~0.62-0.70 (diverse, valid, but "weak" tier),
+    # so 0.75 blocked 4/6 founders and starved crossbreed of parents. 0.10 (weak
+    # threshold 0.60) lets decent founders qualify NATURALLY rather than being
+    # force-bypassed; still above the 0.50 strong-tier bar.
+    _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.10
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
 
     @staticmethod
@@ -7220,6 +7235,15 @@ finally:
         for rec in cls._read_jsonl_records(kg_dir / _KG_EXPERIMENTS):
             if rec.get("crossbreed_parent_eligible") is not True:
                 continue
+            # An ELIGIBLE validity-admitted seed founder (diverse_seed /
+            # first_layer_auto) is a crossbreed parent regardless of bic sign: for a
+            # founder pool, the building-block value is diversity+validity, not the
+            # prediction score. Eligibility (the parentage-strength + near-dup gate,
+            # whose weak-tier threshold was lowered so decent founders qualify) is the
+            # quality criterion; bic<0 only governs NORMAL (predictor-lift) admits.
+            if rec.get("admission_path") in ("diverse_seed", "first_layer_auto"):
+                out.append(rec)
+                continue
             try:
                 bic_delta = float(rec.get("bic_delta"))
             except (TypeError, ValueError):
@@ -7271,8 +7295,15 @@ finally:
             for exp_b in experiments:
                 if exp_a["node_id"] == exp_b["node_id"]:
                     continue
-                bic_a = abs(float(exp_a.get("bic_delta", 0.0)))
-                bic_b = abs(float(exp_b.get("bic_delta", 0.0)))
+                # Seed/first-layer founders score against a tiny pool -> artificially
+                # large |bic| (first_layer_auto carries None). That magnitude is a
+                # scoring artifact, not a quality signal, so neutralize it: seeds rank
+                # by diversity (the λ·dist term), NOT by their inflated bic, so they
+                # cannot dominate the queue or crowd out normal admits.
+                bic_a = 0.0 if exp_a.get("admission_path") in ("diverse_seed", "first_layer_auto") \
+                    else abs(float(exp_a.get("bic_delta") or 0.0))
+                bic_b = 0.0 if exp_b.get("admission_path") in ("diverse_seed", "first_layer_auto") \
+                    else abs(float(exp_b.get("bic_delta") or 0.0))
                 # Distance is symmetric and uses the alphabetically-sorted
                 # pair id (matches `_update_pairwise_distance_index`).
                 dist_pair_id = (
