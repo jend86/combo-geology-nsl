@@ -2136,6 +2136,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "    call spatial_set_layer_array(name='shared_layer_name', array_artifact='value_grid') once,\n"
                         "    then go to scoring (step 5). This preserves continuous values (point/line/box only stamp\n"
                         "    a flat scalar). Prefer this when your feature is a gradient or smooth distribution.\n"
+                        "    The bridge records the resolved code-phase ndarray artifact as provenance for review;\n"
+                        "    use the path that best reflects how your analysis produced the layer.\n"
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
@@ -2513,7 +2515,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     "(0..1). Values are preserved verbatim (NO binarization). The array must match "
                     "the grid shape (200x200x8). Set array_artifact to the name of the top-level "
                     "numpy array your code left (auto-saved as <name>_array.npy); 'auto' picks the "
-                    "grid-shaped array."
+                    "grid-shaped array. The resolved ndarray artifact is recorded as artifact "
+                    "provenance for admission review."
                 ),
                 schema={
                     "type": "object",
@@ -4732,6 +4735,11 @@ finally:
                 arr_args["values"] = layer_array
                 _meta = arr_args.get("metadata") if isinstance(arr_args.get("metadata"), dict) else {}
                 arr_args["metadata"] = {**_meta, "array_artifact_path": array_path}
+                arr_args["source_file"] = str(array_path) if array_path else None
+                arr_args["source_excerpt"] = (
+                    f"code-phase ndarray artifact {artifact_name!r} materialized as full-grid array"
+                )
+                arr_args["coordinate_source"] = "artifact"
                 args = arr_args
 
             # Validate coordinates if this is a spatial operation with coordinates
@@ -6690,6 +6698,10 @@ finally:
         z_levels = int(np.any(support, axis=(0, 1)).sum()) if candidate.ndim == 3 else 0
         depth_levels_filled = bool(candidate.ndim == 3 and z_levels == candidate.shape[2] and z_levels > 0)
         op_count = int(kg_record.get("spatial_operation_provenance_count", 0) or 0)
+        geometry_kind_counts = kg_record.get("geometry_kind_counts") or {}
+        if not isinstance(geometry_kind_counts, dict):
+            geometry_kind_counts = {}
+        array_op_count = int(geometry_kind_counts.get("array", 0) or 0)
         nonzero = int(kg_record.get("candidate_nonzero_voxels", np.count_nonzero(candidate)) or 0)
         declared_footprint_size = nonzero if nonzero > 0 else op_count
         declared_nothing = op_count == 0 and nonzero == 0
@@ -6699,7 +6711,7 @@ finally:
             "candidate_nonzero_value_min": value_min,
             "candidate_nonzero_value_max": value_max,
             "candidate_value_entropy": entropy,
-            "single_spatial_operation": op_count == 1,
+            "single_spatial_operation": op_count == 1 and array_op_count == 0,
             "uniform_nonzero_value": bool(nonzero_values.size > 0 and unique_nonzero.size <= 1),
             "depth_levels_filled": depth_levels_filled,
             "declared_footprint_size": int(declared_footprint_size),
@@ -7067,9 +7079,12 @@ finally:
             kind = str(op.get("operation_type") or "unknown")
             geometry_kind_counts[kind] = geometry_kind_counts.get(kind, 0) + 1
         fallback_count = source_counts.get("creative_fallback", 0)
+        missing_provenance = not operations
         all_creative_fallback = bool(operations) and fallback_count == len(operations)
         override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
-        guard_passed = (not all_creative_fallback) or override_enabled
+        guard_passed = (not missing_provenance) and (
+            (not all_creative_fallback) or override_enabled
+        )
         operation_signatures = [
             "|".join(
                 str(op.get(key) or "")
@@ -7089,9 +7104,13 @@ finally:
             "spatial_operation_signatures": operation_signatures,
             "translate_fallback_used": fallback_count > 0,
             "provenance_guard_passed": guard_passed,
-            "provenance_rejection_reason": "all_creative_fallback"
-            if all_creative_fallback and not override_enabled
-            else "none",
+            "provenance_rejection_reason": (
+                "missing_spatial_operation_provenance"
+                if missing_provenance
+                else "all_creative_fallback"
+                if all_creative_fallback and not override_enabled
+                else "none"
+            ),
         })
         return guard_passed
 

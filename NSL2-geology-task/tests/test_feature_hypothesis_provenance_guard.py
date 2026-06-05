@@ -14,7 +14,14 @@ from pathlib import Path
 from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
 
 
-def _make_spatial_db(scratch: Path, feature_name: str, coordinate_source: str, n: int) -> None:
+def _make_spatial_db(
+    scratch: Path,
+    feature_name: str,
+    coordinate_source: str,
+    n: int,
+    *,
+    operation_type: str = "point",
+) -> None:
     db = scratch / "spatial.db"
     conn = sqlite3.connect(str(db))
     conn.execute(
@@ -36,7 +43,7 @@ def _make_spatial_db(scratch: Path, feature_name: str, coordinate_source: str, n
         conn.execute(
             "INSERT INTO spatial_operations (operation_type, feature_name, coordinates, parameters, coordinate_source) "
             "VALUES (?,?,?,?,?)",
-            ("point", feature_name, "69.0,51.0,40", "radius_m=100,value=1.0", coordinate_source),
+            (operation_type, feature_name, "69.0,51.0,40", "radius_m=100,value=1.0", coordinate_source),
         )
     conn.commit()
     conn.close()
@@ -63,3 +70,34 @@ def test_provenance_all_creative_fallback_now_rejected(tmp_path):
     )
     assert kg["spatial_operation_provenance_count"] == 1
     assert kg["provenance_guard_passed"] is False
+
+
+def test_missing_spatial_operation_provenance_rejected(tmp_path):
+    kg: dict = {}
+    FeatureHypothesisKazakhstanTask._stamp_candidate_provenance(
+        kg, scratch_dir=tmp_path, layer_name="array_layer_1780408167200"
+    )
+
+    assert kg["spatial_operation_provenance_count"] == 0
+    assert kg["coordinate_source_counts"] == {}
+    assert kg["provenance_guard_passed"] is False
+    assert kg["provenance_rejection_reason"] == "missing_spatial_operation_provenance"
+
+
+def test_array_operation_artifact_provenance_passes(tmp_path):
+    _make_spatial_db(
+        tmp_path,
+        "continuous_field",
+        coordinate_source="artifact",
+        n=1,
+        operation_type="array",
+    )
+    kg: dict = {}
+    FeatureHypothesisKazakhstanTask._stamp_candidate_provenance(
+        kg, scratch_dir=tmp_path, layer_name="continuous_field_1780408167201"
+    )
+
+    assert kg["spatial_operation_provenance_count"] == 1
+    assert kg["coordinate_source_counts"] == {"artifact": 1}
+    assert kg["geometry_kind_counts"] == {"array": 1}
+    assert kg["provenance_guard_passed"] is True

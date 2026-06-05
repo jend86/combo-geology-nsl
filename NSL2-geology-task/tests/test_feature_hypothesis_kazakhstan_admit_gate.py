@@ -12,6 +12,7 @@ strings so post-rewrite scoring keeps admitting.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
@@ -347,6 +348,23 @@ class TestSeedPhaseHardening:
             record, seed_phase=True
         ) is False
         assert record["first_root_rejection_reason"] == "single_spatial_operation"
+
+    def test_single_array_operation_seed_is_not_single_geometry_blob(self) -> None:
+        record = {
+            "spatial_operation_provenance_count": 1,
+            "coordinate_source_counts": {"artifact": 1},
+            "geometry_kind_counts": {"array": 1},
+        }
+        values = np.zeros((4, 4, 2), dtype=float)
+        values[:, :, :] = 0.5
+
+        FeatureHypothesisKazakhstanTask._stamp_candidate_triviality(record, values=values)
+
+        assert record["single_spatial_operation"] is False
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is True
+        assert record["first_root_rejection_reason"] == "none"
 
     def test_partial_fallback_seed_passes(self) -> None:
         # 1 of 4 ops is fallback → not all_creative_fallback → passes.

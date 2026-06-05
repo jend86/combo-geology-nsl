@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
 from voxel_features.spatial import SpatialVoxelStore
 from voxel_features.store import GridSpec
@@ -85,6 +87,23 @@ def _multi_point(
             source_file="analysis.csv",
             source_excerpt=f"row {i}",
         )
+
+
+def _array_layer(scratch_dir: Path, layer_name: str, *, with_provenance: bool) -> None:
+    store = SpatialVoxelStore(scratch_dir, _grid())
+    values = np.zeros(_grid().shape, dtype=float)
+    values[:, :, :] = 0.5
+    if with_provenance:
+        store.set_layer_array(
+            layer_name,
+            values,
+            dtype="float",
+            source_file="value_grid_array.npy",
+            source_excerpt="code-phase value_grid artifact",
+            coordinate_source="artifact",
+        )
+    else:
+        store.add_layer(layer_name, values, dtype="float")
 
 
 def _first_root_record(node_id: str, layer_name: str) -> dict:
@@ -166,6 +185,40 @@ def test_graded_multi_op_first_root_admits(tmp_path: Path) -> None:
     assert record["single_spatial_operation"] is False
     assert record["admission_tier"] in {"kg_evidence", "kg_parent_eligible"}
     assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_artifact_backed_array_first_root_admits(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "array_root"
+    _array_layer(store_dir / "scratch" / layer_name, layer_name, with_provenance=True)
+    record = _first_root_record("exp_array", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record)
+
+    assert admitted is True
+    assert record["first_root_rejection_reason"] == "none"
+    assert record["spatial_operation_provenance_count"] == 1
+    assert record["geometry_kind_counts"] == {"array": 1}
+    assert record["single_spatial_operation"] is False
+    assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_array_without_operation_provenance_rejected(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "unprovenanced_array_root"
+    _array_layer(store_dir / "scratch" / layer_name, layer_name, with_provenance=False)
+    record = _first_root_record("exp_unprovenanced_array", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record)
+
+    assert admitted is False
+    assert record["admission_tier"] == "guard_rejected"
+    assert record["provenance_rejection_reason"] == "missing_spatial_operation_provenance"
+    assert not (kg_dir / "experiments.jsonl").exists()
 
 
 def test_second_root_with_positive_bic_admits_in_survey(tmp_path: Path) -> None:

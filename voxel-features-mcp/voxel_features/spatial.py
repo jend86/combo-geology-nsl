@@ -270,6 +270,11 @@ class SpatialVoxelStore(VoxelStore):
         metadata: dict[str, Any] | None = None,
         hypothesis_uri: str | None = None,
         experiment_id: str | None = None,
+        source_file: str | None = None,
+        source_excerpt: str | None = None,
+        coordinate_source: Literal[
+            "geonames", "web", "artifact", "creative_fallback"
+        ] = "creative_fallback",
     ):
         """Deposit a FULL precomputed per-voxel value array as layer ``name``.
 
@@ -288,12 +293,13 @@ class SpatialVoxelStore(VoxelStore):
             raise ValueError(
                 f"Array shape {tuple(arr.shape)} does not match grid shape {tuple(self.grid.shape)}"
             )
+        nz = arr[arr != 0]
         with _store_rmw_lock(self.store_path):
             self._layers.pop(name, None)
             scratch_npy = self._layers_dir / f"{name}.npy"
             if scratch_npy.exists():
                 scratch_npy.unlink()
-            return self.add_layer(
+            layer = self.add_layer(
                 name=name,
                 values=arr,
                 dtype=dtype,
@@ -301,6 +307,33 @@ class SpatialVoxelStore(VoxelStore):
                 hypothesis_uri=hypothesis_uri,
                 experiment_id=experiment_id,
             )
+            with self._spatial_conn:
+                self._spatial_conn.execute(
+                    "DELETE FROM spatial_operations WHERE feature_name = ?",
+                    (name,),
+                )
+                self._log_spatial_operation(
+                    "array",
+                    name,
+                    (
+                        f"grid_origin={tuple(self.grid.origin)};"
+                        f"grid_maximum={tuple(self.grid.maximum)};"
+                        f"shape={tuple(arr.shape)}"
+                    ),
+                    (
+                        f"dtype={dtype},shape={tuple(arr.shape)},"
+                        f"nonzero_voxels={int(nz.size)},"
+                        f"value_min={float(arr.min()) if arr.size else 0.0},"
+                        f"value_max={float(arr.max()) if arr.size else 0.0},"
+                        f"distinct_nonzero_values={int(np.unique(nz).size) if nz.size else 0}"
+                    ),
+                    source_file=source_file,
+                    source_excerpt=source_excerpt,
+                    coordinate_source=coordinate_source,
+                    affected_voxels=int(arr.size),
+                    commit=False,
+                )
+            return layer
 
     @staticmethod
     def _combine_values(current, value: float, combination_rule: str):

@@ -39,6 +39,35 @@ def test_set_layer_array_preserves_continuous_values(tmp_path):
     assert len(np.unique(stored)) > 2  # genuinely continuous, not a 0/1 mask
 
 
+def test_set_layer_array_logs_artifact_provenance(tmp_path):
+    store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
+    arr = np.zeros((200, 200, 8), dtype=float)
+    arr[3, 4, 2] = 0.25
+    arr[10, 20, 1] = 0.75
+
+    result = spatial_set_layer_array(
+        store,
+        name="grad",
+        values=arr,
+        dtype="float",
+        source_file="value_grid_array.npy",
+        source_excerpt="computed IDW grid from code phase",
+        coordinate_source="artifact",
+    )
+
+    assert result["success"] is True
+    ops = [op for op in store.get_spatial_operations() if op["feature_name"] == "grad"]
+    assert len(ops) == 1
+    op = ops[0]
+    assert op["operation_type"] == "array"
+    assert op["coordinate_source"] == "artifact"
+    assert op["source_file"] == "value_grid_array.npy"
+    assert op["source_excerpt"] == "computed IDW grid from code phase"
+    assert op["affected_voxels"] == arr.size
+    assert "shape=(200, 200, 8)" in op["parameters"]
+    assert "nonzero_voxels=2" in op["parameters"]
+
+
 def test_set_layer_array_rejects_shape_mismatch(tmp_path):
     """Shape != grid is rejected cleanly (success False); no layer is created."""
     store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
@@ -56,6 +85,22 @@ def test_set_layer_array_replaces_existing_layer(tmp_path):
     store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
     a = np.full((200, 200, 8), 0.3)
     b = np.full((200, 200, 8), 0.7)
-    assert spatial_set_layer_array(store, name="L", values=a)["success"] is True
-    assert spatial_set_layer_array(store, name="L", values=b)["success"] is True
+    assert spatial_set_layer_array(
+        store,
+        name="L",
+        values=a,
+        source_file="first_array.npy",
+        coordinate_source="artifact",
+    )["success"] is True
+    assert spatial_set_layer_array(
+        store,
+        name="L",
+        values=b,
+        source_file="second_array.npy",
+        coordinate_source="artifact",
+    )["success"] is True
     np.testing.assert_array_equal(store.get_layer_values("L"), b)
+    ops = [op for op in store.get_spatial_operations() if op["feature_name"] == "L"]
+    assert len(ops) == 1
+    assert ops[0]["operation_type"] == "array"
+    assert ops[0]["source_file"] == "second_array.npy"
