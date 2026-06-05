@@ -78,8 +78,17 @@ _SPATIAL_TAU_SELF = 0.9
 _SPATIAL_MIN_EVAL_ROWS = 8
 _SPATIAL_MIN_TRAIN_ROWS = 5
 _SPATIAL_MAX_PREDICTOR_LAYERS = 6
-_SPATIAL_NULL_PERMUTATIONS = 0
+# Permutation null ON (2026-06-06): admit iff real lift beats the (100-percentile)th
+# percentile of the null lift distribution AND the hand-set floor (the null only
+# TIGHTENS). null_max_rows bounds per-permutation cost — rich/blanket targets carry
+# 10^5 rows; an UNBOUNDED null cost ~4.3s/permutation (=> 7min at N=100). Subsampling
+# to null_max_rows cuts that to ~380ms/perm (real lift still uses ALL rows). Measured
+# host cost @ pool=15: N=50 ~= 19s/score, scaling ~linearly with n_targets (pool size).
+# The host is GPU-bound / ~98% CPU-idle so this overlaps inference-wait. Env override:
+# VFM_SPATIAL_NULL_PERMUTATIONS (dial down at very large pools if scoring stalls slots).
+_SPATIAL_NULL_PERMUTATIONS = 50
 _SPATIAL_NULL_PERCENTILE = 5.0
+_SPATIAL_NULL_MAX_ROWS = 2000
 # 3 -> 6 (2026-06-05): the seed bypass admits validity-passing layers WITHOUT
 # predictor-lift, building the diverse founder pool the survey phase needs. At 3 it
 # stalled: layers 4+ hit full predictor-lift, which can't admit spatially-distinct
@@ -1665,6 +1674,7 @@ def spatial_predictor_lift_score(
     max_predictor_layers: int | None = _SPATIAL_MAX_PREDICTOR_LAYERS,
     null_permutations: int = _SPATIAL_NULL_PERMUTATIONS,
     null_percentile: float = _SPATIAL_NULL_PERCENTILE,
+    null_max_rows: int = _SPATIAL_NULL_MAX_ROWS,
     admit_min_lift: float = _SPATIAL_ADMIT_MIN_LIFT,
 ) -> dict:
     """D13 cross-only spatial predictor-lift score.
@@ -1928,55 +1938,80 @@ def spatial_predictor_lift_score(
     n_total = int(sum(n_rows_by_target.values()))
     rel_after_array = np.array(list(rel_after_by_target.values()), dtype=float)
     lift_mean = float(np.mean(list(lift_by_target.values()))) if lift_by_target else 0.0
+    # Permutation null over LIFT. Per-permutation cost is bounded by subsampling each
+    # target's eval rows to null_max_rows BEFORE the loop — rich/blanket targets carry
+    # 10^5 rows and an unbounded null costs ~4.3s/permutation (=> 7min at N=100). The
+    # REAL lift above used ALL rows; only the null subsamples. The subsampled baseline
+    # rel_before_n is recomputed once per target so each null draw (rel_before_n -
+    # rel_perm) is a clean same-rows comparison. bic_delta null is dropped (bic_delta
+    # is demoted telemetry; the gate is lift).
     null_deltas: list[float] = []
-    for permutation_idx in range(int(null_permutations)):
-        permuted_delta_by_target: list[float] = []
+    null_lifts: list[float] = []
+    if int(null_permutations) > 0 and target_payloads:
+        null_rng = np.random.default_rng(0)
+        null_targets: list[tuple] = []
         for payload in target_payloads:
-            X_perm_candidate = _fold_preserving_permute_features(
-                payload["X_candidate"],
-                payload["idx"],
-                labels,
-                permutation_idx,
+            idx_n = payload["idx"]
+            y_n = payload["y"]
+            xb_n = payload["X_before"]
+            xc_n = payload["X_candidate"]
+            if len(idx_n) > int(null_max_rows):
+                sel = np.sort(
+                    null_rng.choice(len(idx_n), size=int(null_max_rows), replace=False)
+                )
+                idx_n, y_n, xb_n, xc_n = idx_n[sel], y_n[sel], xb_n[sel], xc_n[sel]
+            rel_before_n, _, _ = _buffered_block_relative_mae(
+                idx_n, y_n, xb_n, labels, cv_buffer_vox, ridge_alpha, min_train_rows
             )
-            X_before = payload["X_before"]
-            X_perm_after = (
-                np.column_stack([X_before, X_perm_candidate])
-                if X_before.shape[1]
-                else X_perm_candidate
-            )
-            rel_perm, n_perm, folds_perm = _buffered_block_relative_mae(
-                payload["idx"],
-                payload["y"],
-                X_perm_after,
-                labels,
-                cv_buffer_vox,
-                ridge_alpha,
-                min_train_rows,
-            )
-            if n_perm < int(min_eval_rows) or folds_perm < 1:
-                continue
-            df_perm = ridge_effective_dof(X_perm_after, ridge_alpha)
-            bic_perm = _laplace_bic_single(rel_perm, n_perm, df_perm)
-            permuted_delta_by_target.append(
-                (bic_perm - payload["bic_before"]) / max(int(n_perm), 1)
-            )
-        if permuted_delta_by_target:
-            null_deltas.append(float(np.mean(permuted_delta_by_target)))
-    if null_deltas:
-        admission_threshold = min(float(np.percentile(null_deltas, float(null_percentile))), 0.0)
+            null_targets.append((idx_n, y_n, xb_n, xc_n, float(rel_before_n)))
+        for permutation_idx in range(int(null_permutations)):
+            permuted_lift_by_target: list[float] = []
+            for idx_n, y_n, xb_n, xc_n, rel_before_n in null_targets:
+                x_perm_candidate = _fold_preserving_permute_features(
+                    xc_n, idx_n, labels, permutation_idx
+                )
+                x_perm_after = (
+                    np.column_stack([xb_n, x_perm_candidate])
+                    if xb_n.shape[1]
+                    else x_perm_candidate
+                )
+                rel_perm, n_perm, folds_perm = _buffered_block_relative_mae(
+                    idx_n, y_n, x_perm_after, labels, cv_buffer_vox, ridge_alpha, min_train_rows
+                )
+                if n_perm < int(min_eval_rows) or folds_perm < 1:
+                    continue
+                permuted_lift_by_target.append(float(rel_before_n - rel_perm))
+            if permuted_lift_by_target:
+                null_lifts.append(float(np.mean(permuted_lift_by_target)))
+
+    # Permutation-null-calibrated lift bar (2026-06-06, Approach A = "lift gate +
+    # perm-null bar"): when the null is active, the bar is the (100 - null_percentile)th
+    # percentile of the null lift distribution, but it can only TIGHTEN the hand-set
+    # admit_min_lift, never drop below it. The absolute floor catches near-zero-lift
+    # no-ops/duplicates (whose own arrangement does beat a scramble, so the null alone
+    # would pass them); the null catches structured-but-spurious lift above the floor
+    # (value-distribution / autocorrelation artifacts). When the null is OFF
+    # (null_permutations == 0) or yielded no valid folds, the bar is exactly admit_min_lift.
+    null_calibrated = bool(null_lifts)
+    if null_calibrated:
+        null_lift_bar = float(np.percentile(null_lifts, 100.0 - float(null_percentile)))
+        effective_min_lift = max(null_lift_bar, float(admit_min_lift))
     else:
-        admission_threshold = 0.0
+        null_lift_bar = float("nan")
+        effective_min_lift = float(admit_min_lift)
+    admission_threshold = float(effective_min_lift)
 
     stage1_passed = bool(validity_passed and lift_mean > _SPATIAL_MIN_LIFT)
     # Calibrated 2026-06-05: admit on cross-layer predictor lift, NOT the
     # complexity-penalised bic_delta (which rejected rich, distributed crossbreed
-    # children that genuinely lifted prediction). bic_delta + admission_threshold
-    # remain in the result as telemetry. See predictor_lift_admission_decision.
+    # children that genuinely lifted prediction). 2026-06-06: the lift bar is the
+    # permutation null's upper percentile when active (above). bic_delta +
+    # admission_threshold remain telemetry. See predictor_lift_admission_decision.
     admitted = predictor_lift_admission_decision(
         validity_passed=validity_passed,
         lift_mean=lift_mean,
         bic_delta=bic_delta,
-        admit_min_lift=admit_min_lift,
+        admit_min_lift=effective_min_lift,
     )
     return {
         **base_result,
@@ -2011,9 +2046,12 @@ def spatial_predictor_lift_score(
         "masking_test_direction": "candidate_predictor_lift",
         "admitted": admitted,
         "admission_threshold": admission_threshold,
-        "admit_min_lift": float(admit_min_lift),
+        "admit_min_lift": float(effective_min_lift),
         "admission_policy": "predictor_lift_v1",
         "permutation_null_bic_deltas": null_deltas,
+        "permutation_null_lifts": null_lifts,
+        "null_calibrated": null_calibrated,
+        "null_lift_bar": null_lift_bar,
         "score_note": "scored",
     }
 

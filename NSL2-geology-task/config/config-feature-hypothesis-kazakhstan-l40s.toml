@@ -126,7 +126,7 @@ container_rebuild_interval = 10
 # slots pipeline NON-inference work (explore/code-exec/scoring) while waiting for an inference slot --
 # a modest gain, NOT extra decode throughput. NOT pushing past ~32: beyond it just deepens the endpoint
 # queue (no decode gain) and 32 is the tested RAM-stable ceiling. Applies on next restart; live run = 28.
-parallel_episodes = 64   # 32->64 (2026-06-05 STRESS test; leak resolved per orchestrator-memory-leak). Ramp THIS (cheap, restart-only) NOT max-num-seqs (baked) to find the throughput knee; watch host RAM (~0.25GB/slot effective -> ~16GB@64, 125GB host) + the H100 preemption/KV as concurrency climbs.
+parallel_episodes = 84   # 64->84 (2026-06-06 perm-null restart; measured KV ~63%@64 => ~84%@84, knee >64, preempt 0). Ramp THIS (cheap, restart-only) NOT max-num-seqs (baked, =128 ceiling). Watch host RAM (~0.25GB/slot -> ~21GB@84) + H100 preemption/KV; back off toward 64 if preempt>0.
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20

@@ -118,3 +118,74 @@ def test_two_pillars_fail_but_small_distributed_blob_passes_validity() -> None:
 
     blob = _blob(shape, (20, 20), radius=2)  # ~13 columns
     assert scoring.self_validity_score(blob.ravel(), shape) < scoring._SPATIAL_TAU_SELF
+
+
+# --- 2026-06-06: permutation-null-calibrated lift bar (Approach A) ----------------
+# When the null is active, the admission bar is the (100 - null_percentile)th
+# percentile of the LIFT a feature-scrambled candidate yields — a self-calibrating
+# per-pool replacement for the hand-set _SPATIAL_ADMIT_MIN_LIFT (0.005).
+
+
+def test_perm_null_emits_lift_distribution_and_nonneg_bar() -> None:
+    """With null_permutations>0 the scorer emits a null LIFT distribution and the
+    admission_threshold becomes that distribution's upper percentile (a NON-negative
+    lift bar), replacing the hand-set 0.005. Pre-change: no null_lifts, and
+    admission_threshold was the bic-percentile (<= 0)."""
+    shape = (40, 40, 3)
+    target = _blob(shape, (16, 20), radius=2)
+    candidate = _blob(shape, (24, 20), radius=2)
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel()], ["target"], candidate.ravel(), shape,
+        ridge_alpha=1e-2, null_permutations=40,
+    )
+    assert result["null_calibrated"] is True
+    assert isinstance(result["permutation_null_lifts"], list)
+    assert len(result["permutation_null_lifts"]) >= 1
+    # the null only TIGHTENS: effective bar >= the hand-set floor, never below it
+    assert result["admission_threshold"] >= scoring._SPATIAL_ADMIT_MIN_LIFT
+    # the effective bar the decision used IS the null-calibrated threshold
+    assert result["admit_min_lift"] == result["admission_threshold"]
+
+
+def test_perm_null_admits_strong_offset_candidate() -> None:
+    """A genuinely cross-predictive (offset, non-co-located) candidate beats the
+    null's upper tail and is still admitted with the null active."""
+    shape = (40, 40, 3)
+    target = _blob(shape, (16, 20), radius=2)
+    candidate = _blob(shape, (24, 20), radius=2)
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel()], ["target"], candidate.ravel(), shape,
+        ridge_alpha=1e-2, null_permutations=40,
+    )
+    assert result["validity_passed"] is True
+    assert result["candidate_predictor_lift_mean"] > result["admission_threshold"]
+    assert result["admitted"] is True
+
+
+def test_perm_null_rejects_clone_that_cannot_beat_its_own_null() -> None:
+    """A clone of an existing layer has ~zero real lift; its real lift cannot exceed
+    the upper tail of its own null distribution, so the null rejects it."""
+    shape = (40, 40, 3)
+    target = _blob(shape, (20, 20), radius=3)
+    clone = target.copy()
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel(), clone.ravel()], ["target", "clone"], clone.ravel(), shape,
+        ridge_alpha=1e-2, null_permutations=40,
+    )
+    assert result["admitted"] is False
+    assert result["candidate_predictor_lift_mean"] <= result["admission_threshold"]
+
+
+def test_perm_null_off_preserves_handset_bar() -> None:
+    """null_permutations=0 → fall back to the hand-set _SPATIAL_ADMIT_MIN_LIFT;
+    decision + telemetry unchanged from prior behaviour (regression guard)."""
+    shape = (40, 40, 3)
+    target = _blob(shape, (16, 20), radius=2)
+    candidate = _blob(shape, (24, 20), radius=2)
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel()], ["target"], candidate.ravel(), shape,
+        ridge_alpha=1e-2, null_permutations=0,
+    )
+    assert result["null_calibrated"] is False
+    assert result["admit_min_lift"] == scoring._SPATIAL_ADMIT_MIN_LIFT
+    assert result["admitted"] is True
