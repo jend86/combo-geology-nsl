@@ -350,7 +350,7 @@ TOOLS = [
                 "code": {"type": "string", "description": "Python code to execute"},
                 "timeout_s": {"type": "integer", "default": 300, "description": "Execution timeout in seconds"},
                 "session_id": {"type": "string", "description": "Optional session ID for budget tracking"},
-                "max_attempts": {"type": "integer", "default": 3, "description": "Maximum execution attempts for this session"},
+                "max_attempts": {"type": "integer", "default": 10, "description": "Maximum execution attempts for this session"},
             },
             "required": ["code"],
         },

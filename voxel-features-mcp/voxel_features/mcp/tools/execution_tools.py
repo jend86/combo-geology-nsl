@@ -55,7 +55,11 @@ class ExecutionStatus(Enum):
 class ExecutionSession:
     """Tracks execution attempts and budget for an agent session."""
     session_id: str
-    max_attempts: int = 3
+    # 3 -> 10 (2026-06-05): the 3-attempt cap turned recoverable codegen errors
+    # (wrong polars column, a dropped newline) into terminal empty-layer episodes.
+    # The budget is cosmetic -- a normal agent won't hit it; 10 gives the natural
+    # write->error->fix loop room. Still bounded by max_iterations / wall-timeout.
+    max_attempts: int = 10
     attempts_used: int = 0
     
     def can_submit(self) -> bool:
@@ -139,7 +143,7 @@ def _tar_container_path(container: Any, container_path: str, timeout_s: int = 30
     return raw
 
 
-def _get_or_create_session(session_id: str | None = None, max_attempts: int = 3) -> ExecutionSession:
+def _get_or_create_session(session_id: str | None = None, max_attempts: int = 10) -> ExecutionSession:
     """Get or create execution session."""
     with _session_lock:
         if session_id is None:
@@ -465,7 +469,7 @@ def execution_submit(
     code: str,
     timeout_s: int = 300,
     session_id: str | None = None,
-    max_attempts: int = 3,
+    max_attempts: int = 10,  # 3 -> 10 (2026-06-05): stamp out the cosmetic retry cap
     container: Any | None = None,
     artifact_root: str | None = None,
 ) -> dict[str, Any]:
