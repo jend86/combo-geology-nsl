@@ -80,9 +80,23 @@ _SPATIAL_MIN_TRAIN_ROWS = 5
 _SPATIAL_MAX_PREDICTOR_LAYERS = 6
 _SPATIAL_NULL_PERMUTATIONS = 0
 _SPATIAL_NULL_PERCENTILE = 5.0
-_SPATIAL_SEED_POOL_TARGET = 3
+# 3 -> 6 (2026-06-05): the seed bypass admits validity-passing layers WITHOUT
+# predictor-lift, building the diverse founder pool the survey phase needs. At 3 it
+# stalled: layers 4+ hit full predictor-lift, which can't admit spatially-distinct
+# binary layers (cross-prediction == near-dup), so the KG froze at ~4 and never
+# reached min_features=6 / crossbreed. 6 = min_features, so the survey blankets the
+# basin with up to 6 valid diverse founders, then predictor-lift governs at L>=6.
+_SPATIAL_SEED_POOL_TARGET = 6
 _SPATIAL_REJECTION_BIC_DELTA = 1_000_000.0
 _SPATIAL_MIN_LIFT = 1e-6
+# Calibration 2026-06-05: a candidate occupying fewer than this many distinct (x,y)
+# columns has no HORIZONTAL spatial structure to validate — any self-prediction skill
+# comes entirely from its own vertical stack (a borehole-like pillar; Rv leak), which
+# is a geologically trivial "obvious failure". Reject it at the validity gate.
+# (Chosen over a horizontal-only-feature rewrite: smaller, interpretable, keeps the
+# vertical kernel for real layers. The live empties/single-pillars in the rejected
+# corpus all sit at <=2 columns; all 19 real admitted layers are >=3.)
+_SPATIAL_MIN_SUPPORT_COLUMNS = 3
 
 
 def _effective_sample_count(total_non_zero: int, n_layers: int) -> int:
@@ -1563,6 +1577,12 @@ def self_validity_score(
     min_eval_rows: int = _SPATIAL_MIN_EVAL_ROWS,
 ) -> float:
     field = _as_spatial_field(candidate_values, shape)
+    # Minimum horizontal support: reject borehole-like pillars / near-points whose
+    # only internal coherence is the vertical stack of <_SPATIAL_MIN_SUPPORT_COLUMNS
+    # distinct (x,y) columns (see constant). relative_mae=1.0 == "no validity".
+    support_columns = int(np.count_nonzero(np.any(field != 0, axis=2)))
+    if support_columns < _SPATIAL_MIN_SUPPORT_COLUMNS:
+        return 1.0
     scales = _spatial_scales_for_shape(shape, self_scales_vox, self_scales=True)
     bbox = _spatial_union_bbox([field], pad=int(2 * max(scales)))
     idx = _spatial_eval_indices(field, bbox, matched_zero_ratio)

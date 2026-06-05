@@ -77,3 +77,44 @@ def test_blanket_candidate_fails_self_validity_gate() -> None:
     assert result["masking_test_passed"] is False
     assert result["admitted"] is False
     assert result["masking_test_direction"] == "self_validity_gate"
+
+
+def test_single_column_pillar_fails_self_validity_gate() -> None:
+    """A candidate whose signal lives in a single (x,y) column self-predicts
+    near-perfectly through its own vertical stack (Rv leak), so it would pass the
+    self-validity gate despite having NO horizontal spatial structure — a
+    geologically trivial borehole-like pillar. Calibration 2026-06-05 adds a
+    minimum horizontal-support gate; assert it is rejected as invalid.
+    """
+    shape = (40, 40, 8)
+    target = _blob(shape, (20, 20), radius=3)
+    pillar = np.zeros(shape, dtype=np.float32)
+    pillar[10, 10, :] = 1.0  # exactly one (x,y) column, all depths
+
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel()],
+        ["target"],
+        pillar.ravel(),
+        shape,
+        ridge_alpha=1e-2,
+        null_permutations=0,
+    )
+
+    assert result["validity_passed"] is False
+    assert result["admitted"] is False
+    assert result["masking_test_direction"] == "self_validity_gate"
+
+
+def test_two_pillars_fail_but_small_distributed_blob_passes_validity() -> None:
+    """Boundary check on the min-support gate: two isolated columns (2 columns)
+    are still rejected, but a compact 5-voxel-wide blob (well above the floor)
+    remains a valid candidate.
+    """
+    shape = (40, 40, 8)
+    two_pillars = np.zeros(shape, dtype=np.float32)
+    two_pillars[8, 8, :] = 1.0
+    two_pillars[30, 30, :] = 1.0
+    assert scoring.self_validity_score(two_pillars.ravel(), shape) >= 1.0
+
+    blob = _blob(shape, (20, 20), radius=2)  # ~13 columns
+    assert scoring.self_validity_score(blob.ravel(), shape) < scoring._SPATIAL_TAU_SELF

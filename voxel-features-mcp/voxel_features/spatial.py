@@ -191,11 +191,19 @@ class SpatialVoxelStore(VoxelStore):
         radius_y = int(lat_deg / (grid.maximum[1] - grid.origin[1]) * grid.shape[1]) + 1
         radius_z = int(depth_units / (grid.maximum[2] - grid.origin[2]) * grid.shape[2]) + 1
         
-        affected_voxels = []
-        
+        # A point ALWAYS occupies its containing voxel, even when radius_m is below
+        # the voxel half-width. On the coarse Teniz grid (~1.7 km voxels) a 100 m
+        # point sits far from every voxel CENTER, so the center-distance test below
+        # would otherwise return ZERO voxels and the record would be silently dropped
+        # as "outside grid bounds" (2026-06-05: ~98-100% of in-bounds records lost
+        # this way). Seeding the center voxel makes sub-voxel points/lines rasterize.
+        affected_voxels = [(center_x, center_y, center_z)]
+
         for x in range(max(0, center_x - radius_x), min(grid.shape[0], center_x + radius_x + 1)):
             for y in range(max(0, center_y - radius_y), min(grid.shape[1], center_y + radius_y + 1)):
                 for z in range(max(0, center_z - radius_z), min(grid.shape[2], center_z + radius_z + 1)):
+                    if (x, y, z) == (center_x, center_y, center_z):
+                        continue  # already claimed above
                     # Check if voxel center is within sphere
                     voxel_lon, voxel_lat, voxel_depth = self.voxel_indices_to_coord(x, y, z)
                     
@@ -596,6 +604,34 @@ class SpatialVoxelStore(VoxelStore):
                 "operation": "box_feature",
             }
 
+    # Coordinate column-name aliases agents emit instead of the canonical
+    # longitude/latitude/depth_m. DataFrames from geopandas expose geometry.x/.y,
+    # short forms (lon/lat) and capitalized headers (Longitude) are common; a hard
+    # record["longitude"] raised KeyError('longitude') and skipped EVERY such
+    # record -> empty layer (the dominant 2026-06-05 empty-layer cause:
+    # 'Skipped record N: longitude'). Resolve aliases case-insensitively instead.
+    # x/y are degrees here (grid CRS is EPSG:4326); a projected x/y in metres would
+    # fall outside grid bounds and skip on the bounds check, same as before.
+    _COORD_REQUIRED = object()
+    _LON_ALIASES = ("longitude", "lon", "long", "lng", "x")
+    _LAT_ALIASES = ("latitude", "lat", "y")
+    _DEPTH_ALIASES = ("depth_m", "depth", "depth_meters", "z")
+
+    @staticmethod
+    def _coord_value(
+        record: dict[str, Any],
+        aliases: tuple[str, ...],
+        default: Any = _COORD_REQUIRED,
+    ) -> Any:
+        lowered = {str(k).lower(): v for k, v in record.items()}
+        for alias in aliases:
+            val = lowered.get(alias)
+            if val is not None:
+                return val
+        if default is not SpatialVoxelStore._COORD_REQUIRED:
+            return default
+        raise KeyError(aliases[0])
+
     def _record_region(
         self,
         record: dict[str, Any],
@@ -603,9 +639,11 @@ class SpatialVoxelStore(VoxelStore):
         bounds_policy: Literal["skip", "clip", "fail"],
     ):
         if kind == "point":
-            lon = float(record["longitude"])
-            lat = float(record["latitude"])
-            depth = float(record["depth_m"])
+            lon = float(self._coord_value(record, self._LON_ALIASES))
+            lat = float(self._coord_value(record, self._LAT_ALIASES))
+            # depth is the most-omitted axis; default to surface (0 m) rather than
+            # dropping the record on a shallow 80 m grid.
+            depth = float(self._coord_value(record, self._DEPTH_ALIASES, default=0.0))
             if not self._coord_in_bounds(lon, lat, depth):
                 if bounds_policy == "fail":
                     self.coord_to_voxel_indices(lon, lat, depth)
@@ -664,7 +702,10 @@ class SpatialVoxelStore(VoxelStore):
         value: float,
     ) -> tuple[str, str]:
         if kind == "point":
-            coords = f"{record.get('longitude')},{record.get('latitude')},{record.get('depth_m')}"
+            lon = self._coord_value(record, self._LON_ALIASES, default=None)
+            lat = self._coord_value(record, self._LAT_ALIASES, default=None)
+            depth = self._coord_value(record, self._DEPTH_ALIASES, default=0.0)
+            coords = f"{lon},{lat},{depth}"
             params = f"radius_m={record.get('radius_m', 100.0)},value={value}"
             return coords, params
         if kind == "line":
@@ -752,8 +793,14 @@ class SpatialVoxelStore(VoxelStore):
                             )
                         rule = str(rec.get("combination_rule") or combination_rule)
                         region = self._record_region(rec, kind, bounds_policy)
-                        if region is None or self._region_affected_voxels(region) == 0:
+                        if region is None:
                             warnings.append(f"Skipped record {record_id}: outside grid bounds")
+                            continue
+                        if self._region_affected_voxels(region) == 0:
+                            warnings.append(
+                                f"Skipped record {record_id}: geometry too small to "
+                                "intersect any voxel (grid voxel ~1.7 km; raise radius_m/width_m)"
+                            )
                             continue
                         affected = self._apply_region_into(layer_values, region, value, rule)
                         if affected == 0:

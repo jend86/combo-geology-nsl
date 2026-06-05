@@ -18,6 +18,82 @@ def _store(tmp_path) -> SpatialVoxelStore:
     return SpatialVoxelStore(tmp_path / "store", GRID)
 
 
+# Coarse Teniz-scale grid: voxel ~= 1.75 km x 1.67 km x 10 m, so a point's own
+# voxel center can be ~875 m from the point. Agents default radius_m=100 m.
+TENIZ_GRID = GridSpec(
+    origin=(66.5, 49.5, 0.0),
+    maximum=(71.5, 52.5, 80.0),
+    shape=(200, 200, 8),
+    crs="EPSG:4326",
+)
+
+
+def test_point_subvoxel_radius_claims_its_containing_voxel(tmp_path):
+    """On a coarse grid a valid in-bounds point with radius_m below the voxel
+    half-width must still claim at least its containing voxel. Previously
+    get_voxels_in_sphere only kept voxels whose CENTER was within radius_m, so
+    a 100 m point selected ZERO voxels and was silently dropped as 'outside grid
+    bounds' (live 2026-06-05: ~98-100% of records skipped this way)."""
+    store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
+    center = store.coord_to_voxel_indices(68.046, 51.997, 0.0)
+    voxels = store.get_voxels_in_sphere(68.046, 51.997, 0.0, 100.0)
+    assert len(voxels) >= 1
+    assert center in voxels
+
+
+def test_batch_points_small_radius_build_nonempty_layer(tmp_path):
+    """End-to-end: in-bounds points with the default radius_m=100 must materialize
+    a non-empty distributed layer, not 0 affected_voxels."""
+    store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
+    records = [
+        {
+            "record_id": str(i),
+            "geometry_kind": "point",
+            "longitude": 67.0 + 0.3 * i,
+            "latitude": 50.0 + 0.2 * i,
+            "depth_m": 0.0,
+            "radius_m": 100.0,
+            "value": 1.0,
+            "coordinate_source": "artifact",
+        }
+        for i in range(6)
+    ]
+    result = store.add_geometry_batch("pts", records)
+    assert result["success"] is True
+    assert result["records_applied"] == 6
+    assert result["affected_voxels"] >= 6
+
+
+def test_batch_points_accept_coordinate_column_aliases(tmp_path):
+    """Agents frequently emit coordinate columns named lon/lat, x/y (geopandas
+    geometry.x/.y), or capitalized Longitude/Latitude rather than the canonical
+    longitude/latitude/depth_m. Previously _record_region did a hard
+    record["longitude"] -> KeyError('longitude') -> EVERY such record skipped ->
+    empty layer. Live 2026-06-05 this 'Skipped record N: longitude' pattern was
+    the dominant empty-layer cause (no_feature=true in ~51% of episodes). The
+    batch must resolve common aliases so valid coordinates are not dropped."""
+    store = SpatialVoxelStore(tmp_path / "store", TENIZ_GRID)
+    records = [
+        # short lon/lat/depth
+        {"record_id": "a", "geometry_kind": "point", "lon": 67.0, "lat": 50.0,
+         "depth": 0.0, "radius_m": 100.0, "value": 1.0, "coordinate_source": "artifact"},
+        # geopandas-style x/y, depth omitted entirely -> defaults to surface
+        {"record_id": "b", "geometry_kind": "point", "x": 68.0, "y": 51.0,
+         "radius_m": 100.0, "value": 1.0, "coordinate_source": "artifact"},
+        # capitalized headers
+        {"record_id": "c", "geometry_kind": "point", "Longitude": 69.0, "Latitude": 51.5,
+         "depth_m": 10.0, "radius_m": 100.0, "value": 1.0, "coordinate_source": "artifact"},
+    ]
+    result = store.add_geometry_batch("aliased", records)
+    assert result["success"] is True
+    assert result["records_applied"] == 3
+    assert result["records_skipped"] == 0
+    assert result["affected_voxels"] >= 3
+    # provenance coords are resolved (not None) for the aliased columns
+    ops = [op for op in store.get_spatial_operations() if op["feature_name"] == "aliased"]
+    assert all("None" not in (op.get("coordinates") or "") for op in ops)
+
+
 def test_box_fills_clipped_slice(tmp_path):
     store = _store(tmp_path)
 
