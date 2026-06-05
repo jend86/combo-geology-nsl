@@ -89,6 +89,40 @@ _SPATIAL_NULL_PERCENTILE = 5.0
 _SPATIAL_SEED_POOL_TARGET = 6
 _SPATIAL_REJECTION_BIC_DELTA = 1_000_000.0
 _SPATIAL_MIN_LIFT = 1e-6
+# Calibrated ADMISSION bar on mean cross-layer predictor lift (2026-06-05). The
+# uncalibrated `bic_delta < 0` gate inverted the ranking: tiny low-DOF self-
+# predictive blobs admitted while richer high-DOF crossbreed children with
+# genuine cross-layer lift were rejected -> KG frozen at 7, 25 consecutive
+# crossbreed failures. _SPATIAL_MIN_LIFT (1e-6) stays the telemetry "any positive
+# lift" floor; admission now requires a MEANINGFUL lift (live: trivial blobs
+# ~0.0026 vs distributed children ~0.011-0.020). Tunable; validated offline on
+# scratch/scoring_validation. See predictor_lift_admission_decision.
+_SPATIAL_ADMIT_MIN_LIFT = 0.005
+
+
+def predictor_lift_admission_decision(
+    *,
+    validity_passed: bool,
+    lift_mean: float,
+    bic_delta: float,
+    admit_min_lift: float = _SPATIAL_ADMIT_MIN_LIFT,
+) -> bool:
+    """Calibrated admission policy for ``spatial_predictor_lift_v1``.
+
+    Gates on the CROSS-LAYER predictor lift (validity + a meaningful lift bar),
+    NOT the per-sample ``bic_delta``. ``bic_delta`` penalises a candidate's
+    effective DOF, which perversely rejected rich, distributed (high-DOF)
+    crossbreed children that genuinely improved cross-layer prediction while
+    admitting tiny low-DOF self-predictive blobs. ``bic_delta`` is retained for
+    telemetry (and as a future veto hook) but does NOT gate admission here;
+    ``validity_passed`` (self coherence) plus held-out buffered-CV lift guard
+    against blanket layers. The ``bic_delta`` argument is intentionally accepted
+    and unused so callers/telemetry keep a stable signature.
+    """
+    _ = bic_delta  # telemetry / future veto hook; deliberately not a gate
+    if not validity_passed:
+        return False
+    return float(lift_mean) > float(admit_min_lift)
 # Calibration 2026-06-05: a candidate occupying fewer than this many distinct (x,y)
 # columns has no HORIZONTAL spatial structure to validate — any self-prediction skill
 # comes entirely from its own vertical stack (a borehole-like pillar; Rv leak), which
@@ -1631,6 +1665,7 @@ def spatial_predictor_lift_score(
     max_predictor_layers: int | None = _SPATIAL_MAX_PREDICTOR_LAYERS,
     null_permutations: int = _SPATIAL_NULL_PERMUTATIONS,
     null_percentile: float = _SPATIAL_NULL_PERCENTILE,
+    admit_min_lift: float = _SPATIAL_ADMIT_MIN_LIFT,
 ) -> dict:
     """D13 cross-only spatial predictor-lift score.
 
@@ -1933,7 +1968,16 @@ def spatial_predictor_lift_score(
         admission_threshold = 0.0
 
     stage1_passed = bool(validity_passed and lift_mean > _SPATIAL_MIN_LIFT)
-    admitted = bool(stage1_passed and bic_delta < admission_threshold - 1e-9)
+    # Calibrated 2026-06-05: admit on cross-layer predictor lift, NOT the
+    # complexity-penalised bic_delta (which rejected rich, distributed crossbreed
+    # children that genuinely lifted prediction). bic_delta + admission_threshold
+    # remain in the result as telemetry. See predictor_lift_admission_decision.
+    admitted = predictor_lift_admission_decision(
+        validity_passed=validity_passed,
+        lift_mean=lift_mean,
+        bic_delta=bic_delta,
+        admit_min_lift=admit_min_lift,
+    )
     return {
         **base_result,
         "bic_before": bic_before,
@@ -1967,6 +2011,8 @@ def spatial_predictor_lift_score(
         "masking_test_direction": "candidate_predictor_lift",
         "admitted": admitted,
         "admission_threshold": admission_threshold,
+        "admit_min_lift": float(admit_min_lift),
+        "admission_policy": "predictor_lift_v1",
         "permutation_null_bic_deltas": null_deltas,
         "score_note": "scored",
     }

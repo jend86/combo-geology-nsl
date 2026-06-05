@@ -3,8 +3,9 @@
 # (unlike the Ampere A40, see runpod-a40-fp8-kv-ampere); the provision script
 # defaults --kv-cache-dtype fp8 + --max-num-seqs 32 for capacity 28.
 #
-# Slot split (user-directed 2026-06-03): 4 local + 28 L40S = 32 parallel_episodes.
-# NOTE: 32 concurrent episodes is ABOVE the ~26-stable / 30-livelock ceiling found
+# Slot split (user-directed 2026-06-05): 0 local + 18 L40S = 18 parallel_episodes (EXTERNAL-ONLY).
+# The local-4090 endpoint was REMOVED for this run (user: "0 local slots + ~18 external on an L40S").
+# NOTE: 18 concurrent episodes is well under the ~26-stable / 30-livelock ceiling found
 # for this 125 GB host (orchestrator holds ~3.5 GB in-flight per concurrent episode,
 # regardless of where inference runs — see orchestrator-memory-leak). Run under the
 # RAM-floor supervisor (scripts/run_supervised_resume.sh) as the safety net and watch
@@ -53,15 +54,12 @@ timeout = 600
 # floor set too high vs capacity caused a spurious abort before (endpoint-timeout-not-outage).
 min_healthy_endpoint_capacity = 4
 
-[[vllm.endpoints]]
-id       = "local-4090"
-base_url = "http://127.0.0.1:8000"
-capacity = 4                          # existing nsl-vllm-8000 box; no api_key (runs without --api-key)
+# local-4090 endpoint REMOVED 2026-06-05 for external-only run (0 local slots).
 
 [[vllm.endpoints]]
-id          = "runpod-l40s-1"
-base_url    = "http://202.181.159.228:11996"   # L40S pod lz1o6n9e6xerhx (v0.20.2, fp8 KV)
-capacity    = 22                      # 22 (was 28) 2026-06-04: /metrics showed 28 running => KV 87% + 20 preemptions => decode 0.2-1.6 tok/s => timeouts. 22 => KV ~68%, ~0 preempt. Tune from /metrics preemptions.
+id          = "runpod-h100-nvl-stress"
+base_url    = "http://38.143.35.131:19610"  # H100 NVL pod v9wvkamxkvoqq0 (2026-06-05 STRESS re-provision; community, 94GB, fp8 KV, --max-num-seqs 128)
+capacity    = 96                      # 28->96 (2026-06-05 stress): new pod BAKED at --max-num-seqs 128 (a CEILING; KV pool ~834k tok = num_gpu_blocks 52128*16, sized by gpu_mem_util 0.92 NOT max-num-seqs -> 128 costs no VRAM unless active; ~22% used @24 streams). parallel_episodes=64 drives ~64 concurrent (~60% KV). Ramp slots via restart (cheap) to find the throughput knee; max-num-seqs is baked -> needs a re-provision to change. Monitor preemptions(was 0)/KV%/RAM/timeout-rate.
 api_key_env = "RUNPOD_VLLM_KEY"       # pod injects VLLM_API_KEY; bearer the pool sends
 
 [task]
@@ -73,10 +71,13 @@ dataset_dir = "../Kazkhstan_data"
 store_dir = "./data/kazakhstan/feature-hypothesis/store"
 kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
 variation_names = ["teniz_basin"]
-# Hold survey until >=9 layers are banked before crossbreed/greedy-init. The
-# survey->crossbreed flip was otherwise gated on source coverage alone
-# (min_features=0), flipping at ~4 layers with a greedy init computed on 3.
-min_features = 9
+# Hold survey until >=6 layers are banked before crossbreed/greedy-init.
+# 9 -> 6 (2026-06-05): under the new predictor-lift scorer (no blanket survey bypass;
+# real bic_delta<0 needed to admit), reaching 9 is slow, and the user wants crossbreed
+# admissions THIS run. 6 = ~3 diverse seeds (validity-only, not parent-eligible) + ~3
+# predictor-lift admits (bic_delta<0, parent-eligible) -> a >=3-parent crossbreed pool,
+# while still above the ~4-layer greedy-init-too-thin floor that motivated raising it.
+min_features = 6
 
 [harness]
 name = "container"
@@ -91,6 +92,11 @@ inference_transport = "tcp"
 # Tool-output truncation cap (chars); full output stays available via artifact paths.
 tool_output_max_chars = 2500
 context_compaction_enabled = true
+# 52k/45k (2026-06-05, REVERTED from 36k/28k): aggressive compaction risks run quality + can
+# stall runs (user guidance) -- summarising mid-episode drops context the agent needs. Reverted
+# to the safe H100-tuned baseline: it rarely fires (only the longest episodes hit 52k). The
+# context-size lever is now the TOOL-CALL BUDGET (250->150 in the task: fewer calls -> shorter,
+# tighter episodes -> smaller contexts) plus the slot cut (14->8), NOT compaction.
 context_compaction_trigger_tokens = 52000
 context_compaction_target_tokens = 45000
 context_compaction_keep_recent_tool_outputs = 3
@@ -113,11 +119,14 @@ variation_strategy = "round_robin"
 generation_timeout_s = 172800  # 48 hrs
 max_consecutive_verification_failures = 2
 container_rebuild_interval = 10
-# 4 local + 22 L40S = 26 slots (was 32). Dropped 2026-06-04: 32 over-subscribed the single L40S
-# (28 concurrent 31B-AWQ => decode starvation => 39% inference_timeout deaths @ 0% success). 26
-# matches the config's own "toward 26 on preemption" guidance + the supervisor's RAM profile.
-# RAM is NOT binding at this episode count (ep ~68, avail ~97G); the leak only bites in the hundreds.
-parallel_episodes = 26
+# 0 local + 32 H100-NVL slots (set 2026-06-05 for the NEXT restart, user-directed). RAM is NOT the
+# constraint: the leak is resolved (orchestrator-memory-leak 2026-06-03, <=32 stable) and 28 ran FLAT at
+# ~16GB used / 0 swap over 25 min -- large headroom. The real throughput ceiling is the H100's vLLM
+# max-num-seqs=24 (decode-bound), so capacity stays 28 (its efficient serving level) and the extra ~4-8
+# slots pipeline NON-inference work (explore/code-exec/scoring) while waiting for an inference slot --
+# a modest gain, NOT extra decode throughput. NOT pushing past ~32: beyond it just deepens the endpoint
+# queue (no decode gain) and 32 is the tested RAM-stable ceiling. Applies on next restart; live run = 28.
+parallel_episodes = 64   # 32->64 (2026-06-05 STRESS test; leak resolved per orchestrator-memory-leak). Ramp THIS (cheap, restart-only) NOT max-num-seqs (baked) to find the throughput knee; watch host RAM (~0.25GB/slot effective -> ~16GB@64, 125GB host) + the H100 preemption/KV as concurrency climbs.
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20

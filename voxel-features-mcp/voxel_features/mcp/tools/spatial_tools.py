@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+import numpy as np
+
 from voxel_features.spatial import SpatialVoxelStore
 
 
@@ -238,6 +240,53 @@ def spatial_upsert_geometry_batch(
             "success": False,
             "error": str(e),
             "operation": "spatial_upsert_geometry_batch",
+        }
+
+
+def spatial_set_layer_array(
+    store: SpatialVoxelStore,
+    name: str,
+    values: np.ndarray,
+    dtype: Literal["float", "categorical", "boolean"] = "float",
+    metadata: dict[str, Any] | None = None,
+    hypothesis_uri: str | None = None,
+    experiment_id: str | None = None,
+) -> dict[str, Any]:
+    """Deposit a FULL precomputed per-voxel value array as one layer.
+
+    Unlike the geometry tools (which flat-fill ONE scalar across each shape's
+    voxels), this writes an arbitrary CONTINUOUS field — the array the code phase
+    computed (kernel density, IDW/interpolation, distance-to-contact, a redox/
+    grade gradient, prospectivity 0..1). Values are preserved verbatim (no
+    binarization). Shape must match the grid; an existing scratch layer of the
+    same name is replaced (RMW-safe).
+    """
+    try:
+        arr = np.asarray(values)
+        store.set_layer_array(
+            name=name,
+            values=arr,
+            dtype=dtype,
+            metadata=metadata,
+            hypothesis_uri=hypothesis_uri,
+            experiment_id=experiment_id,
+        )
+        nz = arr[arr != 0]
+        return {
+            "success": True,
+            "operation": "set_layer_array",
+            "layer_name": name,
+            "shape": list(arr.shape),
+            "nonzero_voxels": int(nz.size),
+            "value_min": float(arr.min()) if arr.size else 0.0,
+            "value_max": float(arr.max()) if arr.size else 0.0,
+            "distinct_nonzero_values": int(np.unique(nz).size) if nz.size else 0,
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "operation": "spatial_set_layer_array",
         }
 
 

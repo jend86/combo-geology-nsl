@@ -2072,6 +2072,15 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "     a DataFrame named EXACTLY `feature_points` with longitude, latitude, depth_m, value,\n"
                         "     coordinate_source is still accepted. Emit ONE ROW PER LOCATION/VOLUME the feature\n"
                         "     occupies, NOT a single representative point. This is a data table, not voxel creation.\n"
+                        "   - VALUES MATTER: populate the `value` column with the QUANTITY your analysis produced\n"
+                        "     (grade, concentration, probability 0..1, a distance/redox score) -- NOT a constant 1.0.\n"
+                        "     A constant value discards your analysis and yields a flat presence mask.\n"
+                        "   - CONTINUOUS-FIELD DELIVERABLE (preferred for gradients / smooth structure): build a 3-D\n"
+                        "     numpy array named EXACTLY `value_grid` of shape (200, 200, 8) -- your interpolated /\n"
+                        "     kernel-density / distance-to-contact / prospectivity field over the basin (axes: lon\n"
+                        "     index, lat index, depth index). It is auto-saved; the Translate phase deposits it\n"
+                        "     verbatim as a CONTINUOUS layer. Use this to express a real distribution, not presence\n"
+                        "     points.\n"
                         "3. Submit code for async execution:\n"
                         "   execution_submit(code='your_code_here', timeout_s=300)\n\n"
                         "4. Monitor execution progress:\n"
@@ -2089,7 +2098,8 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "**REQUIREMENTS**:\n"
                         "- Available libraries: pandas, numpy, scipy\n"
                         "- Use try/except blocks for robust file handling\n"
-                        "- DO NOT attempt 3D interpolation or voxel creation\n"
+                        "- You MAY compute a full 3-D `value_grid` array (interpolation / kernel density / distance);\n"
+                        "  do NOT call the spatial/voxel tools here -- materialization is the Translate phase\n"
                         "- MUST produce at least one artifact file to proceed\n\n"
                         "**SUCCESS CRITERIA**: At least one artifact file created + execution_results shows success"
                     ),
@@ -2121,6 +2131,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "    and materializes every row under ONE shared layer name. Do NOT collapse rows into a\n"
                         "    single point. Use the steps below only for locations the artifact does not cover, or if\n"
                         "    it is empty.\n"
+                        "1c. CONTINUOUS-FIELD PATH -- if your code produced a `value_grid` array (a full 3-D field:\n"
+                        "    interpolation, kernel density, distance-to-contact, prospectivity), deposit it VERBATIM:\n"
+                        "    call spatial_set_layer_array(name='shared_layer_name', array_artifact='value_grid') once,\n"
+                        "    then go to scoring (step 5). This preserves continuous values (point/line/box only stamp\n"
+                        "    a flat scalar). Prefer this when your feature is a gradient or smooth distribution.\n"
                         "2. Generate spatial commands based on analysis findings:\n"
                         "   Grid bounds: lon 66.5°-71.5°E, lat 49.5°-52.5°N, depth 0-80m\n"
                         "   Resolution: ~1.75km × 1.75km × 10m per voxel (200×200×8 total)\n\n"
@@ -2131,6 +2146,9 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
 
                         "   **For areal/volumetric extents with depth control:**\n"
                         "   spatial_add_box(name='string', min_longitude=float, min_latitude=float, min_depth_m=float, max_longitude=float, max_latitude=float, max_depth_m=float, value=float)\n\n"
+
+                        "   **For a full precomputed continuous field (gradient / interpolation / kernel density):**\n"
+                        "   spatial_set_layer_array(name='string', array_artifact='value_grid')  # deposits your (200,200,8) array verbatim\n\n"
                         "   **For text-based locations without coordinates:**\n"
                         "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
                         "   2. Use search tools as needed (no fixed call budget):\n"
@@ -2149,11 +2167,11 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "4. Validate coordinates using spatial_coord_to_voxel() to check grid bounds\n\n"
                         "5. **MANDATORY TO COMPLETE THIS PHASE**:\n"
                         "   🚨 When you are done YOU MUST CALL scoring_create_feature_layer(name='your_layer_name') 🚨\n"
-                        "   Example workflow:\n"
-                        "   1. spatial_add_point(name='name', ...)\n"
-                        "   2. spatial_add_line(name='name', ...)\n"
-                        "   3. spatial_upsert_geometry_batch(name='name', artifact_name='auto')\n"
-                        "   4. scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
+                        "   Example workflows (pick the one matching your artifact):\n"
+                        "   A. continuous field:  spatial_set_layer_array(name='name', array_artifact='value_grid')\n"
+                        "                          → scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
+                        "   B. geometry records:   spatial_upsert_geometry_batch(name='name', artifact_name='auto')\n"
+                        "                          → scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
                         "Focus on regional geological intelligence for Kazakhstan basin analysis!"
                     ),
@@ -2162,6 +2180,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                     capabilities=(
                         "get_experiment_summary",
                         "spatial_upsert_geometry_batch",
+                        "spatial_set_layer_array",
                         "spatial_add_point",
                         "spatial_add_line",
                         "spatial_add_box",
@@ -2485,6 +2504,41 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                 },
             ),
             Capability(
+                name="spatial_set_layer_array",
+                description=(
+                    "Deposit a FULL precomputed per-voxel value array (the grid your code phase "
+                    "computed) as one layer -- the way to encode a CONTINUOUS field or complex 3-D "
+                    "geometry that point/line/box flat-fills cannot express: kernel/IDW "
+                    "interpolation, distance-to-contact, a redox or grade gradient, prospectivity "
+                    "(0..1). Values are preserved verbatim (NO binarization). The array must match "
+                    "the grid shape (200x200x8). Set array_artifact to the name of the top-level "
+                    "numpy array your code left (auto-saved as <name>_array.npy); 'auto' picks the "
+                    "grid-shaped array."
+                ),
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Feature layer name"},
+                        "array_artifact": {
+                            "type": "string",
+                            "default": "auto",
+                            "description": (
+                                "Name of the code-phase top-level ndarray variable (e.g. "
+                                "'value_grid'); 'auto' = the grid-shaped array."
+                            ),
+                        },
+                        "dtype": {
+                            "type": "string",
+                            "enum": ["float", "categorical", "boolean"],
+                            "default": "float",
+                            "description": "Value semantics; the array's values are preserved as-is.",
+                        },
+                        "metadata": {"type": "object"},
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Capability(
                 name="spatial_add_point",
                 description="Add a point feature at geographic coordinates with radius of effect.",
                 schema={
@@ -2494,7 +2548,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "longitude": {"type": "number", "description": "Longitude in degrees"},
                         "latitude": {"type": "number", "description": "Latitude in degrees"},
                         "depth_m": {"type": "number", "description": "Depth in meters"},
-                        "value": {"type": "number", "description": "Feature value"},
+                        "value": {"type": "number", "description": "Per-voxel value: a CONTINUOUS measurement (grade, probability 0..1, distance/redox score); use 1.0 only for pure presence"},
                         "radius_m": {"type": "number", "description": "Radius of effect in meters"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
@@ -2517,7 +2571,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "end_longitude": {"type": "number", "description": "End longitude in degrees"},
                         "end_latitude": {"type": "number", "description": "End latitude in degrees"},
                         "end_depth_m": {"type": "number", "description": "End depth in meters"},
-                        "value": {"type": "number", "description": "Feature value"},
+                        "value": {"type": "number", "description": "Per-voxel value: a CONTINUOUS measurement (grade, probability 0..1, distance/redox score); use 1.0 only for pure presence"},
                         "width_m": {"type": "number", "description": "Width of line in meters"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
@@ -2541,7 +2595,7 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
                         "max_longitude": {"type": "number", "description": "Maximum longitude in degrees"},
                         "max_latitude": {"type": "number", "description": "Maximum latitude in degrees"},
                         "max_depth_m": {"type": "number", "description": "Maximum depth in meters"},
-                        "value": {"type": "number", "description": "Feature value"},
+                        "value": {"type": "number", "description": "Per-voxel value: a CONTINUOUS measurement (grade, probability 0..1, distance/redox score); use 1.0 only for pure presence"},
                         "dtype": {"type": "string", "enum": ["float", "categorical", "boolean"]},
                         "combination_rule": {"type": "string", "enum": ["replace", "max", "add", "mean"]},
                         "coordinate_source": {"type": "string", "enum": sorted(_VALID_COORDINATE_SOURCES)},
@@ -3246,6 +3300,83 @@ except Exception as user_code_error:
                     if path:
                         return path
         return None
+
+    @staticmethod
+    def _load_layer_array(
+        artifact_files,
+        artifact_directory,
+        *,
+        artifact_name: str = "auto",
+        expected_shape: tuple | None = None,
+    ):
+        """Resolve + load a code-phase ndarray artifact (a precomputed per-voxel
+        value grid) as a numpy array. Mirrors ``_resolve_geometry_artifact_path``
+        but probes ``.npy`` suffixes. For ``artifact_name='auto'`` prefers a
+        candidate whose shape matches ``expected_shape`` (the grid). Returns
+        ``(array | None, path | None)``.
+        """
+        import os as _os
+
+        import numpy as _np
+
+        artifact_name = str(artifact_name or "auto").strip() or "auto"
+
+        def _existing_path(candidate):
+            if candidate is None:
+                return None
+            text = str(candidate)
+            if _os.path.exists(text):
+                return text
+            if artifact_directory:
+                joined = _os.path.join(artifact_directory, _os.path.basename(text))
+                if _os.path.exists(joined):
+                    return joined
+            return None
+
+        def _try_load(path):
+            try:
+                return _np.load(path, allow_pickle=False)
+            except Exception:
+                return None
+
+        if artifact_name != "auto":
+            path = _existing_path(artifact_name)
+            if not path and artifact_directory:
+                for suffix in ("", ".npy", "_array.npy"):
+                    path = _existing_path(_os.path.join(artifact_directory, artifact_name + suffix))
+                    if path:
+                        break
+            if path:
+                arr = _try_load(path)
+                if arr is not None:
+                    return arr, path
+            return None, None
+
+        # auto: scan candidate .npy artifacts, prefer one matching the grid shape.
+        candidates: list[str] = []
+        for f in artifact_files or []:
+            if str(f).endswith(".npy"):
+                p = _existing_path(f)
+                if p and p not in candidates:
+                    candidates.append(p)
+        if artifact_directory and _os.path.isdir(artifact_directory):
+            for b in sorted(_os.listdir(artifact_directory)):
+                if b.endswith(".npy"):
+                    p = _os.path.join(artifact_directory, b)
+                    if _os.path.exists(p) and p not in candidates:
+                        candidates.append(p)
+        best = None
+        for p in candidates:
+            arr = _try_load(p)
+            if arr is None:
+                continue
+            if expected_shape is not None and tuple(arr.shape) == tuple(expected_shape):
+                return arr, p
+            if best is None:
+                best = (arr, p)
+        if best is not None:
+            return best
+        return None, None
 
     @staticmethod
     def _load_geometry_records(
@@ -4488,8 +4619,9 @@ finally:
             from voxel_features.store import GridSpec
             from voxel_features.mcp.tools.spatial_tools import (
                 spatial_add_point, spatial_add_line, spatial_add_box,
-                spatial_upsert_geometry_batch, spatial_query_region,
-                spatial_coord_to_voxel, spatial_get_operations_log
+                spatial_upsert_geometry_batch, spatial_set_layer_array,
+                spatial_query_region, spatial_coord_to_voxel,
+                spatial_get_operations_log
             )
             print("🔧 DEBUG: ✅ Imports successful")
 
@@ -4573,7 +4705,35 @@ finally:
                     "artifact_rows_truncated": truncated,
                 }
                 args = batch_args
-              
+            elif capability_name == "spatial_set_layer_array":
+                arr_args = dict(args)
+                artifact_name = str(arr_args.pop("array_artifact", "auto") or "auto")
+                arr_args.pop("artifact_format", None)
+                code_record = ctx.episode_context.get("phase_records", {}).get("code", {})
+                artifact_files = code_record.get("artifact_files", [])
+                if not isinstance(artifact_files, list):
+                    artifact_files = []
+                layer_array, array_path = self._load_layer_array(
+                    artifact_files,
+                    code_record.get("artifact_directory", ""),
+                    artifact_name=artifact_name,
+                    expected_shape=tuple(store.grid.shape),
+                )
+                if layer_array is None:
+                    return CapabilityResult(
+                        capability_name,
+                        success=False,
+                        error=(
+                            "No ndarray artifact found for array layer materialization. The code "
+                            "phase must leave a top-level numpy array (e.g. `value_grid` of shape "
+                            f"{tuple(store.grid.shape)}); it is auto-saved as <name>_array.npy."
+                        ),
+                    )
+                arr_args["values"] = layer_array
+                _meta = arr_args.get("metadata") if isinstance(arr_args.get("metadata"), dict) else {}
+                arr_args["metadata"] = {**_meta, "array_artifact_path": array_path}
+                args = arr_args
+
             # Validate coordinates if this is a spatial operation with coordinates
             if capability_name in ["spatial_add_point", "spatial_add_line"]:
                 if "longitude" in args and "latitude" in args:
@@ -4610,6 +4770,9 @@ finally:
                         result["records_skipped"] = result.get("records_skipped", 0) + extra_skipped
                         warnings = result.setdefault("warnings", [])
                         warnings.append(f"Skipped {extra_skipped} artifact rows beyond max_records")
+            elif capability_name == "spatial_set_layer_array":
+                print("🔧 DEBUG: Calling spatial_set_layer_array...")
+                result = spatial_set_layer_array(store, **args)
             elif capability_name == "spatial_query_region":
                 print("🔧 DEBUG: Calling spatial_query_region...")
                 result = spatial_query_region(store, **args)
@@ -5889,12 +6052,16 @@ finally:
         """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
         experiments enter the kg pool.
 
-        Normal path (crossbreed) — all four conditions must hold:
+        Normal path (crossbreed) — all hold:
           - ``masking_test_passed`` — stage 1 predictive-capacity check.
-          - ``admitted`` — stage 2 scorer admitted the layer (bic_delta < 0).
-          - ``bic_delta is not None and bic_delta < 0`` — defense in depth.
-          - ``stage_completed`` in the allowlist — proves stage 2 actually ran
-            (vs. partial / aborted scoring).
+          - ``admitted`` — the scorer admitted the layer. CALIBRATED 2026-06-05 to
+            LIFT-PRIMARY (validity + cross-layer lift > bar), so this is the
+            authority and ``bic_delta`` no longer gates here (it is telemetry).
+            The old ``bic_delta < 0`` re-check contradicted lift-primary and dropped
+            every positive-bic crossbreed child at the kg_gate.
+          - ``bic_delta is not None`` — scoring must have produced a delta.
+          - ``stage_completed`` in the allowlist — proves scoring actually ran
+            (vs. partial / aborted).
 
         ``seed_phase`` (``workflow_kind == "survey"``, decided at the call site
         via ``_in_seed_phase``) no longer admits every completed scorer reject.
@@ -5924,7 +6091,13 @@ finally:
             return False
         if not bool(admitted):
             return False
-        if bic_delta is None or bic_delta >= 0:
+        # Calibrated 2026-06-05 (lift-primary): the scorer's `admitted` is the
+        # authority (validity + cross-layer lift > bar). The old `bic_delta < 0`
+        # "defense in depth" contradicted it and dropped every positive-bic
+        # crossbreed child at the kg_gate (e.g. vladimirov_kirey_intersection,
+        # bic +0.264, lift +0.024). Keep only the None-guard (scoring produced a
+        # delta); bic_delta is telemetry. The novelty guard still dedups.
+        if bic_delta is None:
             return False
         return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
 

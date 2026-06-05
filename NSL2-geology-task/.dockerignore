@@ -19,3 +19,10 @@ code/
 **/.pytest_cache/
 *.lock
 negative_space_learning.egg-info/
+# Run output + scratch (not COPYd by agent/analysis; trims wasted context)
+generations/
+train_data/
+scratch/
+unsloth_compiled_cache.bak*/
+_archive*/
+_backup*/

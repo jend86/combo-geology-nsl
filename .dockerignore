@@ -29,3 +29,10 @@ voxel-features-mcp/.pytest_cache/
 voxel-features-mcp/dist/
 voxel-features-mcp/build/
 voxel-features-mcp/*.egg-info/
+# Run output + scratch under NSL2-geology-task (vfm only COPYs voxel_features)
+NSL2-geology-task/generations/
+NSL2-geology-task/train_data/
+NSL2-geology-task/scratch/
+NSL2-geology-task/unsloth_compiled_cache.bak*/
+**/_archive*/
+**/_backup*/

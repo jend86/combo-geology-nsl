@@ -560,7 +560,15 @@ def create_worker_slots(
     Preflight: cap N against estimated Docker network-pool capacity.
     Fallback: on per-slot failure, clean up the partial slot and return the
     successful ones. Only re-raise when zero slots could be started.
+
+    Resilience: each slot's build is retried up to ``max_attempts`` times
+    (transient docker.io registry blips during image builds are common), and a
+    slot that still fails is SKIPPED so the rest of the ramp proceeds; the run
+    only aborts if zero slots come up.
     """
+    import time  # local: short backoff between transient slot-build retries
+
+    max_attempts = 3
     effective_n_slots = estimate_slot_capacity(n_slots)
     if effective_n_slots < n_slots:
         logger.warning(
@@ -579,51 +587,70 @@ def create_worker_slots(
         project_name = f"gen_{run_id}_slot_{i}"
         slot_compose_dir = generation_dir / "compose" / f"slot_{i}"
         slot_cache_dir = code_host_cache_path / f"slot_{i}"
-        try:
-            _generate_slot_compose(base_compose_dir, slot_compose_dir, project_name, i)
+        slot_started = False
+        for attempt in range(1, max_attempts + 1):
+            try:
+                _generate_slot_compose(base_compose_dir, slot_compose_dir, project_name, i)
 
-            docker_client = docker.from_env()
-            _launch_slot_compose(slot_compose_dir, project_name)
+                docker_client = docker.from_env()
+                _launch_slot_compose(slot_compose_dir, project_name)
 
-            expected_services = compose_services(
-                slot_compose_dir / "docker-compose.yml",
-                project_name=project_name,
-            )
-            container_manager = ContainerManager(
-                docker_client=docker_client,
-                container_ids=[],
-                docker_compose_dir=str(slot_compose_dir),
-                post_rebuild_wait_seconds=post_rebuild_wait_seconds,
-                project_name_pattern=project_name,
-                expected_services=expected_services,
-                task=task,
-            )
-            container_manager.refresh_container_ids()
-            logger.info(
-                f"Slot {i} discovered containers: {container_manager.container_ids}"
-            )
-
-            slots.append(
-                WorkerSlot(
-                    slot_id=i,
-                    container_manager=container_manager,
-                    docker_client=docker_client,
-                    circuit_breaker=SlotCircuitBreaker(),
-                    cache_dir=slot_cache_dir,
+                expected_services = compose_services(
+                    slot_compose_dir / "docker-compose.yml",
+                    project_name=project_name,
                 )
-            )
-        except Exception as exc:
-            logger.error(f"Slot {i} creation failed ({type(exc).__name__}: {exc})")
-            _cleanup_partial_slot(project_name, slot_compose_dir)
-            if not slots:
-                raise
-            logger.warning(
-                f"Proceeding with {len(slots)}/{n_slots} worker slots — "
-                f"slot {i} failed to start; remaining slots skipped. "
-                f"Throughput will be reduced."
-            )
-            return slots
+                container_manager = ContainerManager(
+                    docker_client=docker_client,
+                    container_ids=[],
+                    docker_compose_dir=str(slot_compose_dir),
+                    post_rebuild_wait_seconds=post_rebuild_wait_seconds,
+                    project_name_pattern=project_name,
+                    expected_services=expected_services,
+                    task=task,
+                )
+                container_manager.refresh_container_ids()
+                logger.info(
+                    f"Slot {i} discovered containers: {container_manager.container_ids}"
+                )
 
+                slots.append(
+                    WorkerSlot(
+                        slot_id=i,
+                        container_manager=container_manager,
+                        docker_client=docker_client,
+                        circuit_breaker=SlotCircuitBreaker(),
+                        cache_dir=slot_cache_dir,
+                    )
+                )
+                slot_started = True
+                break
+            except Exception as exc:
+                logger.error(
+                    f"Slot {i} creation attempt {attempt}/{max_attempts} "
+                    f"failed ({type(exc).__name__}: {exc})"
+                )
+                _cleanup_partial_slot(project_name, slot_compose_dir)
+                if attempt < max_attempts:
+                    time.sleep(min(8 * attempt, 30))
+        if not slot_started:
+            # A transient failure (e.g. a docker.io registry blip during the
+            # image build) must not abort the whole ramp. Skip THIS slot and
+            # keep building the rest; only fail if zero slots come up.
+            logger.warning(
+                f"Slot {i} permanently failed after {max_attempts} attempts; "
+                f"continuing with remaining slots ({len(slots)} started so far)."
+            )
+
+    if not slots:
+        raise RuntimeError(
+            f"No worker slots could be started (requested {effective_n_slots})."
+        )
+    if len(slots) < effective_n_slots:
+        logger.warning(
+            f"Started {len(slots)}/{effective_n_slots} worker slots; "
+            f"{effective_n_slots - len(slots)} failed after retries. "
+            f"Throughput reduced but the run proceeds."
+        )
     return slots
 
 

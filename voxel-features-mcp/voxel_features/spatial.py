@@ -262,6 +262,46 @@ class SpatialVoxelStore(VoxelStore):
                 scratch_npy.unlink()
             return self.add_layer(name=name, values=layer_values, dtype=dtype, **kwargs)
 
+    def set_layer_array(
+        self,
+        name: str,
+        values: np.ndarray,
+        dtype: str = "float",
+        metadata: dict[str, Any] | None = None,
+        hypothesis_uri: str | None = None,
+        experiment_id: str | None = None,
+    ):
+        """Deposit a FULL precomputed per-voxel value array as layer ``name``.
+
+        The geometry tools flat-fill a single scalar across each shape's voxels;
+        this writes an arbitrary CONTINUOUS field (the array the code phase
+        computed — kernel density / IDW / distance / prospectivity) VERBATIM, with
+        no flat-fill and no binarization. RMW-safe (serialized per store_path) and
+        disk-truthful, mirroring ``_accumulate_voxels``: pops any stale
+        in-memory/scratch layer then re-adds. Shape is validated against the grid
+        (also enforced by ``add_layer``).
+        """
+        arr = np.asarray(values)
+        if dtype == "float":
+            arr = arr.astype(float, copy=False)
+        if arr.shape != self.grid.shape:
+            raise ValueError(
+                f"Array shape {tuple(arr.shape)} does not match grid shape {tuple(self.grid.shape)}"
+            )
+        with _store_rmw_lock(self.store_path):
+            self._layers.pop(name, None)
+            scratch_npy = self._layers_dir / f"{name}.npy"
+            if scratch_npy.exists():
+                scratch_npy.unlink()
+            return self.add_layer(
+                name=name,
+                values=arr,
+                dtype=dtype,
+                metadata=metadata,
+                hypothesis_uri=hypothesis_uri,
+                experiment_id=experiment_id,
+            )
+
     @staticmethod
     def _combine_values(current, value: float, combination_rule: str):
         if combination_rule == "replace":

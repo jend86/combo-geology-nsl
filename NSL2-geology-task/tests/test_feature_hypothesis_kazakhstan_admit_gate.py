@@ -119,13 +119,16 @@ class TestSeedPhasePersistBypass:
             seed_phase=False,
         )
 
-    def test_crossbreed_strict_gate_applies_to_normal_admits(self) -> None:
-        # The strict bic<0 gate still governs NORMAL (non-seed) admits regardless
-        # of phase — a +bic normal candidate is rejected.
-        assert not _GATE(
+    def test_normal_positive_bic_admit_persists_on_lift(self) -> None:
+        # Calibrated 2026-06-05 (lift-primary): the scorer's `admitted` is
+        # authoritative. A NORMAL/crossbreed child the lift gate admitted persists
+        # even at positive bic_delta — the old bic<0 "defense in depth" contradicted
+        # lift-primary and dropped every +bic crossbreed child at the kg_gate (e.g.
+        # vladimirov_kirey_intersection: bic +0.264, lift +0.024). Novelty still dedups.
+        assert _GATE(
             masking_test_passed=True,
             admitted=True,
-            bic_delta=3.38,
+            bic_delta=0.264,
             stage_completed="mae_bic_completed",
             admission_path="normal",
             seed_phase=False,
@@ -188,10 +191,12 @@ class TestOtherGateConditions:
             stage_completed="mae_bic_completed",
         )
 
-    @pytest.mark.parametrize("bic", [0.0, 0.001, 100.0])
-    def test_non_negative_bic_blocks(self, bic: float) -> None:
-        # bic_delta must be strictly negative (lower BIC = better).
-        assert not _GATE(
+    @pytest.mark.parametrize("bic", [-50.0, 0.0, 0.001, 100.0])
+    def test_bic_sign_does_not_gate_persist_when_admitted(self, bic: float) -> None:
+        # Calibrated 2026-06-05 (lift-primary): bic_delta is telemetry, not a gate.
+        # The lift gate already set admitted=True, so the layer persists for any
+        # finite bic sign; the novelty guard (not bic) prevents pile-on.
+        assert _GATE(
             masking_test_passed=True,
             admitted=True,
             bic_delta=bic,
