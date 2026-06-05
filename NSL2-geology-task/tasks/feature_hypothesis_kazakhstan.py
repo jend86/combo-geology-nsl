@@ -173,11 +173,10 @@ _PARENT_USE_DECAY = 0.05     # γ — safety rail while tensor novelty guards be
                              # without hard-banning high-value parents.
 _PAIR_DISTANCE_WEIGHT = 2.0  # λ for the orthogonality term in the score prior
 _CONSUMMATED_DISCOUNT = 0.25
-# Jaccard distance below which two boolean layers are treated as near-duplicates.
-# Value of 0.15 means >85% footprint overlap — practically the same spatial mask
-# jittered by noise or minor coordinate rounding.  Float layers are not gated
-# here because their raw-MAE distance is in geological units and has no
-# comparable normalised threshold.
+# Normalized pairwise distance below which two layers are treated as
+# near-duplicates. Boolean layers use Jaccard distance; float layers use the
+# magnitude-normalized L1 distance implemented by voxel_features.scoring.
+# Value 0.15 means roughly >=85% agreement independent of dtype scale.
 _NEAR_DUPLICATE_JACCARD_THRESHOLD = 0.15
 
 
@@ -3803,15 +3802,15 @@ finally:
                     "stage_completed": stage_completed,
                     "admission_path": admission_path,
                     "workflow_kind": ctx.episode_context.get("workflow_kind", "survey"),
-                    # True when this admit rode the survey-phase scorer bypass
-                    # (seed phase, and the scorer would otherwise have rejected
-                    # it). Lets analysis separate bypass-seeded survey roots from
-                    # naturally BIC-passing admits.
+                    # True when this admit rode the explicit diverse-seed
+                    # bootstrap rather than a negative predictor-lift BIC.
                     "seed_phase_bypass": bool(
                         seed_phase
+                        and admission_path == "diverse_seed"
                         and not (bic_delta is not None and bic_delta < 0)
                     ),
-                    "scoring_version": "two_stage_v2",
+                    "scoring_version": evaluate.get("scoring_objective", "spatial_predictor_lift_v1"),
+                    "scoring_objective": evaluate.get("scoring_objective"),
                     "proposal_evidence_tier": proposal_evidence_tier,
                     "self_assessment": self_assessment,
                     "confidence": confidence,
@@ -3820,6 +3819,32 @@ finally:
                     "relative_mae_max": evaluate.get('relative_mae_max'),
                     "bic_delta_raw": evaluate.get('bic_delta_raw'),
                     "n_effective_samples": evaluate.get('n_effective_samples'),
+                    "n_spatial_folds": evaluate.get("n_spatial_folds"),
+                    "n_signal_folds_by_target": evaluate.get("n_signal_folds_by_target"),
+                    "n_holdout_rows_by_target": evaluate.get("n_holdout_rows_by_target"),
+                    "n_rows_dropped_low_den_by_target": evaluate.get("n_rows_dropped_low_den_by_target"),
+                    "insufficient_evidence_by_target": evaluate.get("insufficient_evidence_by_target"),
+                    "kernel_scales_m": evaluate.get("kernel_scales_m"),
+                    "kernel_scales_vox": evaluate.get("kernel_scales_vox"),
+                    "R_v_m": evaluate.get("R_v_m"),
+                    "R_v_vox": evaluate.get("R_v_vox"),
+                    "block_voxels": evaluate.get("block_voxels"),
+                    "buffer_voxels": evaluate.get("buffer_voxels"),
+                    "min_den": evaluate.get("min_den"),
+                    "ridge_alpha": evaluate.get("ridge_alpha"),
+                    "ridge_effective_dof_by_target": evaluate.get("ridge_effective_dof_by_target"),
+                    "matched_zero_ratio": evaluate.get("matched_zero_ratio"),
+                    "pool_size_at_score": evaluate.get("pool_size_at_score"),
+                    "calibration_bin": evaluate.get("calibration_bin"),
+                    "calibration_null_permutations": evaluate.get("calibration_null_permutations"),
+                    "admission_threshold": evaluate.get("admission_threshold"),
+                    "candidate_predictor_lift_by_target": evaluate.get("candidate_predictor_lift_by_target"),
+                    "candidate_predictor_lift_mean": evaluate.get("candidate_predictor_lift_mean"),
+                    "bic_delta_by_target": evaluate.get("bic_delta_by_target"),
+                    "self_relative_mae": evaluate.get("self_relative_mae"),
+                    "candidate_as_target_relative_mae": evaluate.get("candidate_as_target_relative_mae"),
+                    "validity_passed": evaluate.get("validity_passed"),
+                    "tau_self": evaluate.get("tau_self"),
                     "candidate_nonzero_voxels": evaluate.get('candidate_nonzero_voxels'),
                     "candidate_fill_fraction": evaluate.get('candidate_fill_fraction'),
                     "artifact_links": {
@@ -5870,21 +5895,21 @@ finally:
             (vs. partial / aborted scoring).
 
         ``seed_phase`` (``workflow_kind == "survey"``, decided at the call site
-        via ``_in_seed_phase``) bypasses the Stage-1/Stage-2 *verdicts*. The
-        co-location objective rejects distributed layers at supports distinct
-        from the seed (live: post-seed candidates scored relative_mae~=1.0,
-        bic_delta~=+3.38), so the whole survey admits on completed scoring
-        alone — blanketing the basin so that by crossbreed there is enough
-        co-location for the scorer to discriminate. The only invariant kept is
-        the ``stage_completed`` allowlist, so aborted/partial episodes can never
-        seed; the geometry/provenance floor in ``_admit_with_dedup``
-        (``_seed_phase_admission_ok``) is the real quality gate. ``first_layer_auto``
-        (empty pool, no scoring possible) keeps its own bypass below.
+        via ``_in_seed_phase``) no longer admits every completed scorer reject.
+        The spatial-predictor-lift scorer labels only validity-qualified early
+        bootstrap layers as ``admission_path="diverse_seed"``; those seed admits
+        bypass literal ``bic_delta < 0`` but still require completed scoring,
+        ``masking_test_passed``, and ``admitted``. Normal survey candidates that
+        are not diverse seeds fall through to the strict scorer gate.
         """
         if admission_path == "first_layer_auto" and stage_completed == "first_layer_auto":
             return True
-        if seed_phase:
-            return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
+        if seed_phase and admission_path == "diverse_seed":
+            return (
+                stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
+                and bool(masking_test_passed)
+                and bool(admitted)
+            )
         if not bool(masking_test_passed):
             return False
         if not bool(admitted):
@@ -6323,6 +6348,28 @@ finally:
         rounded = np.round(np.asarray(values, dtype=float), 6)
         return "sha256:" + hashlib.sha256(rounded.tobytes()).hexdigest()
 
+    @staticmethod
+    def _normalised_pairwise_distance(candidate: Any, admitted: Any) -> float:
+        import numpy as np
+
+        a = np.nan_to_num(np.asarray(candidate, dtype=float), nan=0.0).ravel()
+        b = np.nan_to_num(np.asarray(admitted, dtype=float), nan=0.0).ravel()
+        a_bool_like = np.all(np.isclose(a, 0.0) | np.isclose(a, 1.0))
+        b_bool_like = np.all(np.isclose(b, 0.0) | np.isclose(b, 1.0))
+        if a_bool_like and b_bool_like:
+            ab = a.astype(bool)
+            bb = b.astype(bool)
+            union = int(np.logical_or(ab, bb).sum())
+            if union == 0:
+                return 0.0
+            intersection = int(np.logical_and(ab, bb).sum())
+            return 1.0 - float(intersection) / float(union)
+
+        scale = float(np.sum(np.abs(a)) + np.sum(np.abs(b)))
+        if scale <= 1e-12:
+            return 0.0
+        return min(max(float(np.sum(np.abs(a - b))) / scale, 0.0), 1.0)
+
     _PARENTAGE_BASE_THRESHOLD = 0.50
     _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
@@ -6712,6 +6759,7 @@ finally:
 
         nearest_layer_name = None
         nearest_tensor_distance = None
+        nearest_pairwise_distance = None
         nearest_support_match = False
         novelty_rejection_reason = "none"
 
@@ -6728,23 +6776,41 @@ finally:
                 if admitted.shape != candidate.shape:
                     continue
                 distance = float(np.mean(np.abs(candidate - admitted)))
+                pairwise_dist = cls._normalised_pairwise_distance(candidate, admitted)
                 support_match = cls._support_hash(admitted) == candidate_support_hash
                 tensor_match = cls._tensor_hash(admitted) == candidate_tensor_hash
                 if nearest_tensor_distance is None or distance < nearest_tensor_distance:
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = support_match
+                elif (
+                    nearest_pairwise_distance is None
+                    or pairwise_dist < nearest_pairwise_distance
+                ):
+                    nearest_pairwise_distance = pairwise_dist
                 if tensor_match:
                     novelty_rejection_reason = "exact_tensor_duplicate"
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = True
                     break
                 if support_match and novelty_rejection_reason == "none":
                     novelty_rejection_reason = "support_duplicate"
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = True
+                if (
+                    novelty_rejection_reason == "none"
+                    and pairwise_dist < _NEAR_DUPLICATE_JACCARD_THRESHOLD
+                ):
+                    novelty_rejection_reason = "near_duplicate_pairwise"
+                    nearest_layer_name = admitted_npy.stem
+                    nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
+                    nearest_support_match = support_match
 
         kg_record.update({
             "candidate_support_hash": candidate_support_hash,
@@ -6755,6 +6821,9 @@ finally:
             "candidate_fill_fraction": (nonzero / total) if total else 0.0,
             "nearest_layer_name": nearest_layer_name,
             "nearest_tensor_distance": nearest_tensor_distance,
+            "nearest_pairwise_distance": nearest_pairwise_distance,
+            "min_pairwise_distance_to_pool": nearest_pairwise_distance,
+            "near_duplicate_threshold": _NEAR_DUPLICATE_JACCARD_THRESHOLD,
             "nearest_support_match": nearest_support_match,
             "novelty_guard_passed": novelty_rejection_reason == "none",
             "novelty_rejection_reason": novelty_rejection_reason,

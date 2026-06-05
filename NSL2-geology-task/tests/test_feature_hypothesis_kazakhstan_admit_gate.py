@@ -62,49 +62,36 @@ class TestStageCompletedAllowlist:
 
 
 class TestSeedPhasePersistBypass:
-    """Every SURVEY-phase admit seeds the KG and must NOT be gated by the
-    co-location scorer: Stage-1 MAE and Stage-2 BIC both reject distributed
-    layers at supports distinct from the seed (observed live: every post-seed
-    candidate scored relative_mae~=1.0, bic_delta~=+3.38). When
-    ``seed_phase=True`` (workflow_kind == "survey") the persist gate admits on
-    the strength of *completed* scoring alone; the real quality gate is the
-    geometry/provenance floor in ``_admit_with_dedup``
-    (``_seed_phase_admission_ok``). In crossbreed the basin has been surveyed,
-    co-location exists, and the scorer governs again. See
-    docs/design/scoring-colocation-monoculture-2026-06-03.md.
-    """
+    """Survey seeding is now explicit, not a blanket completed-scoring bypass."""
 
-    def test_seed_phase_bypasses_positive_bic(self) -> None:
-        # The exact shape the live run stalled on: scorer rejected
-        # (admitted=False, bic_delta>0) but in the survey phase it persists.
+    def test_seed_phase_diverse_seed_bypasses_positive_bic(self) -> None:
         assert _GATE(
             masking_test_passed=True,
-            admitted=False,
+            admitted=True,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
+            admission_path="diverse_seed",
             seed_phase=True,
         )
 
-    def test_seed_phase_bypasses_stage1_failure(self) -> None:
-        # Stage-1 MAE also rejects distributed layers once >=2 layers exist; the
-        # survey-phase bypass skips Stage-1 too.
-        assert _GATE(
+    def test_seed_phase_no_longer_bypasses_stage1_failure(self) -> None:
+        assert not _GATE(
             masking_test_passed=False,
-            admitted=False,
+            admitted=True,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
+            admission_path="diverse_seed",
             seed_phase=True,
         )
 
     def test_seed_phase_still_requires_completed_scoring(self) -> None:
-        # Aborted/partial episodes must never seed the pool even in survey —
-        # the stage_completed allowlist is the one invariant kept.
         for stage in ("", "aborted", "stage_2_partial", "stage_1_only"):
             assert not _GATE(
                 masking_test_passed=True,
-                admitted=False,
+                admitted=True,
                 bic_delta=3.38,
                 stage_completed=stage,
+                admission_path="diverse_seed",
                 seed_phase=True,
             )
 
@@ -119,13 +106,12 @@ class TestSeedPhasePersistBypass:
         )
 
     def test_crossbreed_restores_strict_gate(self) -> None:
-        # In crossbreed (seed_phase=False) the bypass is off: a positive-BIC
-        # rejected candidate is blocked exactly as before (regression pin).
         assert not _GATE(
             masking_test_passed=True,
-            admitted=False,
+            admitted=True,
             bic_delta=3.38,
             stage_completed="mae_bic_completed",
+            admission_path="diverse_seed",
             seed_phase=False,
         )
 

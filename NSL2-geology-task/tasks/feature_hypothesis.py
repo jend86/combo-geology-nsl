@@ -3204,6 +3204,28 @@ finally:
         rounded = np.round(np.asarray(values, dtype=float), 6)
         return "sha256:" + hashlib.sha256(rounded.tobytes()).hexdigest()
 
+    @staticmethod
+    def _normalised_pairwise_distance(candidate: Any, admitted: Any) -> float:
+        import numpy as np
+
+        a = np.nan_to_num(np.asarray(candidate, dtype=float), nan=0.0).ravel()
+        b = np.nan_to_num(np.asarray(admitted, dtype=float), nan=0.0).ravel()
+        a_bool_like = np.all(np.isclose(a, 0.0) | np.isclose(a, 1.0))
+        b_bool_like = np.all(np.isclose(b, 0.0) | np.isclose(b, 1.0))
+        if a_bool_like and b_bool_like:
+            ab = a.astype(bool)
+            bb = b.astype(bool)
+            union = int(np.logical_or(ab, bb).sum())
+            if union == 0:
+                return 0.0
+            intersection = int(np.logical_and(ab, bb).sum())
+            return 1.0 - float(intersection) / float(union)
+
+        scale = float(np.sum(np.abs(a)) + np.sum(np.abs(b)))
+        if scale <= 1e-12:
+            return 0.0
+        return min(max(float(np.sum(np.abs(a - b))) / scale, 0.0), 1.0)
+
     _PARENTAGE_BASE_THRESHOLD = 0.50
     _PARENTAGE_WEAK_THRESHOLD_BONUS = 0.25
     _ARTIFACT_BACKED_SOURCES: frozenset[str] = frozenset({"artifact", "geonames", "web"})
@@ -3339,6 +3361,7 @@ finally:
 
         nearest_layer_name = None
         nearest_tensor_distance = None
+        nearest_pairwise_distance = None
         nearest_support_match = False
         novelty_rejection_reason = "none"
 
@@ -3355,23 +3378,41 @@ finally:
                 if admitted.shape != candidate.shape:
                     continue
                 distance = float(np.mean(np.abs(candidate - admitted)))
+                pairwise_dist = cls._normalised_pairwise_distance(candidate, admitted)
                 support_match = cls._support_hash(admitted) == candidate_support_hash
                 tensor_match = cls._tensor_hash(admitted) == candidate_tensor_hash
                 if nearest_tensor_distance is None or distance < nearest_tensor_distance:
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = support_match
+                elif (
+                    nearest_pairwise_distance is None
+                    or pairwise_dist < nearest_pairwise_distance
+                ):
+                    nearest_pairwise_distance = pairwise_dist
                 if tensor_match:
                     novelty_rejection_reason = "exact_tensor_duplicate"
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = True
                     break
                 if support_match and novelty_rejection_reason == "none":
                     novelty_rejection_reason = "support_duplicate"
                     nearest_layer_name = admitted_npy.stem
                     nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
                     nearest_support_match = True
+                if (
+                    novelty_rejection_reason == "none"
+                    and pairwise_dist < _NEAR_DUPLICATE_PAIR_THRESHOLD
+                ):
+                    novelty_rejection_reason = "near_duplicate_pairwise"
+                    nearest_layer_name = admitted_npy.stem
+                    nearest_tensor_distance = distance
+                    nearest_pairwise_distance = pairwise_dist
+                    nearest_support_match = support_match
 
         kg_record.update({
             "candidate_support_hash": candidate_support_hash,
@@ -3382,6 +3423,9 @@ finally:
             "candidate_fill_fraction": (nonzero / total) if total else 0.0,
             "nearest_layer_name": nearest_layer_name,
             "nearest_tensor_distance": nearest_tensor_distance,
+            "nearest_pairwise_distance": nearest_pairwise_distance,
+            "min_pairwise_distance_to_pool": nearest_pairwise_distance,
+            "near_duplicate_threshold": _NEAR_DUPLICATE_PAIR_THRESHOLD,
             "nearest_support_match": nearest_support_match,
             "novelty_guard_passed": novelty_rejection_reason == "none",
             "novelty_rejection_reason": novelty_rejection_reason,

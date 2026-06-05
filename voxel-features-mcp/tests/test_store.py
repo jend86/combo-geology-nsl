@@ -115,11 +115,8 @@ def test_evaluate_new_layer_admitted():
         assert "admitted" in result
 
 
-def test_first_layer_gets_real_null_bic_not_sentinel():
-    """First (empty-store) layer must get a real predict-by-mean null-model BIC,
-    not the old hardcoded -1.0 sentinel. The sentinel auto-satisfied admission
-    and flipped the pipeline to crossbreed after only ~5/18 sources (rabbit-hole
-    bias), and gave the greedy BIC init no signal to rank foundation layers."""
+def test_first_layer_uses_explicit_auto_admission_path():
+    """First layer remains a labeled bootstrap path, not a synthetic BIC score."""
     with tempfile.TemporaryDirectory() as tmpdir:
         store = VoxelStore(tmpdir, COE_FAIRBAIRN_GRID)
         first = np.random.rand(200, 200, 8)  # spatially variable → real null BIC
@@ -134,9 +131,11 @@ def test_first_layer_gets_real_null_bic_not_sentinel():
 
         assert result["admitted"] is True
         assert result["bic_delta"] != -1.0, "first layer still returns the -1.0 sentinel"
-        assert result["bic_delta"] < 0.0, "admitted first layer must have a real negative bic_delta"
-        assert result["bic_before"] > 0.0, "bic_before should be the layer's null-model BIC"
-        assert result["masking_test_direction"] == "null_model_baseline"
+        assert result["bic_delta"] is None
+        assert result["bic_before"] is None
+        assert result["masking_test_direction"] == "first_layer_auto"
+        assert result["admission_path"] == "first_layer_auto"
+        assert result["scoring_objective"] == "spatial_predictor_lift_v1"
 
 
 def test_evaluate_redundant_layer_rejected():

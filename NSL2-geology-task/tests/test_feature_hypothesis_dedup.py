@@ -323,6 +323,43 @@ class TestAdmitWithDedup:
         assert record2["novelty_rejection_reason"] == "exact_tensor_duplicate"
         assert record2["nearest_tensor_distance"] == 0.0
 
+    def test_near_duplicate_pairwise_rejected_before_kg_admit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        task = _task(tmp_path)
+        variation = _variation(tmp_path)
+        kg_dir = Path(variation.kg_dir)
+        store_dir = Path(variation.store_dir)
+        values_a = np.zeros(_grid().shape, dtype=float)
+        values_b = np.zeros(_grid().shape, dtype=float)
+        values_a.flat[:31] = 1.0
+        values_b.flat[:] = 1.0
+
+        first, _ = _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="broad_host",
+            values=values_a,
+            hypothesis="Broad host footprint.",
+        )
+        second, record2 = _admit_layer(
+            task,
+            kg_dir,
+            store_dir,
+            layer_name="broad_host_jittered",
+            values=values_b,
+            hypothesis="Slightly jittered broad host footprint.",
+        )
+
+        assert first is True
+        assert second is False
+        assert record2["novelty_guard_passed"] is False
+        assert record2["novelty_rejection_reason"] == "near_duplicate_pairwise"
+        assert record2["nearest_pairwise_distance"] < 0.05
+        assert not (store_dir / "admitted" / "layers" / "broad_host_jittered.npy").exists()
+
     def test_spatial_operations_log_coordinate_provenance(self, tmp_path: Path) -> None:
         store = SpatialVoxelStore(tmp_path / "store", _grid())
 

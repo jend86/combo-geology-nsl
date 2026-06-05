@@ -46,6 +46,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy import stats
+from scipy.ndimage import (
+    binary_dilation,
+    gaussian_filter,
+    generate_binary_structure,
+    iterate_structure,
+)
 
 if TYPE_CHECKING:
     from voxel_features.store import VoxelStore, GridSpec
@@ -57,6 +63,26 @@ _MAX_EFFECTIVE_SAMPLES = 10_000
 
 _STAGE1_MAE_TOLERANCE = 1e-3
 _STAGE1_BIC_RESCUE_THRESHOLD = -1.0
+
+_SPATIAL_SCORING_OBJECTIVE = "spatial_predictor_lift_v1"
+_SPATIAL_DEFAULT_SCALES_VOX = (3.0, 8.0, 20.0)
+_SPATIAL_SMALL_GRID_SCALES_VOX = (2.0, 5.0, 12.0)
+_SPATIAL_DEFAULT_SELF_SCALES_VOX = (3.0, 8.0)
+_SPATIAL_SMALL_GRID_SELF_SCALES_VOX = (2.0, 5.0)
+_SPATIAL_VERTICAL_SIGMA_VOX = 0.8
+_SPATIAL_GAUSSIAN_TRUNCATE = 2.0
+_SPATIAL_N_BLOCKS_XY = 4
+_SPATIAL_CV_BUFFER_VOX = 4
+_SPATIAL_MATCHED_ZERO_RATIO = 1.0
+_SPATIAL_TAU_SELF = 0.9
+_SPATIAL_MIN_EVAL_ROWS = 8
+_SPATIAL_MIN_TRAIN_ROWS = 5
+_SPATIAL_MAX_PREDICTOR_LAYERS = 6
+_SPATIAL_NULL_PERMUTATIONS = 0
+_SPATIAL_NULL_PERCENTILE = 5.0
+_SPATIAL_SEED_POOL_TARGET = 3
+_SPATIAL_REJECTION_BIC_DELTA = 1_000_000.0
+_SPATIAL_MIN_LIFT = 1e-6
 
 
 def _effective_sample_count(total_non_zero: int, n_layers: int) -> int:
@@ -890,10 +916,11 @@ def fit_continuous_predictor(
         }
     
     try:
-        # Use sklearn for robust linear regression if available
-        from sklearn.linear_model import LinearRegression
+        # Use ridge when sklearn is available; the multi-scale spatial features
+        # are intentionally collinear, so nominal OLS is too brittle.
+        from sklearn.linear_model import Ridge
         
-        model = LinearRegression()
+        model = Ridge(alpha=1e-3, fit_intercept=True)
         model.fit(train_predictors, train_target)
         
         return {
@@ -901,22 +928,27 @@ def fit_continuous_predictor(
             'intercept': model.intercept_,
             'n_predictors': n_predictors,
             'n_train_samples': n_train,
-            'prediction_type': 'sklearn_linear'
+            'prediction_type': 'sklearn_ridge'
         }
         
     except ImportError:
         # Fallback: numpy least squares
         try:
-            # Add intercept column
+            # Add intercept column; keep the intercept unpenalized.
             X_with_intercept = np.column_stack([np.ones(n_train), train_predictors])
-            coeffs_with_intercept, _, _, _ = np.linalg.lstsq(X_with_intercept, train_target, rcond=None)
+            regularizer = 1e-3 * np.eye(X_with_intercept.shape[1])
+            regularizer[0, 0] = 0.0
+            coeffs_with_intercept = np.linalg.solve(
+                X_with_intercept.T @ X_with_intercept + regularizer,
+                X_with_intercept.T @ train_target,
+            )
             
             return {
                 'coefficients': coeffs_with_intercept[1:],  # Exclude intercept
                 'intercept': coeffs_with_intercept[0],
                 'n_predictors': n_predictors,
                 'n_train_samples': n_train,
-                'prediction_type': 'numpy_lstsq'
+                'prediction_type': 'numpy_ridge'
             }
         except np.linalg.LinAlgError:
             # Ultimate fallback: correlation-based prediction
@@ -1203,6 +1235,721 @@ def _bic_with_common_effective_samples(
 
     # Test doubles and legacy callers may only provide a scalar BIC.
     return float(score.get("bic", 0.0))
+
+
+def _spatial_scales_for_shape(
+    shape: tuple[int, int, int],
+    scales: tuple[float, ...] | None,
+    *,
+    self_scales: bool = False,
+) -> tuple[float, ...]:
+    if scales is not None:
+        source = tuple(float(s) for s in scales if float(s) > 0.0)
+    elif min(shape[:2]) < 80:
+        source = (
+            _SPATIAL_SMALL_GRID_SELF_SCALES_VOX
+            if self_scales
+            else _SPATIAL_SMALL_GRID_SCALES_VOX
+        )
+    else:
+        source = _SPATIAL_DEFAULT_SELF_SCALES_VOX if self_scales else _SPATIAL_DEFAULT_SCALES_VOX
+
+    max_scale = max(1.0, float(min(shape[:2])) / 2.0)
+    clipped: list[float] = []
+    for scale in source:
+        value = min(float(scale), max_scale)
+        if not clipped or abs(value - clipped[-1]) > 1e-9:
+            clipped.append(value)
+    return tuple(clipped) or (1.0,)
+
+
+def _spatial_null_permutations_from_env() -> int:
+    import os
+
+    raw = os.environ.get("VFM_SPATIAL_NULL_PERMUTATIONS")
+    if raw is None:
+        return _SPATIAL_NULL_PERMUTATIONS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _SPATIAL_NULL_PERMUTATIONS
+
+
+def _as_spatial_field(values: np.ndarray, shape: tuple[int, int, int]) -> np.ndarray:
+    return np.nan_to_num(np.asarray(values, dtype=float).reshape(shape), nan=0.0, copy=True)
+
+
+def _spatial_union_bbox(fields: list[np.ndarray], pad: int = 0) -> tuple[int, int, int, int]:
+    if not fields:
+        return (0, 0, 0, 0)
+    nx, ny = fields[0].shape[:2]
+    support = np.zeros((nx, ny), dtype=bool)
+    for field in fields:
+        support |= np.any(field != 0, axis=2)
+    xs, ys = np.where(support)
+    if xs.size == 0:
+        return (0, nx, 0, ny)
+    return (
+        max(0, int(xs.min()) - int(pad)),
+        min(nx, int(xs.max()) + 1 + int(pad)),
+        max(0, int(ys.min()) - int(pad)),
+        min(ny, int(ys.max()) + 1 + int(pad)),
+    )
+
+
+def spatial_block_folds(
+    shape: tuple[int, int, int],
+    signal_mask: np.ndarray | None = None,
+    block_voxels: int | None = None,
+    buffer_voxels: int = _SPATIAL_CV_BUFFER_VOX,
+    *,
+    n_blocks_xy: int = _SPATIAL_N_BLOCKS_XY,
+) -> list[dict[str, np.ndarray | int]]:
+    """Create deterministic whole-column XY block folds.
+
+    D13 uses these folds only for fit/evaluation row separation. Cross-layer
+    features are full-field smooths of other layers, so no block-masked feature
+    tensors are constructed here.
+    """
+    nx, ny, nz = shape
+    if signal_mask is None:
+        bbox = (0, nx, 0, ny)
+    else:
+        signal = np.asarray(signal_mask, dtype=bool).reshape(shape)
+        bbox = _spatial_union_bbox([signal.astype(float)])
+    if block_voxels is not None and block_voxels > 0:
+        x0, x1, y0, y1 = bbox
+        n_blocks_xy = max(1, int(math.ceil(max(x1 - x0, y1 - y0) / float(block_voxels))))
+    labels = _spatial_block_labels(shape, bbox, n_blocks_xy)
+    st = (
+        iterate_structure(generate_binary_structure(2, 1), int(buffer_voxels))
+        if buffer_voxels > 0
+        else None
+    )
+    folds: list[dict[str, np.ndarray | int]] = []
+    for block_id in sorted(int(v) for v in np.unique(labels) if int(v) >= 0):
+        block2d = labels == block_id
+        buffer2d = binary_dilation(block2d, structure=st) if st is not None else block2d
+        block = np.repeat(block2d[:, :, None], nz, axis=2).ravel()
+        buffer = np.repeat(buffer2d[:, :, None], nz, axis=2).ravel()
+        folds.append({"block_id": block_id, "block": block, "buffer": buffer})
+    return folds
+
+
+def _spatial_block_labels(
+    shape: tuple[int, int, int],
+    bbox: tuple[int, int, int, int],
+    n_blocks_xy: int,
+) -> np.ndarray:
+    nx, ny, _ = shape
+    x0, x1, y0, y1 = bbox
+    labels = -np.ones((nx, ny), dtype=int)
+    k = max(1, int(n_blocks_xy))
+    x_edges = np.linspace(x0, x1, k + 1).astype(int)
+    y_edges = np.linspace(y0, y1, k + 1).astype(int)
+    block_id = 0
+    for ix in range(k):
+        for iy in range(k):
+            labels[x_edges[ix]:x_edges[ix + 1], y_edges[iy]:y_edges[iy + 1]] = block_id
+            block_id += 1
+    return labels
+
+
+def _center_weight(
+    sigma: tuple[float, float, float],
+    truncate: float,
+    nz: int,
+) -> float:
+    n = 21
+    z = max(int(nz), 1)
+    impulse = np.zeros((n, n, z), dtype=float)
+    impulse[n // 2, n // 2, z // 2] = 1.0
+    filtered = gaussian_filter(impulse, sigma=sigma, truncate=truncate, mode="constant")
+    return float(filtered[n // 2, n // 2, z // 2])
+
+
+def masked_kernel_features(
+    field: np.ndarray,
+    scales_vox: tuple[float, ...],
+    vertical_sigma_vox: float = _SPATIAL_VERTICAL_SIGMA_VOX,
+    truncate: float = _SPATIAL_GAUSSIAN_TRUNCATE,
+    *,
+    leave_self: bool = False,
+) -> list[np.ndarray]:
+    """Full-field normalized convolution features for D13.
+
+    Cross-features use ``leave_self=False`` because they smooth other layers and
+    carry no target signal. The self-validity gate passes ``leave_self=True`` to
+    remove the candidate voxel's own kernel contribution.
+    """
+    field = np.asarray(field, dtype=float)
+    observed = (field != 0).astype(float)
+    features: list[np.ndarray] = []
+    for scale in scales_vox:
+        sigma = (float(scale), float(scale), float(vertical_sigma_vox))
+        numerator = gaussian_filter(field, sigma=sigma, truncate=truncate, mode="constant")
+        denominator = gaussian_filter(observed, sigma=sigma, truncate=truncate, mode="constant")
+        if leave_self:
+            k0 = _center_weight(sigma, truncate, field.shape[2])
+            numerator = numerator - k0 * field
+            denominator = denominator - k0 * observed
+        features.append(numerator / (denominator + 1e-9))
+    return features
+
+
+def denominator_confidence_mask(
+    field: np.ndarray,
+    scales_vox: tuple[float, ...],
+    min_den: float,
+    vertical_sigma_vox: float = _SPATIAL_VERTICAL_SIGMA_VOX,
+    truncate: float = _SPATIAL_GAUSSIAN_TRUNCATE,
+) -> np.ndarray:
+    """Validity-gate-only denominator confidence mask.
+
+    D13 removed denominator masking from cross-features. This helper remains for
+    callers/tests that need to inspect whether leave-self self-validity features
+    have enough kernel support.
+    """
+    observed = (np.asarray(field) != 0).astype(float)
+    mask = np.ones(field.shape, dtype=bool)
+    for scale in scales_vox:
+        sigma = (float(scale), float(scale), float(vertical_sigma_vox))
+        denominator = gaussian_filter(observed, sigma=sigma, truncate=truncate, mode="constant")
+        k0 = _center_weight(sigma, truncate, field.shape[2])
+        denominator = denominator - k0 * observed
+        mask &= denominator >= float(min_den)
+    return mask
+
+
+def _stack_spatial_features(feature_list: list[np.ndarray], idx: np.ndarray) -> np.ndarray:
+    if not feature_list:
+        return np.zeros((len(idx), 0), dtype=float)
+    columns = [feature[idx[:, 0], idx[:, 1], idx[:, 2]] for feature in feature_list]
+    return np.column_stack(columns) if columns else np.zeros((len(idx), 0), dtype=float)
+
+
+def _spatial_eval_indices(
+    target_field: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    matched_zero_ratio: float,
+) -> np.ndarray:
+    x0, x1, y0, y1 = bbox
+    region = np.zeros(target_field.shape, dtype=bool)
+    region[x0:x1, y0:y1, :] = True
+    positive = np.array(np.where((target_field != 0) & region)).T
+    zero = np.array(np.where((target_field == 0) & region)).T
+    n_zero = int(float(matched_zero_ratio) * len(positive))
+    if n_zero > 0 and len(zero) > n_zero:
+        stride = max(1, len(zero) // n_zero)
+        zero = zero[::stride][:n_zero]
+    elif n_zero <= 0:
+        zero = zero[:0]
+    return np.vstack([positive, zero]) if len(positive) else zero
+
+
+def _ridge_fit(X: np.ndarray, y: np.ndarray, alpha: float) -> np.ndarray:
+    n_rows, n_features = X.shape
+    X_with_intercept = np.column_stack([np.ones(n_rows), X])
+    xtx = X_with_intercept.T @ X_with_intercept
+    regularizer = float(alpha) * np.eye(n_features + 1)
+    regularizer[0, 0] = 0.0
+    return np.linalg.solve(xtx + regularizer, X_with_intercept.T @ y)
+
+
+def _ridge_predict(X: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    return np.column_stack([np.ones(X.shape[0]), X]) @ beta
+
+
+def ridge_effective_dof(X: np.ndarray, alpha: float) -> float:
+    """Ridge effective degrees of freedom, including an unpenalized intercept."""
+    X = np.asarray(X, dtype=float)
+    n_rows, n_features = X.shape
+    if n_rows == 0:
+        return 0.0
+    X_with_intercept = np.column_stack([np.ones(n_rows), X])
+    xtx = X_with_intercept.T @ X_with_intercept
+    regularizer = float(alpha) * np.eye(n_features + 1)
+    regularizer[0, 0] = 0.0
+    try:
+        solved = np.linalg.solve(xtx + regularizer, xtx)
+    except np.linalg.LinAlgError:
+        solved = np.linalg.pinv(xtx + regularizer) @ xtx
+    return float(np.clip(np.trace(solved), 0.0, n_features + 1.0))
+
+
+def _buffered_block_relative_mae(
+    idx: np.ndarray,
+    y: np.ndarray,
+    X: np.ndarray,
+    labels: np.ndarray,
+    buffer_voxels: int,
+    alpha: float,
+    min_train_rows: int,
+) -> tuple[float, int, int]:
+    block_of = labels[idx[:, 0], idx[:, 1]]
+    blocks = np.unique(block_of[block_of >= 0])
+    st = (
+        iterate_structure(generate_binary_structure(2, 1), int(buffer_voxels))
+        if buffer_voxels > 0
+        else None
+    )
+    pred_error = 0.0
+    null_error = 0.0
+    n_used = 0
+    n_folds = 0
+    for block_id in blocks:
+        test_rows = block_of == block_id
+        if int(test_rows.sum()) < 1:
+            continue
+        block_mask = labels == block_id
+        buffer_mask = binary_dilation(block_mask, structure=st) if st is not None else block_mask
+        in_buffer = buffer_mask[idx[:, 0], idx[:, 1]]
+        train_rows = (~test_rows) & (~in_buffer) & (block_of >= 0)
+        if int(train_rows.sum()) < int(min_train_rows):
+            continue
+        if X.shape[1] == 0:
+            prediction = np.full(int(test_rows.sum()), float(np.mean(y[train_rows])))
+        else:
+            try:
+                beta = _ridge_fit(X[train_rows], y[train_rows], alpha)
+                prediction = _ridge_predict(X[test_rows], beta)
+            except np.linalg.LinAlgError:
+                prediction = np.full(int(test_rows.sum()), float(np.mean(y[train_rows])))
+        null_prediction = float(np.mean(y[train_rows]))
+        pred_error += float(np.abs(y[test_rows] - prediction).sum())
+        null_error += float(np.abs(y[test_rows] - null_prediction).sum())
+        n_used += int(test_rows.sum())
+        n_folds += 1
+    if null_error <= _RELATIVE_MAE_NULL_EPS or n_used == 0:
+        return 1.0, n_used, n_folds
+    return float(max(pred_error / null_error, _RELATIVE_MAE_FLOOR)), n_used, n_folds
+
+
+def _laplace_bic_single(relative_mae: float, n_rows: int, df: float) -> float:
+    n = float(max(int(n_rows), 1))
+    rel = max(float(relative_mae), _RELATIVE_MAE_FLOOR)
+    log_likelihood = -n * (math.log(2.0 * rel) + 1.0)
+    return float(-2.0 * log_likelihood + float(df) * math.log(max(n, 2.0)))
+
+
+def _fold_preserving_permute_features(
+    X: np.ndarray,
+    idx: np.ndarray,
+    labels: np.ndarray,
+    permutation_index: int,
+) -> np.ndarray:
+    if X.shape[0] <= 1:
+        return X.copy()
+    out = X.copy()
+    block_of = labels[idx[:, 0], idx[:, 1]]
+    for block_id in np.unique(block_of[block_of >= 0]):
+        rows = np.where(block_of == block_id)[0]
+        if len(rows) <= 1:
+            continue
+        shift = 1 + (int(permutation_index) % (len(rows) - 1))
+        out[rows] = X[np.roll(rows, shift)]
+    return out
+
+
+def self_validity_score(
+    candidate_values: np.ndarray,
+    shape: tuple[int, int, int],
+    *,
+    self_scales_vox: tuple[float, ...] | None = None,
+    vertical_sigma_vox: float = _SPATIAL_VERTICAL_SIGMA_VOX,
+    truncate: float = _SPATIAL_GAUSSIAN_TRUNCATE,
+    matched_zero_ratio: float = _SPATIAL_MATCHED_ZERO_RATIO,
+    ridge_alpha: float = 1e-2,
+    min_eval_rows: int = _SPATIAL_MIN_EVAL_ROWS,
+) -> float:
+    field = _as_spatial_field(candidate_values, shape)
+    scales = _spatial_scales_for_shape(shape, self_scales_vox, self_scales=True)
+    bbox = _spatial_union_bbox([field], pad=int(2 * max(scales)))
+    idx = _spatial_eval_indices(field, bbox, matched_zero_ratio)
+    if len(idx) < int(min_eval_rows):
+        return 1.0
+    features = masked_kernel_features(
+        field,
+        scales,
+        vertical_sigma_vox,
+        truncate,
+        leave_self=True,
+    )
+    X = _stack_spatial_features(features, idx)
+    if X.shape[1] == 0 or np.allclose(X, 0.0):
+        return 1.0
+    y = field[idx[:, 0], idx[:, 1], idx[:, 2]]
+    try:
+        beta = _ridge_fit(X, y, ridge_alpha)
+        prediction = _ridge_predict(X, beta)
+    except np.linalg.LinAlgError:
+        return 1.0
+    pred_error = float(np.abs(y - prediction).sum())
+    null_error = float(np.abs(y - float(np.mean(y))).sum())
+    if null_error <= _RELATIVE_MAE_NULL_EPS:
+        return 1.0
+    return float(max(pred_error / null_error, _RELATIVE_MAE_FLOOR))
+
+
+def spatial_predictor_lift_score(
+    pool_values: list[np.ndarray],
+    pool_names: list[str],
+    candidate_values: np.ndarray,
+    shape: tuple[int, int, int],
+    *,
+    ridge_alpha: float = 1e-2,
+    scales_vox: tuple[float, ...] | None = None,
+    self_scales_vox: tuple[float, ...] | None = None,
+    vertical_sigma_vox: float = _SPATIAL_VERTICAL_SIGMA_VOX,
+    truncate: float = _SPATIAL_GAUSSIAN_TRUNCATE,
+    n_blocks_xy: int = _SPATIAL_N_BLOCKS_XY,
+    cv_buffer_vox: int = _SPATIAL_CV_BUFFER_VOX,
+    matched_zero_ratio: float = _SPATIAL_MATCHED_ZERO_RATIO,
+    tau_self: float = _SPATIAL_TAU_SELF,
+    min_eval_rows: int = _SPATIAL_MIN_EVAL_ROWS,
+    min_train_rows: int = _SPATIAL_MIN_TRAIN_ROWS,
+    max_predictor_layers: int | None = _SPATIAL_MAX_PREDICTOR_LAYERS,
+    null_permutations: int = _SPATIAL_NULL_PERMUTATIONS,
+    null_percentile: float = _SPATIAL_NULL_PERCENTILE,
+) -> dict:
+    """D13 cross-only spatial predictor-lift score.
+
+    The candidate is never scored as its own target. It is added only as a
+    multi-scale spatial predictor for the existing pool targets, evaluated on
+    identical held-out signal + matched-zero rows under buffered spatial block
+    CV. Self-prediction is used only as a validity gate.
+    """
+    L = len(pool_values)
+    names = list(pool_names) if len(pool_names) == L else [f"layer_{i}" for i in range(L)]
+    pool_fields = [_as_spatial_field(values, shape) for values in pool_values]
+    candidate_field = _as_spatial_field(candidate_values, shape)
+    scales = _spatial_scales_for_shape(shape, scales_vox)
+    self_scales = _spatial_scales_for_shape(shape, self_scales_vox, self_scales=True)
+
+    self_relative_mae = self_validity_score(
+        candidate_field,
+        shape,
+        self_scales_vox=self_scales,
+        vertical_sigma_vox=vertical_sigma_vox,
+        truncate=truncate,
+        matched_zero_ratio=matched_zero_ratio,
+        ridge_alpha=ridge_alpha,
+        min_eval_rows=min_eval_rows,
+    )
+    validity_passed = bool(self_relative_mae < float(tau_self))
+    base_result = {
+        "scoring_objective": _SPATIAL_SCORING_OBJECTIVE,
+        "spatial_correction": 1.0,
+        "kernel_scales_vox": tuple(float(v) for v in scales),
+        "self_kernel_scales_vox": tuple(float(v) for v in self_scales),
+        "R_v_vox": float(vertical_sigma_vox),
+        "block_voxels": None,
+        "buffer_voxels": int(cv_buffer_vox),
+        "n_spatial_folds": int(n_blocks_xy) * int(n_blocks_xy),
+        "matched_zero_ratio": float(matched_zero_ratio),
+        "ridge_alpha": float(ridge_alpha),
+        "tau_self": float(tau_self),
+        "self_relative_mae": float(self_relative_mae),
+        "candidate_as_target_relative_mae": float(self_relative_mae),
+        "validity_passed": validity_passed,
+        "pool_size_at_score": L,
+        "calibration_bin": f"L={L}",
+        "calibration_null_permutations": int(null_permutations),
+    }
+    if L == 0:
+        return {
+            **base_result,
+            "bic_before": None,
+            "bic_after": None,
+            "bic_delta": None,
+            "bic_delta_raw": None,
+            "bic_before_observed": None,
+            "bic_after_observed": None,
+            "bic_comparison_n_effective_samples": 0,
+            "n_effective_samples": 0,
+            "n_effective_samples_before": 0,
+            "n_effective_samples_after": 0,
+            "relative_mae_by_target": np.array([], dtype=float),
+            "relative_mae_before_by_target": {},
+            "relative_mae_after_by_target": {},
+            "candidate_predictor_lift_by_target": {},
+            "candidate_predictor_lift_mean": 0.0,
+            "bic_delta_by_target": {},
+            "ridge_effective_dof_by_target": {},
+            "n_signal_folds_by_target": {},
+            "n_holdout_rows_by_target": {},
+            "n_rows_dropped_low_den_by_target": {},
+            "insufficient_evidence_by_target": {},
+            "masking_test_passed": False,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "no_existing_targets",
+            "admitted": False,
+            "admission_threshold": 0.0,
+            "permutation_null_bic_deltas": [],
+            "score_note": "no_existing_targets",
+        }
+    if not validity_passed:
+        return {
+            **base_result,
+            "bic_before": 0.0,
+            "bic_after": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_raw": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_before_observed": 0.0,
+            "bic_after_observed": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_comparison_n_effective_samples": 0,
+            "n_effective_samples": 0,
+            "n_effective_samples_before": 0,
+            "n_effective_samples_after": 0,
+            "relative_mae_by_target": np.ones(L, dtype=float),
+            "relative_mae_before_by_target": {},
+            "relative_mae_after_by_target": {},
+            "candidate_predictor_lift_by_target": {},
+            "candidate_predictor_lift_mean": 0.0,
+            "bic_delta_by_target": {},
+            "ridge_effective_dof_by_target": {},
+            "n_signal_folds_by_target": {},
+            "n_holdout_rows_by_target": {},
+            "n_rows_dropped_low_den_by_target": {},
+            "insufficient_evidence_by_target": {
+                name: "candidate_failed_self_validity" for name in names
+            },
+            "masking_test_passed": False,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "self_validity_gate",
+            "admitted": False,
+            "admission_threshold": 0.0,
+            "permutation_null_bic_deltas": [],
+            "score_note": "rejected_by_validity_gate",
+        }
+
+    bbox = _spatial_union_bbox(pool_fields + [candidate_field])
+    labels = _spatial_block_labels(shape, bbox, n_blocks_xy)
+    pool_features = [
+        masked_kernel_features(field, scales, vertical_sigma_vox, truncate)
+        for field in pool_fields
+    ]
+    candidate_features = masked_kernel_features(
+        candidate_field,
+        scales,
+        vertical_sigma_vox,
+        truncate,
+    )
+
+    target_payloads: list[dict] = []
+    insufficient: dict[str, str] = {}
+    for target_idx, target_field in enumerate(pool_fields):
+        target_name = names[target_idx]
+        idx = _spatial_eval_indices(target_field, bbox, matched_zero_ratio)
+        if len(idx) < int(min_eval_rows):
+            insufficient[target_name] = "too_few_eval_rows"
+            continue
+        y = target_field[idx[:, 0], idx[:, 1], idx[:, 2]]
+        predictor_indices = [i for i in range(L) if i != target_idx]
+        if max_predictor_layers is not None and len(predictor_indices) > int(max_predictor_layers):
+            mid = min(1, len(scales) - 1)
+            relevance: list[tuple[float, int]] = []
+            for predictor_idx in predictor_indices:
+                feature = pool_features[predictor_idx][mid][idx[:, 0], idx[:, 1], idx[:, 2]]
+                if float(np.std(feature)) <= 1e-12:
+                    corr = 0.0
+                else:
+                    corr = float(abs(np.corrcoef(feature, y)[0, 1]))
+                    if not np.isfinite(corr):
+                        corr = 0.0
+                relevance.append((corr, predictor_idx))
+            relevance.sort(reverse=True)
+            predictor_indices = [i for _, i in relevance[: int(max_predictor_layers)]]
+        before_feature_sets = [pool_features[i] for i in predictor_indices]
+        X_before = (
+            np.column_stack([_stack_spatial_features(feature_set, idx) for feature_set in before_feature_sets])
+            if before_feature_sets
+            else np.zeros((len(idx), 0), dtype=float)
+        )
+        X_candidate = _stack_spatial_features(candidate_features, idx)
+        X_after = np.column_stack([X_before, X_candidate]) if X_before.shape[1] else X_candidate
+        rel_before, n_before, folds_before = _buffered_block_relative_mae(
+            idx,
+            y,
+            X_before,
+            labels,
+            cv_buffer_vox,
+            ridge_alpha,
+            min_train_rows,
+        )
+        rel_after, n_after, folds_after = _buffered_block_relative_mae(
+            idx,
+            y,
+            X_after,
+            labels,
+            cv_buffer_vox,
+            ridge_alpha,
+            min_train_rows,
+        )
+        n_rows = min(int(n_before), int(n_after))
+        n_folds = min(int(folds_before), int(folds_after))
+        if n_rows < int(min_eval_rows) or n_folds < 1:
+            insufficient[target_name] = "too_few_buffered_fold_rows"
+            continue
+        df_before = ridge_effective_dof(X_before, ridge_alpha)
+        df_after = ridge_effective_dof(X_after, ridge_alpha)
+        bic_before_t = _laplace_bic_single(rel_before, n_rows, df_before)
+        bic_after_t = _laplace_bic_single(rel_after, n_rows, df_after)
+        target_payloads.append({
+            "name": target_name,
+            "idx": idx,
+            "y": y,
+            "X_before": X_before,
+            "X_candidate": X_candidate,
+            "rel_before": float(rel_before),
+            "rel_after": float(rel_after),
+            "n_rows": n_rows,
+            "n_folds": n_folds,
+            "df_before": float(df_before),
+            "df_after": float(df_after),
+            "bic_before": float(bic_before_t),
+            "bic_after": float(bic_after_t),
+        })
+
+    if not target_payloads:
+        return {
+            **base_result,
+            "bic_before": 0.0,
+            "bic_after": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_raw": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_before_observed": 0.0,
+            "bic_after_observed": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_comparison_n_effective_samples": 0,
+            "n_effective_samples": 0,
+            "n_effective_samples_before": 0,
+            "n_effective_samples_after": 0,
+            "relative_mae_by_target": np.ones(L, dtype=float),
+            "relative_mae_before_by_target": {},
+            "relative_mae_after_by_target": {},
+            "candidate_predictor_lift_by_target": {},
+            "candidate_predictor_lift_mean": 0.0,
+            "bic_delta_by_target": {},
+            "ridge_effective_dof_by_target": {},
+            "n_signal_folds_by_target": {},
+            "n_holdout_rows_by_target": {},
+            "n_rows_dropped_low_den_by_target": {},
+            "insufficient_evidence_by_target": insufficient,
+            "masking_test_passed": False,
+            "masking_test_improvement": 0.0,
+            "masking_test_direction": "insufficient_evidence",
+            "admitted": False,
+            "admission_threshold": 0.0,
+            "permutation_null_bic_deltas": [],
+            "score_note": "no_scorable_targets",
+        }
+
+    bic_before_by_target = {payload["name"]: payload["bic_before"] for payload in target_payloads}
+    bic_after_by_target = {payload["name"]: payload["bic_after"] for payload in target_payloads}
+    delta_by_target = {
+        payload["name"]: (payload["bic_after"] - payload["bic_before"]) / max(payload["n_rows"], 1)
+        for payload in target_payloads
+    }
+    rel_before_by_target = {payload["name"]: payload["rel_before"] for payload in target_payloads}
+    rel_after_by_target = {payload["name"]: payload["rel_after"] for payload in target_payloads}
+    lift_by_target = {
+        payload["name"]: payload["rel_before"] - payload["rel_after"]
+        for payload in target_payloads
+    }
+    n_rows_by_target = {payload["name"]: payload["n_rows"] for payload in target_payloads}
+    n_folds_by_target = {payload["name"]: payload["n_folds"] for payload in target_payloads}
+    dof_by_target = {
+        payload["name"]: {
+            "before": payload["df_before"],
+            "after": payload["df_after"],
+            "delta": payload["df_after"] - payload["df_before"],
+        }
+        for payload in target_payloads
+    }
+    bic_before = float(sum(bic_before_by_target.values()))
+    bic_after = float(sum(bic_after_by_target.values()))
+    bic_delta_raw = float(bic_after - bic_before)
+    bic_delta = float(np.mean(list(delta_by_target.values())))
+    n_total = int(sum(n_rows_by_target.values()))
+    rel_after_array = np.array(list(rel_after_by_target.values()), dtype=float)
+    lift_mean = float(np.mean(list(lift_by_target.values()))) if lift_by_target else 0.0
+    null_deltas: list[float] = []
+    for permutation_idx in range(int(null_permutations)):
+        permuted_delta_by_target: list[float] = []
+        for payload in target_payloads:
+            X_perm_candidate = _fold_preserving_permute_features(
+                payload["X_candidate"],
+                payload["idx"],
+                labels,
+                permutation_idx,
+            )
+            X_before = payload["X_before"]
+            X_perm_after = (
+                np.column_stack([X_before, X_perm_candidate])
+                if X_before.shape[1]
+                else X_perm_candidate
+            )
+            rel_perm, n_perm, folds_perm = _buffered_block_relative_mae(
+                payload["idx"],
+                payload["y"],
+                X_perm_after,
+                labels,
+                cv_buffer_vox,
+                ridge_alpha,
+                min_train_rows,
+            )
+            if n_perm < int(min_eval_rows) or folds_perm < 1:
+                continue
+            df_perm = ridge_effective_dof(X_perm_after, ridge_alpha)
+            bic_perm = _laplace_bic_single(rel_perm, n_perm, df_perm)
+            permuted_delta_by_target.append(
+                (bic_perm - payload["bic_before"]) / max(int(n_perm), 1)
+            )
+        if permuted_delta_by_target:
+            null_deltas.append(float(np.mean(permuted_delta_by_target)))
+    if null_deltas:
+        admission_threshold = min(float(np.percentile(null_deltas, float(null_percentile))), 0.0)
+    else:
+        admission_threshold = 0.0
+
+    stage1_passed = bool(validity_passed and lift_mean > _SPATIAL_MIN_LIFT)
+    admitted = bool(stage1_passed and bic_delta < admission_threshold - 1e-9)
+    return {
+        **base_result,
+        "bic_before": bic_before,
+        "bic_after": bic_after,
+        "bic_delta": bic_delta,
+        "bic_delta_raw": bic_delta_raw,
+        "bic_before_observed": bic_before,
+        "bic_after_observed": bic_after,
+        "bic_before_by_target": bic_before_by_target,
+        "bic_after_by_target": bic_after_by_target,
+        "bic_comparison_n_effective_samples": n_total,
+        "n_effective_samples": n_total,
+        "n_effective_samples_before": n_total,
+        "n_effective_samples_after": n_total,
+        "relative_mae_by_target": rel_after_array,
+        "relative_mae_before_by_target": rel_before_by_target,
+        "relative_mae_after_by_target": rel_after_by_target,
+        "relative_mae_mean": float(np.mean(rel_after_array)) if rel_after_array.size else 1.0,
+        "relative_mae_min": float(np.min(rel_after_array)) if rel_after_array.size else 1.0,
+        "relative_mae_max": float(np.max(rel_after_array)) if rel_after_array.size else 1.0,
+        "candidate_predictor_lift_by_target": lift_by_target,
+        "candidate_predictor_lift_mean": lift_mean,
+        "bic_delta_by_target": delta_by_target,
+        "ridge_effective_dof_by_target": dof_by_target,
+        "n_signal_folds_by_target": n_folds_by_target,
+        "n_holdout_rows_by_target": n_rows_by_target,
+        "n_rows_dropped_low_den_by_target": {payload["name"]: 0 for payload in target_payloads},
+        "insufficient_evidence_by_target": insufficient,
+        "masking_test_passed": stage1_passed,
+        "masking_test_improvement": lift_mean,
+        "masking_test_direction": "candidate_predictor_lift",
+        "admitted": admitted,
+        "admission_threshold": admission_threshold,
+        "permutation_null_bic_deltas": null_deltas,
+        "score_note": "scored",
+    }
 
 
 def system_mae_to_coherence(
@@ -2117,7 +2864,7 @@ def evaluate_new_layer(
     layer_values: np.ndarray,
     layer_dtype: str,
     *,
-    ridge_alpha: float = 1.0,
+    ridge_alpha: float = 1e-2,
     n_folds: int = 5,
     seed: int | None = None,
 ) -> dict:
@@ -2226,106 +2973,99 @@ def evaluate_new_layer(
             "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
             "stage_completed": "first_layer_auto",
             "admission_path": "first_layer_auto",
+            "scoring_objective": _SPATIAL_SCORING_OBJECTIVE,
+            "validity_passed": True,
+            "self_relative_mae": None,
+            "candidate_as_target_relative_mae": None,
+            "candidate_predictor_lift_mean": 0.0,
+            "candidate_predictor_lift_by_target": {},
+            "bic_delta_by_target": {},
+            "insufficient_evidence_by_target": {},
+            "n_spatial_folds": 0,
+            "n_signal_folds_by_target": {},
+            "n_holdout_rows_by_target": {},
+            "n_rows_dropped_low_den_by_target": {},
+            "ridge_effective_dof_by_target": {},
+            "pool_size_at_score": 0,
+            "admission_threshold": 0.0,
+            "permutation_null_bic_deltas": [],
         }
 
     # Get existing layer values and dtypes
     existing_values = [store.get_layer_values(n).flatten() for n in existing_layers]
     existing_dtypes = [store.get_layer(n).dtype for n in existing_layers]
 
-    # Score WITHOUT new layer (always call to get system_mae / n_effective_samples).
-    # ``seed`` is reused for both before/after so the CV split, Moran sample,
-    # and interpolation sources are identical between the two calls.
-    # When there is exactly one existing layer, geological_coherence_score
-    # returns bic=0 (no pairwise predictions possible). Using zero as the
-    # baseline produces an artefactual bic_delta. Substitute a predict-by-mean
-    # null model so the 2-layer BIC delta measures actual predictive gain.
-    if len(existing_values) == 1:
-        score_before = _single_layer_null_bic(
-            existing_values[0], existing_dtypes[0], store.grid, grid_shape,
-            seed=effective_seed,
-        )
-    else:
-        score_before = geological_coherence_score(
-            existing_values, existing_dtypes, store.grid, grid_shape, seed=effective_seed
-        )
-
-    # Score WITH new layer
-    all_values = existing_values + [new_values_flat]
-    all_dtypes = existing_dtypes + [layer_dtype]
-    score_after = geological_coherence_score(
-        all_values, all_dtypes, store.grid, grid_shape, seed=effective_seed
+    score_after = spatial_predictor_lift_score(
+        existing_values,
+        existing_layers,
+        new_values_flat,
+        grid_shape,
+        ridge_alpha=float(ridge_alpha),
+        null_permutations=_spatial_null_permutations_from_env(),
     )
-    
-    # Raw BIC values from each independently-scored model. These are retained
-    # for audit, but the admission delta below is recomputed with a common
-    # effective-sample count so the candidate cannot win or lose purely because
-    # the before/after sample universe moved.
-    bic_before_observed = score_before["bic"]
-    bic_after_observed = score_after["bic"]
 
-    n_eff_before = int(score_before.get("n_effective_samples", 0) or 0)
-    n_eff_after = int(score_after.get("n_effective_samples", 0) or 0)
+    bic_before = score_after.get("bic_before")
+    bic_after = score_after.get("bic_after")
+    bic_delta = score_after.get("bic_delta")
+    bic_delta_raw = score_after.get("bic_delta_raw")
+    bic_before_observed = score_after.get("bic_before_observed", bic_before)
+    bic_after_observed = score_after.get("bic_after_observed", bic_after)
+
+    n_eff_before = int(score_after.get("n_effective_samples_before", 0) or 0)
+    n_eff_after = int(score_after.get("n_effective_samples_after", 0) or 0)
     n_eff_delta = n_eff_after - n_eff_before
-    bic_comparison_n_eff = min(max(n_eff_before, n_eff_after, 1), _MAX_EFFECTIVE_SAMPLES)
+    bic_comparison_n_eff = int(score_after.get("bic_comparison_n_effective_samples", n_eff_after) or 0)
+    n_eff = int(score_after.get("n_effective_samples", n_eff_after) or 0)
 
-    bic_before = _bic_with_common_effective_samples(
-        score_before,
-        len(existing_values),
-        bic_comparison_n_eff,
-    )
-    bic_after = _bic_with_common_effective_samples(
-        score_after,
-        len(all_values),
-        bic_comparison_n_eff,
-    )
-    bic_delta_raw = bic_after - bic_before
-
-    # Normalize BIC delta by the comparison sample count to remove grid-size
-    # artifacts without reintroducing the before/after n_eff confound.
-    n_eff = max(n_eff_after, 1)
-    bic_delta = bic_delta_raw / bic_comparison_n_eff  # per-sample BIC delta
-    
-    cv_mse_before = score_before["total_cv_mse"]
-    cv_mse_after = score_after["total_cv_mse"]
+    relative_before = score_after.get("relative_mae_before_by_target") or {}
+    cv_mse_before = float(np.mean(list(relative_before.values()))) if relative_before else 1.0
+    cv_mse_after = float(score_after.get("relative_mae_mean", 1.0) or 1.0)
     cv_mse_delta = cv_mse_after - cv_mse_before
-    
-    # -----------------------------------------------------------------------
-    # Stage 1: Real MAE gate - does adding this layer reduce system MAE?
-    # Auto-pass when <2 existing layers (no meaningful baseline MAE available)
-    # -----------------------------------------------------------------------
-    mae_before = score_before.get("system_mae", None)
-    mae_after = score_after.get("system_mae", 0.0)
-    
-    if len(existing_layers) < 2 or mae_before is None:
-        # Not enough layers to compute a meaningful before-MAE; let Stage 2 decide
+
+    stage1_passed = bool(score_after.get("masking_test_passed", False))
+    mae_improvement = float(score_after.get("masking_test_improvement", 0.0) or 0.0)
+    stage1_tolerance_used = False
+    seed_bootstrap = bool(
+        len(existing_layers) < _SPATIAL_SEED_POOL_TARGET
+        and score_after.get("score_note") == "scored"
+        and score_after.get("validity_passed") is True
+        and n_eff > 0
+    )
+    if seed_bootstrap:
+        admitted = True
+        admission_path = "diverse_seed"
         stage1_passed = True
-        mae_improvement = 0.0
-        stage1_tolerance_used = False
-    else:
-        mae_improvement = mae_before - mae_after  # positive = system MAE improved
-        stage1_tolerance_used = (
-            mae_improvement >= -_STAGE1_MAE_TOLERANCE
-            and bic_delta <= _STAGE1_BIC_RESCUE_THRESHOLD
+        masking_direction = "diverse_seed_validity"
+        print(
+            f"✅ Layer {layer_name} admitted as diverse seed: "
+            f"self_rel_mae={score_after.get('self_relative_mae'):.4f}, "
+            f"pool_size={len(existing_layers)}"
         )
-        stage1_passed = mae_improvement > 0 or stage1_tolerance_used
-    
-    # -----------------------------------------------------------------------
-    # Stage 2: Normalized BIC must improve (negative per-sample delta)
-    # -----------------------------------------------------------------------
-    if not stage1_passed:
-        admitted = False
-        print(f"❌ Layer {layer_name} rejected at Stage 1: MAE worsened by {-mae_improvement:.6f} (mae_before={mae_before:.4f}, mae_after={mae_after:.4f})")
     else:
-        admitted = bic_delta < 0.0
-        if admitted:
-            print(f"✅ Layer {layer_name} admitted: BIC/sample={bic_delta:.6f}, MAE delta={mae_improvement:.6f}")
+        admitted = bool(score_after.get("admitted", False))
+        admission_path = "normal"
+        masking_direction = str(score_after.get("masking_test_direction", "candidate_predictor_lift"))
+        if not stage1_passed:
+            print(
+                f"❌ Layer {layer_name} rejected at Stage 1: "
+                f"{masking_direction}, lift={mae_improvement:.6f}"
+            )
+        elif admitted:
+            print(
+                f"✅ Layer {layer_name} admitted: "
+                f"BIC/sample={float(bic_delta):.6f}, lift={mae_improvement:.6f}"
+            )
         else:
-            print(f"❌ Layer {layer_name} rejected at Stage 2: BIC/sample={bic_delta:.6f} (not negative)")
-    
+            print(
+                f"❌ Layer {layer_name} rejected at Stage 2: "
+                f"BIC/sample={float(bic_delta):.6f}, "
+                f"threshold={float(score_after.get('admission_threshold', 0.0)):.6f}"
+            )
+
     stage1_fields = {
         "masking_test_passed": stage1_passed,
         "masking_test_improvement": mae_improvement,
-        "masking_test_direction": "mae_delta" if len(existing_layers) >= 2 else "auto_pass",
+        "masking_test_direction": masking_direction,
         "stage_1_tolerance_used": stage1_tolerance_used,
         "stage_1_mae_tolerance": _STAGE1_MAE_TOLERANCE,
         "stage_1_bic_rescue_threshold": _STAGE1_BIC_RESCUE_THRESHOLD,
@@ -2378,11 +3118,44 @@ def evaluate_new_layer(
         "mutual_info": mi_scores,
         "pairwise_distance": pairwise_distances,
         "admitted": admitted,
-        "admission_path": "normal",
+        "admission_path": admission_path,
         # For hypothesis agent training: positive = improvement (higher = better)
-        "predicted_value": -bic_delta,
+        "predicted_value": -float(bic_delta) if bic_delta is not None else 0.0,
         # Stage 1 fields from two-stage scoring
-        **stage1_fields
+        **stage1_fields,
+        "scoring_objective": score_after.get("scoring_objective", _SPATIAL_SCORING_OBJECTIVE),
+        "spatial_correction": score_after.get("spatial_correction", 1.0),
+        "kernel_scales_m": score_after.get("kernel_scales_m"),
+        "kernel_scales_vox": score_after.get("kernel_scales_vox"),
+        "R_v_m": score_after.get("R_v_m"),
+        "R_v_vox": score_after.get("R_v_vox"),
+        "block_voxels": score_after.get("block_voxels"),
+        "buffer_voxels": score_after.get("buffer_voxels"),
+        "min_den": score_after.get("min_den"),
+        "ridge_alpha": score_after.get("ridge_alpha", float(ridge_alpha)),
+        "ridge_effective_dof_by_target": score_after.get("ridge_effective_dof_by_target", {}),
+        "matched_zero_ratio": score_after.get("matched_zero_ratio"),
+        "pool_size_at_score": score_after.get("pool_size_at_score", len(existing_layers)),
+        "calibration_bin": score_after.get("calibration_bin"),
+        "calibration_null_permutations": score_after.get("calibration_null_permutations", 0),
+        "admission_threshold": score_after.get("admission_threshold", 0.0),
+        "permutation_null_bic_deltas": score_after.get("permutation_null_bic_deltas", []),
+        "candidate_predictor_lift_by_target": score_after.get("candidate_predictor_lift_by_target", {}),
+        "candidate_predictor_lift_mean": score_after.get("candidate_predictor_lift_mean", 0.0),
+        "bic_delta_by_target": score_after.get("bic_delta_by_target", {}),
+        "self_relative_mae": score_after.get("self_relative_mae"),
+        "candidate_as_target_relative_mae": score_after.get("candidate_as_target_relative_mae"),
+        "validity_passed": score_after.get("validity_passed"),
+        "tau_self": score_after.get("tau_self"),
+        "n_spatial_folds": score_after.get("n_spatial_folds", 0),
+        "n_signal_folds_by_target": score_after.get("n_signal_folds_by_target", {}),
+        "n_holdout_rows_by_target": score_after.get("n_holdout_rows_by_target", {}),
+        "n_rows_dropped_low_den_by_target": score_after.get("n_rows_dropped_low_den_by_target", {}),
+        "insufficient_evidence_by_target": score_after.get("insufficient_evidence_by_target", {}),
+        "relative_mae_by_target": score_after.get("relative_mae_by_target", np.array([])),
+        "relative_mae_before_by_target": score_after.get("relative_mae_before_by_target", {}),
+        "relative_mae_after_by_target": score_after.get("relative_mae_after_by_target", {}),
+        "score_note": score_after.get("score_note"),
     }
 
 
