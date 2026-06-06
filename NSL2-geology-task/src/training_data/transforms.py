@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -289,6 +290,41 @@ def _source_group_order(groups: list[EpisodeTrainingRows]) -> str:
     return "collector_order"
 
 
+def _row_observability(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    pair_kinds: Counter[str] = Counter()
+    artifact_routes: Counter[str] = Counter()
+    value_grid_episodes: set[str] = set()
+    feature_geometry_episodes: set[str] = set()
+    fallback_method_rows = 0
+
+    for row in rows:
+        meta = row.get("record_meta") if isinstance(row.get("record_meta"), dict) else {}
+        pair_kind = meta.get("pair_kind") or meta.get("task_kind") or "unknown"
+        pair_kinds[str(pair_kind)] += 1
+        route = meta.get("artifact_route")
+        if isinstance(route, str) and route:
+            artifact_routes[route] += 1
+        episode_id = str(row.get("episode_id") or "")
+        if meta.get("has_value_grid") or route == "value_grid":
+            value_grid_episodes.add(episode_id)
+        if meta.get("has_feature_geometry") or route == "feature_geometry":
+            feature_geometry_episodes.add(episode_id)
+        if (
+            meta.get("coordinate_source") == "creative_fallback"
+            and meta.get("fallback_method_framed")
+        ):
+            fallback_method_rows += 1
+
+    return {
+        "rows_by_pair_kind": dict(sorted(pair_kinds.items())),
+        "rows_by_artifact_route": dict(sorted(artifact_routes.items())),
+        "rows_skipped_by_reason": {},
+        "episodes_with_value_grid": len(value_grid_episodes),
+        "episodes_with_feature_geometry": len(feature_geometry_episodes),
+        "creative_fallback_rows_method_framed": fallback_method_rows,
+    }
+
+
 def build_training_export(
     generation_data: Any,
     transforms: Sequence[TrainingDataTransform],
@@ -313,6 +349,7 @@ def build_training_export(
     rows = _flatten_episode_groups(groups)
     _validate_sft_rows(rows)
     training_row_count = len(rows)
+    observability = _row_observability(rows)
     report = {
         "schema_version": 1,
         "task_name": context.task_name,
@@ -332,6 +369,7 @@ def build_training_export(
         "sft_training_rows_sha256": None,
         "exported_at": datetime.now(UTC).isoformat(),
         **_context_to_report_paths(context),
+        **observability,
     }
     return TrainingDataExport(rows=rows, report=report, recipe=recipe)
 

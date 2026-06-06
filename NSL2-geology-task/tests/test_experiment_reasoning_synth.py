@@ -10,12 +10,23 @@ from typing import Any
 
 import pytest
 
-from src.training_data.transforms import EpisodeTrainingRows, validate_training_row_groups
+from src.training_data.transforms import (
+    EpisodeTrainingRows,
+    TrainingDataExportContext,
+    build_export_recipe,
+    build_training_export,
+    validate_training_row_groups,
+)
 from tasks.feature_hypothesis_kazakhstan import (
     PAIR_KIND_ANALYSIS_PLAN,
+    PAIR_KIND_CODE_SYNTHESIS,
+    PAIR_KIND_COORDINATE_PROVENANCE,
     PAIR_KIND_DATASET_HYPOTHESIS,
+    PAIR_KIND_FEATURE_READOUT,
     PAIR_KIND_OUTCOME_NARRATIVE,
     PAIR_KIND_PARENT_HYPOTHESIS,
+    PAIR_KIND_PARENT_RELATION,
+    PAIR_KIND_SPATIAL_MATERIALIZATION,
     ExperimentReasoningRows,
 )
 
@@ -180,18 +191,78 @@ def _default_phase_records(
     *,
     admitted: bool = True,
     bic_delta: float = -1.5,
+    candidate_predictor_lift_mean: float = 0.42,
 ) -> dict[str, Any]:
     return {
         "hypothesise": {
             "hypothesis": "acoustic impedance contrast predicts reservoir quality",
-            "data_spec": {"files": ["seismic.csv"], "transform": "log_ratio"},
-            "parent_experiments": ["ep-parent-0"],
+            "data_spec": {
+                "files": ["seismic.csv"],
+                "output": "ai_contrast_log_ratio",
+                "analysis_steps": ["load seismic", "compute boundary contrast"],
+            },
+            "parent_experiments": ["ep-parent-0", "ep-parent-1"],
+            "parent_context": [
+                {
+                    "hypothesis": "porosity correlates with depth",
+                    "finding": "deeper intervals showed lower porosity",
+                },
+                {
+                    "hypothesis": "seismic boundaries mark reservoir quality",
+                    "finding": "sharp acoustic changes tracked productive contacts",
+                },
+            ],
         },
-        "code": {"result_summary": "feature computed, 1200 rows"},
-        "translate": {"feature_layer_name": "ai_contrast_log_ratio"},
+        "code": {
+            "code_executed": (
+                "import pandas as pd\n"
+                "feature_geometry = pd.DataFrame([{'geometry_kind': 'point', "
+                "'longitude': 68.2, 'latitude': 50.8, 'depth_m': 20, "
+                "'value': 0.7, 'coordinate_source': 'artifact'}])\n"
+                "value_grid = make_continuous_field()\n"
+            ),
+            "result_summary": "feature computed, 1200 rows with a continuous impedance field",
+            "artifact_files": ["feature_geometry_dataframe.csv", "value_grid_array.npy"],
+            "feature_geometry": [
+                {
+                    "record_id": "g0",
+                    "geometry_kind": "point",
+                    "longitude": 68.2,
+                    "latitude": 50.8,
+                    "depth_m": 20.0,
+                    "value": 0.7,
+                    "coordinate_source": "artifact",
+                    "source_file": "seismic.csv",
+                    "source_excerpt": "picked boundary contrast",
+                },
+                {
+                    "record_id": "g1",
+                    "geometry_kind": "line",
+                    "start_longitude": 68.0,
+                    "start_latitude": 50.7,
+                    "end_longitude": 68.4,
+                    "end_latitude": 50.9,
+                    "value": 0.5,
+                    "coordinate_source": "artifact",
+                },
+            ],
+            "feature_geometry_count": 2,
+        },
+        "translate": {
+            "feature_layer_name": "ai_contrast_log_ratio",
+            "coordinate_source_counts": {"artifact": 2},
+            "geometry_kind_counts": {"point": 1, "line": 1},
+            "bulk_geometry_records": 2,
+            "bulk_geometry_skipped": 0,
+        },
         "evaluate": {
             "bic_delta": bic_delta,
             "admitted": admitted,
+            "candidate_predictor_lift_mean": candidate_predictor_lift_mean,
+            "candidate_predictor_lift_by_target": {"target_a": candidate_predictor_lift_mean},
+            "admission_path": "predictor_lift",
+            "admission_threshold": 0.01,
+            "validity_passed": True,
             "mutual_info": {"target": 0.12},
             "masking_test_passed": True,
             "masking_test_improvement": 0.31,
@@ -257,13 +328,33 @@ class TestMaskingLeakage:
         for group in result:
             for row in group.rows:
                 prompt: str = row["prompt"]
-                assert _BIC_PATTERN.search(prompt) is None, (
-                    f"row {row['row_id']} prompt contains a numeric BIC-like value: {prompt!r}"
-                )
                 lower = prompt.lower()
+                assert "bic" not in lower, (
+                    f"row {row['row_id']} prompt contains BIC wording: {prompt!r}"
+                )
                 assert "admitted" not in lower, (
                     f"row {row['row_id']} prompt contains 'admitted': {prompt!r}"
                 )
+
+    def test_scoring_telemetry_not_in_prompt_or_target(self) -> None:
+        episode = _episode()
+        result = _run_transform([episode])
+
+        forbidden = {
+            "candidate_predictor_lift_mean",
+            "candidate_predictor_lift_by_target",
+            "bic_delta",
+            "admitted",
+            "admission_path",
+            "admission_threshold",
+            "masking_test_passed",
+            "0.42",
+        }
+        for group in result:
+            for row in group.rows:
+                text = f"{row['prompt']}\n{row['raw_response']}".lower()
+                for token in forbidden:
+                    assert token.lower() not in text
 
     def test_outcome_narrative_strips_exact_bic_result_appendix(self) -> None:
         """Outcome narrative completions must NOT contain the
@@ -284,6 +375,17 @@ class TestMaskingLeakage:
             assert _RESULT_APPENDIX.search(raw_response) is None, (
                 f"row {row['row_id']} still contains BIC result appendix: {raw_response!r}"
             )
+
+    def test_outcome_narrative_requires_result_summary(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"]["result_summary"] = ""
+        episode = _episode(phase_records=phase_records)
+
+        result = _run_transform([episode])
+
+        assert PAIR_KIND_OUTCOME_NARRATIVE not in {
+            row["record_meta"]["pair_kind"] for group in result for row in group.rows
+        }
 
     def test_compose_child_not_in_parent_query(self) -> None:
         """Parent-hypothesis prompts must not contain the child hypothesis.
@@ -406,8 +508,13 @@ class TestProvenanceMetadata:
 
         valid_kinds = {
             PAIR_KIND_PARENT_HYPOTHESIS,
+            PAIR_KIND_PARENT_RELATION,
             PAIR_KIND_DATASET_HYPOTHESIS,
             PAIR_KIND_ANALYSIS_PLAN,
+            PAIR_KIND_CODE_SYNTHESIS,
+            PAIR_KIND_FEATURE_READOUT,
+            PAIR_KIND_SPATIAL_MATERIALIZATION,
+            PAIR_KIND_COORDINATE_PROVENANCE,
             PAIR_KIND_OUTCOME_NARRATIVE,
         }
         for group in result:
@@ -533,7 +640,7 @@ class TestProvenanceMetadata:
 
 class TestYield:
     def test_rows_per_episode_in_range(self) -> None:
-        """Default config must yield 3–4 rows per training-successful episode."""
+        """Default v2 config should emit the distinct-skill spine rows."""
         # Parent context plus standard phase records should enable the full set
         # of synthesized row kinds.
         episode = _episode(episode_id="ep-yield")
@@ -541,9 +648,164 @@ class TestYield:
 
         assert len(result) == 1
         count = len(result[0].rows)
-        assert 3 <= count <= 4, (
-            f"Expected 3-4 rows per episode, got {count}"
+        assert count >= 8, (
+            f"Expected at least 8 v2 spine rows per episode, got {count}"
         )
+
+    def test_v2_emits_parent_relation_per_parent_with_cap(self) -> None:
+        episode = _episode()
+
+        result = ExperimentReasoningRows(max_parent_relation_rows=1).transform_export_rows(
+            context=None,
+            episodes=[episode],
+        )
+
+        relation_rows = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_PARENT_RELATION
+        ]
+        assert len(relation_rows) == 1
+        assert relation_rows[0]["record_meta"]["parent_id"] == "ep-parent-0"
+
+    def test_v2_emits_code_synthesis_from_code_executed(self) -> None:
+        result = _run_transform([_episode()])
+
+        code_rows = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_CODE_SYNTHESIS
+        ]
+        assert code_rows
+        assert "feature_geometry" in code_rows[0]["raw_response"]
+        assert "value_grid" in code_rows[0]["prompt"]
+
+    def test_v2_emits_feature_readout_only_when_result_summary_present(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"]["result_summary"] = ""
+        result = _run_transform([_episode(phase_records=phase_records)])
+
+        assert PAIR_KIND_FEATURE_READOUT not in {
+            row["record_meta"]["pair_kind"] for group in result for row in group.rows
+        }
+
+    def test_v2_emits_spatial_materialization_preferring_value_grid(self) -> None:
+        result = _run_transform([_episode()])
+
+        materialization = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_SPATIAL_MATERIALIZATION
+        ][0]
+        assert materialization["record_meta"]["artifact_route"] == "value_grid"
+        assert "spatial_set_layer_array" in materialization["raw_response"]
+
+    def test_v2_emits_spatial_materialization_for_feature_geometry_batch(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"]["artifact_files"] = ["feature_geometry_dataframe.csv"]
+
+        result = _run_transform([_episode(phase_records=phase_records)])
+
+        materialization = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_SPATIAL_MATERIALIZATION
+        ][0]
+        assert materialization["record_meta"]["artifact_route"] == "feature_geometry"
+        assert "spatial_upsert_geometry_batch" in materialization["raw_response"]
+
+    def test_v2_marks_feature_points_as_legacy_fallback(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"].pop("feature_geometry")
+        phase_records["code"].pop("feature_geometry_count")
+        phase_records["code"]["artifact_files"] = ["feature_points_dataframe.csv"]
+        phase_records["code"]["feature_points"] = [
+            {
+                "longitude": 68.2,
+                "latitude": 50.8,
+                "depth_m": 20.0,
+                "value": 0.7,
+                "coordinate_source": "artifact",
+            }
+        ]
+        phase_records["code"]["feature_points_count"] = 1
+
+        result = _run_transform([_episode(phase_records=phase_records)])
+
+        materialization = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_SPATIAL_MATERIALIZATION
+        ][0]
+        assert materialization["record_meta"]["artifact_route"] == "feature_points"
+        assert materialization["record_meta"]["legacy_feature_points"] is True
+
+    def test_v2_caps_coordinate_provenance_rows(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"]["feature_geometry"] = [
+            {
+                "record_id": f"g{i}",
+                "geometry_kind": "point",
+                "longitude": 68.0 + i * 0.01,
+                "latitude": 50.7,
+                "depth_m": 10.0,
+                "value": 0.2,
+                "coordinate_source": "artifact",
+            }
+            for i in range(5)
+        ]
+        phase_records["code"]["feature_geometry_count"] = 5
+
+        result = ExperimentReasoningRows(max_coordinate_provenance_rows=2).transform_export_rows(
+            context=None,
+            episodes=[_episode(phase_records=phase_records)],
+        )
+
+        provenance_rows = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_COORDINATE_PROVENANCE
+        ]
+        assert len(provenance_rows) == 2
+
+    def test_fallback_coordinate_row_teaches_method_not_literal_coordinate(self) -> None:
+        phase_records = _default_phase_records()
+        phase_records["code"]["artifact_files"] = ["feature_geometry_dataframe.csv"]
+        phase_records["code"].pop("value_grid_summary", None)
+        phase_records["code"]["feature_geometry"] = [
+            {
+                "record_id": "fallback-0",
+                "geometry_kind": "point",
+                "longitude": 69.1234,
+                "latitude": 51.2345,
+                "depth_m": 10.0,
+                "value": 0.2,
+                "coordinate_source": "creative_fallback",
+            }
+        ]
+        phase_records["code"]["feature_geometry_count"] = 1
+        phase_records["translate"]["coordinate_source_counts"] = {"creative_fallback": 1}
+
+        result = _run_transform([_episode(phase_records=phase_records)])
+
+        fallback_rows = [
+            row
+            for group in result
+            for row in group.rows
+            if row["record_meta"]["pair_kind"] == PAIR_KIND_COORDINATE_PROVENANCE
+            and row["record_meta"].get("coordinate_source") == "creative_fallback"
+        ]
+        assert fallback_rows
+        target = fallback_rows[0]["raw_response"]
+        assert "No grounded coordinate source was found" in target
+        assert "69.1234" not in target
+        assert "51.2345" not in target
 
 
 # ---------------------------------------------------------------------------
@@ -593,8 +855,8 @@ class TestCuration:
         assert non_empty_episode_ids == {"ep-dup-a", "ep-dup-b"}
 
     def test_exact_duplicate_full_pairs_collapse_keeps_strongest_signal(self) -> None:
-        weak_phase = _default_phase_records(bic_delta=-0.2)
-        strong_phase = _default_phase_records(bic_delta=-2.0)
+        weak_phase = _default_phase_records(bic_delta=-2.0, candidate_predictor_lift_mean=0.1)
+        strong_phase = _default_phase_records(bic_delta=-0.2, candidate_predictor_lift_mean=0.8)
         weak = _episode(episode_id="ep-weak", phase_records=weak_phase)
         strong = _episode(episode_id="ep-strong", phase_records=strong_phase)
 
@@ -626,3 +888,33 @@ class TestCuration:
         assert {row["record_meta"]["pair_kind"] for row in capped.rows} == {
             PAIR_KIND_DATASET_HYPOTHESIS
         }
+
+    def test_recipe_hash_changes_for_v2_transform(self) -> None:
+        recipe = build_export_recipe((ExperimentReasoningRows(),))
+
+        assert recipe.transforms[0]["name"] == "ExperimentReasoningRows[v2]"
+
+    def test_export_report_counts_pair_kinds_and_artifact_routes(self, tmp_path: Path) -> None:
+        class _GenerationData:
+            generation_id = 1
+
+            def get_successful_training_row_groups(self) -> list[EpisodeTrainingRows]:
+                return [_episode(episode_id="ep-report")]
+
+        transform = ExperimentReasoningRows()
+        recipe = build_export_recipe((transform,))
+        context = TrainingDataExportContext(
+            generation_id=1,
+            run_id="run-test",
+            task_name="test-task",
+            source_generation_dir=tmp_path,
+            source_all_episodes_path=tmp_path / "all_episodes.jsonl",
+            export_recipe_hash=recipe.recipe_hash,
+        )
+
+        export = build_training_export(_GenerationData(), (transform,), context)
+
+        assert export.report["rows_by_pair_kind"][PAIR_KIND_CODE_SYNTHESIS] == 1
+        assert export.report["rows_by_artifact_route"]["value_grid"] >= 1
+        assert export.report["episodes_with_value_grid"] == 1
+        assert export.report["episodes_with_feature_geometry"] == 1

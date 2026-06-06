@@ -539,9 +539,33 @@ _STOP_WORDS: frozenset[str] = frozenset(
 )
 
 PAIR_KIND_PARENT_HYPOTHESIS = "parent_hypothesis"
+PAIR_KIND_PARENT_RELATION = "parent_relation"
 PAIR_KIND_DATASET_HYPOTHESIS = "dataset_hypothesis"
 PAIR_KIND_ANALYSIS_PLAN = "analysis_plan"
+PAIR_KIND_CODE_SYNTHESIS = "code_synthesis"
+PAIR_KIND_FEATURE_READOUT = "feature_readout"
+PAIR_KIND_SPATIAL_MATERIALIZATION = "spatial_materialization"
+PAIR_KIND_COORDINATE_PROVENANCE = "coordinate_provenance"
 PAIR_KIND_OUTCOME_NARRATIVE = "outcome_narrative"
+_SCORING_OBJECTIVE = "spatial_predictor_lift_v1"
+
+_FORBIDDEN_TELEMETRY_FIELDS: frozenset[str] = frozenset(
+    {
+        "bic_delta",
+        "bic_delta_raw",
+        "bic_delta_by_target",
+        "candidate_predictor_lift_mean",
+        "candidate_predictor_lift_by_target",
+        "admitted",
+        "admission_path",
+        "admission_threshold",
+        "masking_test_passed",
+    }
+)
+_FORBIDDEN_TELEMETRY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(field) for field in sorted(_FORBIDDEN_TELEMETRY_FIELDS)) + r")\b",
+    re.IGNORECASE,
+)
 
 
 # Parse the assigned-source section name and the pre-read sample block out of a
@@ -585,36 +609,43 @@ def _is_novel_vs_parents(hypothesis: str, parent_hypotheses: list[str]) -> bool:
 
 
 class ExperimentReasoningRows:
-    """Synthesize prompt-completion rows from successful geology episodes.
+    """Synthesize v2 prompt-completion rows from successful geology episodes.
 
     Each successful episode may produce these row kinds:
 
     - ``parent_hypothesis``: parent findings -> child hypothesis and rationale.
       Skipped when parent context is not recoverable.
+    - ``parent_relation``: one parent finding + child hypothesis -> relation.
     - ``dataset_hypothesis``: dataset context -> new hypothesis and rationale.
       Only emitted when the hypothesis has enough vocabulary not seen in parent
       hypotheses.
     - ``analysis_plan``: hypothesis and available files -> data_spec plan.
-    - ``outcome_narrative``: hypothesis and built feature -> explanatory
-      narrative. These rows are tagged ``faithfulness = "post_hoc"`` because
-      they are reconstructed after evaluation, and the harness-added BIC result
-      appendix is stripped from the completion.
+    - ``code_synthesis``: hypothesis + data_spec -> artifact-producing code.
+    - ``feature_readout``: compact artifact summary -> execution finding.
+    - ``spatial_materialization``: artifacts -> current materialization route.
+    - ``coordinate_provenance``: one geometry/provenance decision -> rationale.
+    - ``outcome_narrative``: grounded observations -> rewrite narrative.
 
-    Prompts never include the BIC delta value or admitted/not-admitted outcome.
-    Curation collapses exact prompt/completion duplicates and caps dominant
-    hypothesis families while preserving dataset-context hypothesis rows.
+    Prompts and completions never include exact scorer telemetry such as BIC,
+    predictor-lift values, or admitted/not-admitted verdicts. Curation collapses
+    exact prompt/completion duplicates, caps high-multiplier row kinds per
+    episode, and leaves the historical family cap effectively off by default.
     """
 
     def __init__(
         self,
         *,
-        max_per_family: int = 5,
+        max_per_family: int = 10**9,
+        max_parent_relation_rows: int = 2,
+        max_coordinate_provenance_rows: int = 3,
         novelty_threshold: float = 0.50,
         max_pair_chars: int = 12_000,
         dataset_dir: str = "",
         max_evidence_chars: int = 2_500,
     ) -> None:
         self._max_per_family = max_per_family
+        self._max_parent_relation_rows = max(0, int(max_parent_relation_rows))
+        self._max_coordinate_provenance_rows = max(0, int(max_coordinate_provenance_rows))
         self._novelty_threshold = novelty_threshold
         self._max_pair_chars = max_pair_chars
         # Optional host dataset root (maps /workspace/input/X -> dataset_dir/X)
@@ -632,7 +663,7 @@ class ExperimentReasoningRows:
 
     @property
     def name(self) -> str:
-        return "ExperimentReasoningRows[v1]"
+        return "ExperimentReasoningRows[v2]"
 
     def config(self) -> dict[str, Any]:
         # dataset_dir is deliberately excluded: it is an environment detail, not
@@ -640,9 +671,12 @@ class ExperimentReasoningRows:
         # machine-specific (breaking the resume/export-recipe-hash guard).
         return {
             "max_per_family": self._max_per_family,
+            "max_parent_relation_rows": self._max_parent_relation_rows,
+            "max_coordinate_provenance_rows": self._max_coordinate_provenance_rows,
             "novelty_threshold": self._novelty_threshold,
             "max_pair_chars": self._max_pair_chars,
             "max_evidence_chars": self._max_evidence_chars,
+            "scoring_objective": _SCORING_OBJECTIVE,
         }
 
     def transform_export_rows(
@@ -653,17 +687,17 @@ class ExperimentReasoningRows:
         from src.training_data.transforms import EpisodeTrainingRows
 
         source_payloads = self._load_source_episode_payloads(context)
-        raw: list[tuple[EpisodeTrainingRows, list[dict[str, Any]], float | None]] = []
+        raw: list[tuple[EpisodeTrainingRows, list[dict[str, Any]], tuple[float, float, float]]] = []
 
         for episode in episodes:
             source_payload = source_payloads.get(getattr(episode, "episode_id", ""), {})
             record = self._backfill_record(episode, source_payload)
             if not record.get("training_success", True):
-                raw.append((episode, [], None))
+                raw.append((episode, [], self._dedup_strength(record, episode)))
                 continue
 
             rows = self._synthesize_rows(episode, record)
-            raw.append((episode, rows, record.get("bic_delta")))
+            raw.append((episode, rows, self._dedup_strength(record, episode)))
 
         # Curate rows by exact pair de-duplication and family balance.
         curated = self._curate(raw)
@@ -671,7 +705,7 @@ class ExperimentReasoningRows:
         # Preserve empty groups for failed episodes so the caller sees the same
         # episode count.
         out: list[EpisodeTrainingRows] = []
-        for episode, rows, _bic in curated:
+        for episode, rows, _strength in curated:
             out.append(
                 EpisodeTrainingRows(
                     episode_id=episode.episode_id,
@@ -810,11 +844,21 @@ class ExperimentReasoningRows:
             crossbreed_context,
         )
         parent_hypotheses = self._parent_hypotheses(hypothesise, parent_context)
+        parent_records = self._parent_records(
+            hypothesise,
+            parent_context,
+            self._string_list(parent_ids),
+        )
         bic_delta, outcome_source = self._first_float_with_source(
             (evaluate.get("bic_delta"), "phase_records"),
             (outcome.get("bic_delta"), "graph_node"),
             (task_breakdown.get("bic_delta"), "task_breakdown"),
             (meta_record.get("bic_delta"), "record_meta"),
+        )
+        candidate_lift, candidate_lift_source = self._first_float_with_source(
+            (evaluate.get("candidate_predictor_lift_mean"), "phase_records"),
+            (task_breakdown.get("candidate_predictor_lift_mean"), "task_breakdown"),
+            (meta_record.get("candidate_predictor_lift_mean"), "record_meta"),
         )
 
         narrative, narrative_source = self._first_text_with_source(
@@ -858,6 +902,15 @@ class ExperimentReasoningRows:
             if isinstance(analysis_value, str):
                 observation = analysis_value.strip()
 
+        geometry_summary = self._geometry_summary(code, translate)
+        value_grid_summary = self._value_grid_summary(code)
+        artifact_route = self._select_artifact_route(
+            geometry_summary,
+            value_grid_summary,
+            translate,
+        )
+        scoring_meta = self._scoring_metadata(evaluate, task_breakdown, bic_delta, candidate_lift)
+
         return {
             "training_success": bool(episode_context.get("success", True)),
             "duplicate_rejected": bool(episode_context.get("duplicate_rejected", False)),
@@ -866,11 +919,18 @@ class ExperimentReasoningRows:
             "parent_ids": parent_ids,
             "parent_context": parent_context,
             "parent_hypotheses": parent_hypotheses,
+            "parent_records": parent_records,
             "survey_context": survey_context,
             "assigned_section": assigned_section,
             "source_evidence": source_evidence,
             "observation": observation,
             "hypothesise_response": self._row_text(hypothesise_row, "raw_response"),
+            "code_executed": str(code.get("code_executed") or "").strip(),
+            "artifact_files": code.get("artifact_files") if isinstance(code.get("artifact_files"), list) else [],
+            "artifact_route": artifact_route,
+            "geometry_summary": geometry_summary,
+            "value_grid_summary": value_grid_summary,
+            "translate_summary": self._translate_summary(translate),
             "feature_layer_name": str(
                 translate.get("feature_layer_name")
                 or graph_node.get("feature_layer_name")
@@ -882,6 +942,8 @@ class ExperimentReasoningRows:
                 or ""
             ).strip(),
             "bic_delta": bic_delta,
+            "candidate_predictor_lift_mean": candidate_lift,
+            "scoring_metadata": scoring_meta,
             "narrative": narrative_clean,
             "outcome_appended": outcome_appended,
             "source_rows": {
@@ -896,6 +958,7 @@ class ExperimentReasoningRows:
                 "parents": parents_source,
                 "outcome": outcome_source,
                 "narrative": narrative_source,
+                "candidate_predictor_lift_mean": candidate_lift_source,
             },
         }
 
@@ -966,60 +1029,207 @@ class ExperimentReasoningRows:
     @classmethod
     def _phase_records_from_tool_outputs(cls, rows: list[dict[str, Any]]) -> dict[str, Any]:
         phase_records: dict[str, Any] = {}
+        seen_calls: set[str] = set()
         for row in rows:
             prompt = cls._row_text(row, "prompt")
             if "[tool]" not in prompt:
+                for call in cls._iter_assistant_tool_calls(prompt):
+                    cls._ingest_assistant_tool_call(phase_records, call, seen_calls)
                 continue
+            for call in cls._iter_assistant_tool_calls(prompt):
+                cls._ingest_assistant_tool_call(phase_records, call, seen_calls)
             for output in cls._iter_tool_outputs(prompt):
-                if any(
-                    key in output
+                cls._ingest_tool_output(phase_records, output)
+        return phase_records
+
+    @classmethod
+    def _ingest_tool_output(
+        cls,
+        phase_records: dict[str, Any],
+        output: dict[str, Any],
+    ) -> None:
+        if any(
+            key in output
+            for key in (
+                "hypothesis",
+                "data_spec",
+                "parent_experiments",
+                "source_excerpt",
+            )
+        ):
+            phase_records.setdefault("hypothesise", {}).update(
+                {
+                    key: output[key]
                     for key in (
                         "hypothesis",
                         "data_spec",
                         "parent_experiments",
+                        "parent_context",
                         "source_excerpt",
+                        "assigned_section",
+                        "evidence_tier",
+                        "self_assessment",
                     )
-                ):
-                    phase_records.setdefault("hypothesise", {}).update(
-                        {
-                            key: output[key]
-                            for key in (
-                                "hypothesis",
-                                "data_spec",
-                                "parent_experiments",
-                                "source_excerpt",
-                                "assigned_section",
-                            )
-                            if key in output
-                        }
+                    if key in output
+                }
+            )
+        if any(
+            key in output
+            for key in (
+                "code_executed",
+                "result_summary",
+                "artifact_files",
+                "feature_geometry",
+                "feature_points",
+            )
+        ):
+            phase_records.setdefault("code", {}).update(
+                {
+                    key: output[key]
+                    for key in (
+                        "code_executed",
+                        "code_executed_truncated",
+                        "result_summary",
+                        "result_summary_truncated",
+                        "artifact_directory",
+                        "artifact_files",
+                        "artifact_count",
+                        "feature_geometry",
+                        "feature_geometry_count",
+                        "feature_geometry_truncated",
+                        "feature_points",
+                        "feature_points_count",
+                        "feature_points_truncated",
+                        "value_grid_summary",
                     )
-                if any(key in output for key in ("code_executed", "result_summary", "artifact_files")):
-                    phase_records.setdefault("code", {}).update(
-                        {
-                            key: output[key]
-                            for key in (
-                                "code_executed",
-                                "result_summary",
-                                "artifact_directory",
-                                "artifact_files",
-                            )
-                            if key in output
-                        }
-                    )
-                feature_layer_name = output.get("feature_layer_name")
-                if isinstance(feature_layer_name, str) and feature_layer_name.strip():
-                    phase_records.setdefault("translate", {})["feature_layer_name"] = (
-                        feature_layer_name.strip()
-                    )
-                if any(key in output for key in ("bic_delta", "admitted", "mutual_info")):
-                    phase_records.setdefault("evaluate", {}).update(
-                        {
-                            key: output[key]
-                            for key in ("bic_delta", "admitted", "mutual_info")
-                            if key in output
-                        }
-                    )
-        return phase_records
+                    if key in output
+                }
+            )
+        feature_layer_name = output.get("feature_layer_name") or output.get("layer_name")
+        if isinstance(feature_layer_name, str) and feature_layer_name.strip():
+            phase_records.setdefault("translate", {})["feature_layer_name"] = (
+                feature_layer_name.strip()
+            )
+        if any(
+            key in output
+            for key in (
+                "coordinate_source_counts",
+                "geometry_kind_counts",
+                "records_applied",
+                "records_seen",
+                "records_skipped",
+                "operation",
+            )
+        ):
+            translate = phase_records.setdefault("translate", {})
+            for key in (
+                "coordinate_source_counts",
+                "geometry_kind_counts",
+                "records_applied",
+                "records_seen",
+                "records_skipped",
+                "affected_voxels",
+                "operation",
+                "value_min",
+                "value_max",
+            ):
+                if key in output:
+                    translate[key] = output[key]
+            result_summary = {
+                key: output[key]
+                for key in (
+                    "operation",
+                    "layer_name",
+                    "coordinate_source_counts",
+                    "geometry_kind_counts",
+                    "records_applied",
+                    "records_seen",
+                    "records_skipped",
+                )
+                if key in output
+            }
+            if result_summary:
+                translate.setdefault("spatial_results", []).append(result_summary)
+        if any(key in output for key in _FORBIDDEN_TELEMETRY_FIELDS | {"mutual_info", "validity_passed"}):
+            evaluate = phase_records.setdefault("evaluate", {})
+            for key, value in output.items():
+                if key in _FORBIDDEN_TELEMETRY_FIELDS or key in {
+                    "mutual_info",
+                    "validity_passed",
+                    "self_relative_mae",
+                    "masking_test_improvement",
+                    "candidate_fill_fraction",
+                    "candidate_nonzero_voxels",
+                }:
+                    evaluate[key] = value
+
+    @classmethod
+    def _ingest_assistant_tool_call(
+        cls,
+        phase_records: dict[str, Any],
+        call: dict[str, Any],
+        seen_calls: set[str],
+    ) -> None:
+        name = str(call.get("name") or "").removeprefix("capabilities__")
+        args = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+        if not name:
+            return
+        key = json.dumps({"name": name, "arguments": args}, sort_keys=True, default=str)
+        if key in seen_calls:
+            return
+        seen_calls.add(key)
+        if name == "execution_submit":
+            code = args.get("code")
+            if isinstance(code, str) and code.strip():
+                phase_records.setdefault("code", {}).setdefault("code_executed", code.strip())
+        if name.startswith("spatial_") or name == "scoring_create_feature_layer":
+            phase_records.setdefault("translate", {}).setdefault("spatial_tool_calls", []).append(
+                {"name": name, "arguments": args}
+            )
+        if name.startswith("search_"):
+            phase_records.setdefault("translate", {}).setdefault("coordinate_searches", []).append(
+                {"name": name, "arguments": args}
+            )
+
+    @staticmethod
+    def _iter_transcript_blocks(text: str) -> Iterator[tuple[str, str]]:
+        parts = re.split(r"(?m)^\[(\w+)\]\s*$", text or "")
+        iterator = iter(parts[1:])
+        for role, body in zip(iterator, iterator):
+            yield role.strip().lower(), body.strip()
+
+    @classmethod
+    def _iter_assistant_tool_calls(cls, text: str) -> Iterator[dict[str, Any]]:
+        for role, body in cls._iter_transcript_blocks(text):
+            if role != "assistant" or not body.startswith("["):
+                continue
+            try:
+                payload = json.loads(body)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, list):
+                continue
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                function = item.get("function")
+                if not isinstance(function, dict):
+                    continue
+                name = function.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                arguments = function.get("arguments")
+                parsed_args: dict[str, Any] = {}
+                if isinstance(arguments, str) and arguments.strip():
+                    try:
+                        maybe_args = json.loads(arguments)
+                    except (TypeError, ValueError):
+                        maybe_args = {}
+                    if isinstance(maybe_args, dict):
+                        parsed_args = maybe_args
+                elif isinstance(arguments, dict):
+                    parsed_args = arguments
+                yield {"name": name, "arguments": parsed_args}
 
     @staticmethod
     def _iter_tool_outputs(text: str) -> Iterator[dict[str, Any]]:
@@ -1140,6 +1350,47 @@ class ExperimentReasoningRows:
         return [item.strip() for item in quoted if item.strip()]
 
     @staticmethod
+    def _parent_records(
+        hypothesise: dict[str, Any],
+        parent_context: str,
+        parent_ids: list[str],
+    ) -> list[dict[str, str]]:
+        parent_records = hypothesise.get("parent_context")
+        if isinstance(parent_records, list) and parent_records:
+            out: list[dict[str, str]] = []
+            for index, item in enumerate(parent_records):
+                if not isinstance(item, dict):
+                    continue
+                hypothesis = str(item.get("hypothesis") or "").strip()
+                finding = str(
+                    item.get("finding") or item.get("response") or item.get("result") or ""
+                ).strip()
+                if not hypothesis and not finding:
+                    continue
+                out.append(
+                    {
+                        "parent_id": parent_ids[index] if index < len(parent_ids) else f"parent-{index + 1}",
+                        "hypothesis": hypothesis,
+                        "finding": finding,
+                    }
+                )
+            if out:
+                return out
+
+        quoted = re.findall(r"Experiment\s+(\d+):\s*\"(.+?)\"", parent_context)
+        if quoted:
+            return [
+                {
+                    "parent_id": parent_ids[index] if index < len(parent_ids) else f"experiment-{number}",
+                    "hypothesis": hypothesis.strip(),
+                    "finding": "",
+                }
+                for index, (number, hypothesis) in enumerate(quoted)
+                if hypothesis.strip()
+            ]
+        return []
+
+    @staticmethod
     def _strip_outcome_appendix(text: str) -> tuple[str, bool]:
         if not text:
             return "", False
@@ -1149,6 +1400,12 @@ class ExperimentReasoningRows:
     @staticmethod
     def _sanitize_prompt_context(text: str, child_hypothesis: str = "") -> str:
         cleaned = _BIC_RESULT_RE.sub("", text)
+        cleaned = re.sub(
+            r"^.*" + _FORBIDDEN_TELEMETRY_RE.pattern + r".*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
         cleaned = re.sub(
             r"^.*\bBIC (?:delta|improvement)\b.*$",
             "",
@@ -1168,6 +1425,24 @@ class ExperimentReasoningRows:
         return cleaned
 
     @staticmethod
+    def _sanitize_completion_text(text: str) -> str:
+        cleaned, _ = ExperimentReasoningRows._strip_outcome_appendix(text)
+        cleaned = re.sub(
+            r"^.*" + _FORBIDDEN_TELEMETRY_RE.pattern + r".*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        cleaned = re.sub(
+            r"^.*\bBIC (?:delta|improvement)\b.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+        cleaned = re.sub(r"\bnot admitted\b|\badmitted\b", "", cleaned, flags=re.IGNORECASE)
+        return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    @staticmethod
     def _survey_context(survey_row: dict[str, Any]) -> str:
         prompt = ExperimentReasoningRows._row_text(survey_row, "prompt")
         response = ExperimentReasoningRows._row_text(survey_row, "raw_response")
@@ -1177,6 +1452,342 @@ class ExperimentReasoningRows:
             return f"{prompt}\n\nSurvey notes:\n{response}"
         return prompt or response or _DATASET_OVERVIEW
 
+    def _geometry_summary(
+        self,
+        code: dict[str, Any],
+        translate: dict[str, Any],
+    ) -> dict[str, Any]:
+        records: list[dict[str, Any]] = []
+        count = 0
+        truncated = False
+        route = "none"
+        legacy = False
+
+        feature_geometry = code.get("feature_geometry")
+        if isinstance(feature_geometry, list) and feature_geometry:
+            route = "feature_geometry"
+            records = [item for item in feature_geometry if isinstance(item, dict)]
+            count = self._safe_int(code.get("feature_geometry_count"), len(records))
+            truncated = bool(code.get("feature_geometry_truncated", False))
+        else:
+            feature_points = code.get("feature_points")
+            if isinstance(feature_points, list) and feature_points:
+                route = "feature_points"
+                legacy = True
+                records = [
+                    {"geometry_kind": "point", **item}
+                    for item in feature_points
+                    if isinstance(item, dict)
+                ]
+                count = self._safe_int(code.get("feature_points_count"), len(records))
+                truncated = bool(code.get("feature_points_truncated", False))
+
+        if not records and route == "none":
+            artifact_files = code.get("artifact_files") if isinstance(code.get("artifact_files"), list) else []
+            artifact_directory = str(code.get("artifact_directory") or "")
+            try:
+                task_cls = globals().get("FeatureHypothesisKazakhstanTask")
+                if task_cls is not None:
+                    loaded, loaded_truncated, loaded_count, path = task_cls._load_geometry_records(
+                        artifact_files,
+                        artifact_directory,
+                        max_records=max(10, self._max_coordinate_provenance_rows),
+                    )
+                    if loaded or loaded_count:
+                        records = loaded
+                        count = loaded_count or len(loaded)
+                        truncated = loaded_truncated
+                        basename = Path(path).name if path else ""
+                        legacy = basename in {"feature_points.csv", "feature_points_dataframe.csv"}
+                        route = "feature_points" if legacy else "feature_geometry"
+            except Exception:
+                pass
+
+        if route == "none":
+            artifact_files = [Path(str(item)).name for item in code.get("artifact_files", []) or []]
+            if any(re.fullmatch(r"feature_geometry(_dataframe)?\.csv", name) for name in artifact_files):
+                route = "feature_geometry"
+            elif any(re.fullmatch(r"feature_points(_dataframe)?\.csv", name) for name in artifact_files):
+                route = "feature_points"
+                legacy = True
+
+        sample_records = [self._compact_geometry_record(record) for record in records[:5]]
+        geometry_kind_counts: dict[str, int] = {}
+        coordinate_source_counts: dict[str, int] = {}
+        values: list[float] = []
+        for record in records:
+            kind = str(record.get("geometry_kind") or ("point" if legacy else "unknown")).strip() or "unknown"
+            source = str(record.get("coordinate_source") or "unknown").strip() or "unknown"
+            geometry_kind_counts[kind] = geometry_kind_counts.get(kind, 0) + 1
+            coordinate_source_counts[source] = coordinate_source_counts.get(source, 0) + 1
+            value = self._safe_float(record.get("value"))
+            if value is not None and math.isfinite(value):
+                values.append(value)
+
+        if not geometry_kind_counts and isinstance(translate.get("geometry_kind_counts"), dict):
+            geometry_kind_counts = {
+                str(key): self._safe_int(value, 0)
+                for key, value in translate.get("geometry_kind_counts", {}).items()
+            }
+        if not coordinate_source_counts and isinstance(translate.get("coordinate_source_counts"), dict):
+            coordinate_source_counts = {
+                str(key): self._safe_int(value, 0)
+                for key, value in translate.get("coordinate_source_counts", {}).items()
+            }
+        if count == 0:
+            count = sum(geometry_kind_counts.values()) or sum(coordinate_source_counts.values())
+
+        summary: dict[str, Any] = {
+            "route": route,
+            "legacy_feature_points": legacy,
+            "count": count,
+            "truncated": truncated,
+            "geometry_kind_counts": geometry_kind_counts,
+            "coordinate_source_counts": coordinate_source_counts,
+            "sample_records": sample_records,
+        }
+        if values:
+            summary["value_stats"] = {
+                "min": min(values),
+                "max": max(values),
+                "mean": sum(values) / len(values),
+            }
+        return summary
+
+    def _value_grid_summary(self, code: dict[str, Any]) -> dict[str, Any]:
+        existing = code.get("value_grid_summary")
+        if isinstance(existing, dict) and existing:
+            summary = dict(existing)
+            summary.setdefault("present", True)
+            return self._json_safe_summary(summary)
+
+        artifact_files = code.get("artifact_files") if isinstance(code.get("artifact_files"), list) else []
+        artifact_directory = str(code.get("artifact_directory") or "")
+        names = [Path(str(item)).name for item in artifact_files]
+        value_grid_names = [
+            name
+            for name in names
+            if name in {"value_grid.npy", "value_grid_array.npy"}
+            or re.fullmatch(r"value_grid.*\.npy", name)
+        ]
+        if not value_grid_names:
+            return {"present": False}
+
+        path: Path | None = None
+        for item in artifact_files:
+            candidate = Path(str(item))
+            if candidate.name not in value_grid_names:
+                continue
+            if candidate.is_file():
+                path = candidate
+                break
+            if artifact_directory:
+                joined = Path(artifact_directory) / candidate.name
+                if joined.is_file():
+                    path = joined
+                    break
+
+        summary: dict[str, Any] = {
+            "present": True,
+            "artifact_name": value_grid_names[0],
+            "path_available": path is not None,
+        }
+        if path is None:
+            return summary
+
+        try:
+            import numpy as np
+
+            arr = np.load(path, allow_pickle=False)
+            finite = arr[np.isfinite(arr)]
+            summary.update(
+                {
+                    "shape": list(arr.shape),
+                    "dtype": str(arr.dtype),
+                    "nonzero_count": int(np.count_nonzero(arr)),
+                    "fill_fraction": float(np.count_nonzero(arr) / arr.size) if arr.size else 0.0,
+                }
+            )
+            if finite.size:
+                quantiles = np.quantile(finite, [0.25, 0.5, 0.75])
+                unique = np.unique(finite)
+                summary.update(
+                    {
+                        "min": float(np.min(finite)),
+                        "max": float(np.max(finite)),
+                        "mean": float(np.mean(finite)),
+                        "std": float(np.std(finite)),
+                        "quantiles": [float(item) for item in quantiles],
+                        "binary_like": bool(
+                            unique.size <= 3 and set(float(item) for item in unique).issubset({0.0, 1.0})
+                        ),
+                        "degenerate": bool(np.min(finite) == np.max(finite)),
+                    }
+                )
+            else:
+                summary["degenerate"] = True
+        except Exception:
+            summary["load_error"] = True
+        return self._json_safe_summary(summary)
+
+    @staticmethod
+    def _select_artifact_route(
+        geometry_summary: dict[str, Any],
+        value_grid_summary: dict[str, Any],
+        translate: dict[str, Any],
+    ) -> str:
+        if value_grid_summary.get("present") and not value_grid_summary.get("degenerate", False):
+            return "value_grid"
+        route = str(geometry_summary.get("route") or "none")
+        if route in {"feature_geometry", "feature_points"}:
+            return route
+        if translate.get("spatial_tool_calls") or translate.get("coordinate_source_counts"):
+            return "manual_ops"
+        return "none"
+
+    @staticmethod
+    def _translate_summary(translate: dict[str, Any]) -> dict[str, Any]:
+        summary: dict[str, Any] = {}
+        for key in (
+            "feature_layer_name",
+            "coordinate_source_counts",
+            "geometry_kind_counts",
+            "bulk_geometry_records",
+            "bulk_geometry_skipped",
+            "records_applied",
+            "records_seen",
+            "records_skipped",
+            "operation",
+        ):
+            if key in translate:
+                summary[key] = translate[key]
+        if translate.get("spatial_tool_calls"):
+            calls = translate.get("spatial_tool_calls")
+            if isinstance(calls, list):
+                summary["spatial_tool_calls"] = calls[:5]
+        return summary
+
+    @staticmethod
+    def _scoring_metadata(
+        evaluate: dict[str, Any],
+        task_breakdown: dict[str, Any],
+        bic_delta: float | None,
+        candidate_lift: float | None,
+    ) -> dict[str, Any]:
+        meta: dict[str, Any] = {"scoring_objective": _SCORING_OBJECTIVE}
+        for source in (task_breakdown, evaluate):
+            if not isinstance(source, dict):
+                continue
+            for key in (
+                "candidate_predictor_lift_mean",
+                "candidate_predictor_lift_by_target",
+                "bic_delta",
+                "bic_delta_by_target",
+                "admitted",
+                "admission_path",
+                "admission_threshold",
+                "masking_test_passed",
+                "validity_passed",
+                "self_relative_mae",
+            ):
+                if key in source:
+                    meta[key] = source[key]
+        if bic_delta is not None:
+            meta.setdefault("bic_delta", bic_delta)
+        if candidate_lift is not None:
+            meta.setdefault("candidate_predictor_lift_mean", candidate_lift)
+        return meta
+
+    @staticmethod
+    def _compact_geometry_record(record: dict[str, Any]) -> dict[str, Any]:
+        keep = (
+            "record_id",
+            "geometry_kind",
+            "longitude",
+            "latitude",
+            "depth_m",
+            "start_longitude",
+            "start_latitude",
+            "end_longitude",
+            "end_latitude",
+            "lon_min",
+            "lat_min",
+            "lon_max",
+            "lat_max",
+            "value",
+            "coordinate_source",
+            "source_file",
+            "source_excerpt",
+        )
+        out: dict[str, Any] = {}
+        for key in keep:
+            if key not in record:
+                continue
+            value = record[key]
+            if isinstance(value, str):
+                value = value.strip()
+                if len(value) > 180:
+                    value = value[:180].rstrip() + " ..."
+            out[key] = value
+        return out
+
+    @staticmethod
+    def _json_safe_summary(summary: dict[str, Any]) -> dict[str, Any]:
+        return _to_jsonable(summary)
+
+    @staticmethod
+    def _safe_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _artifact_summary_text(
+        self,
+        geometry_summary: dict[str, Any],
+        value_grid_summary: dict[str, Any],
+    ) -> str:
+        lines: list[str] = []
+        if value_grid_summary.get("present"):
+            details = {
+                key: value_grid_summary[key]
+                for key in (
+                    "artifact_name",
+                    "shape",
+                    "dtype",
+                    "nonzero_count",
+                    "fill_fraction",
+                    "min",
+                    "max",
+                    "mean",
+                    "std",
+                    "binary_like",
+                    "path_available",
+                )
+                if key in value_grid_summary
+            }
+            lines.append("value_grid summary: " + json.dumps(details, sort_keys=True, default=str))
+        route = str(geometry_summary.get("route") or "none")
+        if route != "none" or geometry_summary.get("count"):
+            details = {
+                "route": route,
+                "count": geometry_summary.get("count", 0),
+                "legacy_feature_points": bool(geometry_summary.get("legacy_feature_points")),
+                "geometry_kind_counts": geometry_summary.get("geometry_kind_counts", {}),
+                "coordinate_source_counts": geometry_summary.get("coordinate_source_counts", {}),
+                "value_stats": geometry_summary.get("value_stats", {}),
+                "sample_records": geometry_summary.get("sample_records", [])[:3],
+            }
+            lines.append("geometry artifact summary: " + json.dumps(details, sort_keys=True, default=str))
+        return "\n".join(lines) if lines else "No compact spatial artifact summary was recovered."
+
     def _synthesize_rows(self, episode: Any, record: dict[str, Any]) -> list[dict[str, Any]]:
         hypothesis = str(record.get("hypothesis") or "").strip()
         if not hypothesis:
@@ -1184,6 +1795,7 @@ class ExperimentReasoningRows:
         rows: list[dict[str, Any]] = []
         provenance = dict(record.get("provenance") or {})
         source_rows = dict(record.get("source_rows") or {})
+        artifact_meta = self._artifact_meta(record)
         hypothesise_response = str(record.get("hypothesise_response") or "").strip()
         hypothesis_target = hypothesise_response if hypothesis in hypothesise_response else f"Hypothesis: {hypothesis}"
 
@@ -1204,7 +1816,41 @@ class ExperimentReasoningRows:
                     pair_kind=PAIR_KIND_PARENT_HYPOTHESIS,
                     hypothesis=hypothesis,
                     provenance=provenance,
-                    extra_meta={"parent_ids": record.get("parent_ids", [])},
+                    extra_meta={"parent_ids": record.get("parent_ids", []), **artifact_meta},
+                )
+            )
+
+        parent_records = [
+            item for item in record.get("parent_records", []) if isinstance(item, dict)
+        ]
+        for index, parent in enumerate(parent_records[: self._max_parent_relation_rows]):
+            parent_id = str(parent.get("parent_id") or f"parent-{index + 1}")
+            parent_hypothesis = str(parent.get("hypothesis") or "").strip()
+            finding = str(parent.get("finding") or "").strip()
+            parent_lines = [f"Parent hypothesis: {parent_hypothesis or parent_id}"]
+            if finding:
+                parent_lines.append(f"Parent finding: {finding}")
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("hypothesise", {}),
+                    row_suffix=f"{PAIR_KIND_PARENT_RELATION}:{index}",
+                    prompt=(
+                        "Prior experiment evidence:\n"
+                        + "\n".join(parent_lines)
+                        + f"\n\nChild hypothesis: {hypothesis}\n\n"
+                        "Task: State the specific relation the child hypothesis draws "
+                        "from this parent."
+                    ),
+                    raw_response=self._parent_relation_target(parent, hypothesis),
+                    pair_kind=PAIR_KIND_PARENT_RELATION,
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={
+                        "parent_id": parent_id,
+                        "parent_relation_index": index,
+                        **artifact_meta,
+                    },
                 )
             )
 
@@ -1240,6 +1886,7 @@ class ExperimentReasoningRows:
                     extra_meta={
                         "novelty_routed": True,
                         "evidence_on_query": bool(evidence),
+                        **artifact_meta,
                     },
                 )
             )
@@ -1280,12 +1927,80 @@ class ExperimentReasoningRows:
                         pair_kind=PAIR_KIND_ANALYSIS_PLAN,
                         hypothesis=hypothesis,
                         provenance=provenance,
-                        extra_meta={"observation_on_query": bool(observation)},
+                        extra_meta={"observation_on_query": bool(observation), **artifact_meta},
                     )
                 )
 
+        code_executed = str(record.get("code_executed") or "").strip()
+        if code_executed:
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("hypothesise", {}),
+                    row_suffix=PAIR_KIND_CODE_SYNTHESIS,
+                    prompt=self._code_synthesis_prompt(hypothesis, record),
+                    raw_response=code_executed,
+                    pair_kind=PAIR_KIND_CODE_SYNTHESIS,
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta=artifact_meta,
+                )
+            )
+
+        result_summary = self._sanitize_completion_text(str(record.get("result_summary") or ""))
+        if result_summary:
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("code", {}),
+                    row_suffix=PAIR_KIND_FEATURE_READOUT,
+                    prompt=self._feature_readout_prompt(hypothesis, record),
+                    raw_response=result_summary,
+                    pair_kind=PAIR_KIND_FEATURE_READOUT,
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta=artifact_meta,
+                )
+            )
+
+        materialization_target = self._materialization_plan(record)
+        if materialization_target:
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("translate", {}),
+                    row_suffix=PAIR_KIND_SPATIAL_MATERIALIZATION,
+                    prompt=self._spatial_materialization_prompt(hypothesis, record),
+                    raw_response=materialization_target,
+                    pair_kind=PAIR_KIND_SPATIAL_MATERIALIZATION,
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta=artifact_meta,
+                )
+            )
+
+        for index, item in enumerate(self._coordinate_provenance_items(record)):
+            rows.append(
+                self._make_row(
+                    episode=episode,
+                    source_row=source_rows.get("translate", {}),
+                    row_suffix=f"{PAIR_KIND_COORDINATE_PROVENANCE}:{index}",
+                    prompt=self._coordinate_provenance_prompt(hypothesis, item),
+                    raw_response=self._coordinate_provenance_target(item),
+                    pair_kind=PAIR_KIND_COORDINATE_PROVENANCE,
+                    hypothesis=hypothesis,
+                    provenance=provenance,
+                    extra_meta={
+                        **artifact_meta,
+                        "coordinate_source": item.get("coordinate_source", "unknown"),
+                        "provenance_index": index,
+                        "fallback_method_framed": item.get("coordinate_source") == "creative_fallback",
+                    },
+                )
+            )
+
         narrative = str(record.get("narrative") or "").strip()
-        if narrative:
+        if narrative and result_summary:
             feature = str(record.get("feature_layer_name") or "").strip()
             rows.append(
                 self._make_row(
@@ -1295,8 +2010,14 @@ class ExperimentReasoningRows:
                     prompt=(
                         f"Hypothesis: {hypothesis}\n\n"
                         + (f"Feature built: {feature}\n\n" if feature else "")
-                        + "Task: Interpret whether the experiment was informative for "
-                        "geological model compression. Do not cite any BIC number."
+                        + f"Execution observations:\n{result_summary}\n\n"
+                        + self._artifact_summary_text(
+                            dict(record.get("geometry_summary") or {}),
+                            dict(record.get("value_grid_summary") or {}),
+                        )
+                        + "\n\nScoring objective: spatial_predictor_lift_v1.\n"
+                        "Task: Write the grounded experiment narrative without exact score "
+                        "numbers or verdict labels."
                     ),
                     raw_response=narrative,
                     pair_kind=PAIR_KIND_OUTCOME_NARRATIVE,
@@ -1306,10 +2027,190 @@ class ExperimentReasoningRows:
                         "faithfulness": "post_hoc",
                         "outcome_appended": False,
                         "stripped_outcome_appendix": bool(record.get("outcome_appended")),
+                        **artifact_meta,
                     },
                 )
             )
         return [row for row in rows if len(row["prompt"]) + len(row["raw_response"]) <= self._max_pair_chars]
+
+    def _artifact_meta(self, record: dict[str, Any]) -> dict[str, Any]:
+        geometry_summary = dict(record.get("geometry_summary") or {})
+        value_grid_summary = dict(record.get("value_grid_summary") or {})
+        route = str(record.get("artifact_route") or "none")
+        return {
+            "scoring_objective": _SCORING_OBJECTIVE,
+            "artifact_route": route,
+            "legacy_feature_points": bool(geometry_summary.get("legacy_feature_points")),
+            "geometry_kind_counts": geometry_summary.get("geometry_kind_counts", {}),
+            "coordinate_source_counts": geometry_summary.get("coordinate_source_counts", {}),
+            "value_grid_summary": value_grid_summary if value_grid_summary.get("present") else {},
+            "has_value_grid": bool(value_grid_summary.get("present")),
+            "has_feature_geometry": str(geometry_summary.get("route") or "") == "feature_geometry",
+            "scoring_metadata": record.get("scoring_metadata", {}),
+        }
+
+    @staticmethod
+    def _parent_relation_target(parent: dict[str, Any], child_hypothesis: str) -> str:
+        parent_hypothesis = str(parent.get("hypothesis") or "the parent experiment").strip()
+        finding = str(parent.get("finding") or "").strip()
+        relation = "extends"
+        if finding and any(word in finding.lower() for word in ("contrast", "boundary", "contact")):
+            relation = "localizes"
+        return (
+            f"Relation: The child hypothesis {relation} the parent finding.\n"
+            f"Parent basis: {finding or parent_hypothesis}\n"
+            f"Child use: {child_hypothesis}"
+        )
+
+    def _code_synthesis_prompt(self, hypothesis: str, record: dict[str, Any]) -> str:
+        data_spec = record.get("data_spec") if isinstance(record.get("data_spec"), dict) else {}
+        files = self._data_spec_files(data_spec)
+        parts = [
+            f"Hypothesis: {hypothesis}",
+            "Data specification:\n" + self._format_data_spec_target(data_spec),
+            "Available files: " + (", ".join(files) if files else "see data specification"),
+            "Artifact contract: produce `feature_geometry` for mixed point/line/box records "
+            "and/or `value_grid` with shape (200, 200, 8) for continuous fields. Preserve "
+            "meaningful values rather than flat presence masks.",
+            "Task: Write analysis code that tests the hypothesis and leaves the spatial "
+            "artifact(s) for Translate.",
+        ]
+        return "\n\n".join(parts)
+
+    def _feature_readout_prompt(self, hypothesis: str, record: dict[str, Any]) -> str:
+        return (
+            f"Hypothesis: {hypothesis}\n\n"
+            + self._artifact_summary_text(
+                dict(record.get("geometry_summary") or {}),
+                dict(record.get("value_grid_summary") or {}),
+            )
+            + "\n\nTask: Summarize what the executed analysis found from these artifacts."
+        )
+
+    def _spatial_materialization_prompt(self, hypothesis: str, record: dict[str, Any]) -> str:
+        return (
+            f"Hypothesis: {hypothesis}\n\n"
+            + self._artifact_summary_text(
+                dict(record.get("geometry_summary") or {}),
+                dict(record.get("value_grid_summary") or {}),
+            )
+            + "\n\nTranslate constraints: prefer `spatial_set_layer_array` for valid "
+            "continuous value grids; otherwise use `spatial_upsert_geometry_batch` for "
+            "feature_geometry or legacy feature_points; finish with `scoring_create_feature_layer`.\n"
+            "Task: Choose the materialization route and state the normalized tool plan."
+        )
+
+    def _materialization_plan(self, record: dict[str, Any]) -> str:
+        route = str(record.get("artifact_route") or "none")
+        feature = str(record.get("feature_layer_name") or self._data_spec_target_feature(record.get("data_spec") or {}) or "candidate_layer")
+        if route == "value_grid":
+            return (
+                "Materialization plan:\n"
+                f"1. Call spatial_set_layer_array(name='{feature}', array_artifact='value_grid') to deposit the full continuous field.\n"
+                f"2. Call scoring_create_feature_layer(name='{feature}') after the array layer is present.\n"
+                "Rationale: the code produced a value_grid, so the array route preserves gradients and magnitudes."
+            )
+        if route in {"feature_geometry", "feature_points"}:
+            legacy = " legacy point-only" if route == "feature_points" else " mixed-geometry"
+            return (
+                "Materialization plan:\n"
+                f"1. Call spatial_upsert_geometry_batch(name='{feature}', artifact_name='auto') to materialize every{legacy} artifact row.\n"
+                f"2. Call scoring_create_feature_layer(name='{feature}') after the batch succeeds.\n"
+                "Rationale: the artifact already carries row-level coordinates, geometry kind, values, and provenance."
+            )
+        translate_summary = record.get("translate_summary") if isinstance(record.get("translate_summary"), dict) else {}
+        if translate_summary.get("spatial_tool_calls"):
+            call_names = [
+                str(call.get("name"))
+                for call in translate_summary.get("spatial_tool_calls", [])
+                if isinstance(call, dict) and call.get("name")
+            ]
+            return (
+                "Materialization plan:\n"
+                f"Use the recovered manual spatial operations in order: {', '.join(call_names)}.\n"
+                f"Finish with scoring_create_feature_layer(name='{feature}').\n"
+                "Rationale: no compact artifact route was recovered, so the manual operations are the grounded materialization record."
+            )
+        return ""
+
+    def _coordinate_provenance_items(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        geometry_summary = record.get("geometry_summary") if isinstance(record.get("geometry_summary"), dict) else {}
+        items: list[dict[str, Any]] = []
+        for sample in geometry_summary.get("sample_records", []) or []:
+            if not isinstance(sample, dict):
+                continue
+            source = str(sample.get("coordinate_source") or "unknown").strip() or "unknown"
+            items.append(
+                {
+                    "kind": "geometry_record",
+                    "artifact_route": record.get("artifact_route", "none"),
+                    "coordinate_source": source,
+                    "record": sample,
+                }
+            )
+            if len(items) >= self._max_coordinate_provenance_rows:
+                return items
+        if not items:
+            counts = geometry_summary.get("coordinate_source_counts")
+            if isinstance(counts, dict):
+                for source, count in counts.items():
+                    items.append(
+                        {
+                            "kind": "source_count",
+                            "artifact_route": record.get("artifact_route", "none"),
+                            "coordinate_source": str(source),
+                            "count": self._safe_int(count, 0),
+                        }
+                    )
+                    if len(items) >= self._max_coordinate_provenance_rows:
+                        break
+        return items[: self._max_coordinate_provenance_rows]
+
+    @staticmethod
+    def _coordinate_provenance_prompt(hypothesis: str, item: dict[str, Any]) -> str:
+        record = item.get("record") if isinstance(item.get("record"), dict) else {}
+        if record:
+            payload = json.dumps(record, sort_keys=True, default=str)
+        else:
+            payload = json.dumps(
+                {
+                    "coordinate_source": item.get("coordinate_source", "unknown"),
+                    "count": item.get("count", 0),
+                    "artifact_route": item.get("artifact_route", "none"),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        return (
+            f"Hypothesis: {hypothesis}\n\n"
+            f"Coordinate/provenance item:\n{payload}\n\n"
+            "Task: Explain the coordinate source and how it should be handled during spatial materialization."
+        )
+
+    @staticmethod
+    def _coordinate_provenance_target(item: dict[str, Any]) -> str:
+        source = str(item.get("coordinate_source") or "unknown")
+        if source == "creative_fallback":
+            return (
+                "No grounded coordinate source was found. State uncertainty, name the missing lookup or source, "
+                "and propose a concrete georeferencing step before using the coordinate as evidence."
+            )
+        record = item.get("record") if isinstance(item.get("record"), dict) else {}
+        if source == "artifact":
+            source_file = str(record.get("source_file") or "the code artifact").strip()
+            return (
+                "Coordinate provenance: use coordinate_source='artifact'. The coordinates are data-derived "
+                f"from {source_file}, so materialize the row as recorded and keep the source excerpt/file in provenance."
+            )
+        if source in {"geonames", "web"}:
+            return (
+                f"Coordinate provenance: use coordinate_source='{source}'. Treat the location as lookup-resolved, "
+                "validate that it falls within the Teniz grid, and retain the lookup rationale in provenance."
+            )
+        return (
+            f"Coordinate provenance: coordinate_source='{source}'. Preserve the stated provenance and validate bounds "
+            "before scoring the layer."
+        )
 
     def _is_novel(self, hypothesis: str, parent_hypotheses: list[str]) -> bool:
         if not parent_hypotheses:
@@ -1338,10 +2239,12 @@ class ExperimentReasoningRows:
     ) -> dict[str, Any]:
         """Build one fully-validated training row dict."""
         prompt = self._sanitize_prompt_context(prompt)
+        raw_response = self._sanitize_completion_text(raw_response)
         record_meta: dict[str, Any] = {
             "task_kind": pair_kind,
             "pair_kind": pair_kind,
             "hypothesis": hypothesis,
+            "scoring_objective": _SCORING_OBJECTIVE,
             "field_provenance": provenance,
             **extra_meta,
         }
@@ -1546,15 +2449,14 @@ class ExperimentReasoningRows:
 
     def _curate(
         self,
-        raw: list[tuple[Any, list[dict[str, Any]], float | None]],
-    ) -> list[tuple[Any, list[dict[str, Any]], float | None]]:
-        """Deduplicate exact pairs, then cap dominant hypothesis families.
+        raw: list[tuple[Any, list[dict[str, Any]], tuple[float, float, float]]],
+    ) -> list[tuple[Any, list[dict[str, Any]], tuple[float, float, float]]]:
+        """Deduplicate exact pairs, then optionally cap dominant families.
 
         Dataset-context hypothesis rows are always preserved at the family cap.
         """
-        best_by_pair: dict[str, tuple[int, int, float, dict[str, Any]]] = {}
-        for episode_index, (_episode, rows, bic) in enumerate(raw):
-            strength = abs(bic) if bic is not None else 0.0
+        best_by_pair: dict[str, tuple[int, int, tuple[float, float, float], dict[str, Any]]] = {}
+        for episode_index, (_episode, rows, strength) in enumerate(raw):
             for row_index, row in enumerate(rows):
                 key = self._pair_key(row)
                 current = best_by_pair.get(key)
@@ -1566,11 +2468,11 @@ class ExperimentReasoningRows:
             rows_by_episode[episode_index].append(row)
 
         family_counts: dict[str, int] = {}
-        result: list[tuple[Any, list[dict[str, Any]], float | None]] = []
-        for index, (episode, _rows, bic) in enumerate(raw):
+        result: list[tuple[Any, list[dict[str, Any]], tuple[float, float, float]]] = []
+        for index, (episode, _rows, strength) in enumerate(raw):
             rows = rows_by_episode.get(index, [])
             if not rows:
-                result.append((episode, [], bic))
+                result.append((episode, [], strength))
                 continue
             hypothesis = self._extract_hypothesis_from_rows(rows) or episode.episode_id
             family = self._hypothesis_head(hypothesis)
@@ -1583,8 +2485,18 @@ class ExperimentReasoningRows:
                 ]
             else:
                 family_counts[family] = family_counts.get(family, 0) + 1
-            result.append((episode, rows, bic))
+            result.append((episode, rows, strength))
         return result
+
+    @staticmethod
+    def _dedup_strength(record: dict[str, Any], episode: Any) -> tuple[float, float, float]:
+        candidate = record.get("candidate_predictor_lift_mean")
+        candidate_strength = float(candidate) if isinstance(candidate, int | float) else -math.inf
+        episode_score = getattr(episode, "episode_score", None)
+        score_strength = float(episode_score) if isinstance(episode_score, int | float) else 0.0
+        bic = record.get("bic_delta")
+        bic_strength = abs(float(bic)) if isinstance(bic, int | float) else 0.0
+        return (candidate_strength, score_strength, bic_strength)
 
     @staticmethod
     def _pair_key(row: dict[str, Any]) -> str:

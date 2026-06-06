@@ -1,4 +1,4 @@
-"""Aggregate CURRENT-format SFT rows across multiple runs into one pooled dataset.
+"""Aggregate CURRENT-format SFT rows across all recoverable Kazakhstan runs.
 
 Re-applies the task's current ``training_data_transforms()`` to each run's
 ``all_episodes.jsonl`` (best-effort evidence backfill: on-disk dataset chunk →
@@ -32,16 +32,40 @@ from pathlib import Path
 TASK_CLASS = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
 BASE = Path("data/kazakhstan/feature-hypothesis")
 
-# (run_id, generation_dir, note). Order = oldest → newest.
-RUNS: list[tuple[str, Path, str]] = [
-    ("20260524-rg26xw", BASE / "generations/20260524-rg26xw/generation_0", "old workflow (survey+hypothesise); no data_spec.files / source_excerpt"),
-    ("20260529-archive-gen0", BASE / "_archive_2026-05-31/generation_0", "05-29 archived run; old workflow"),
-    ("20260529-h7x7ix", BASE / "generations/20260529-h7x7ix/generation_0", "05-29 short run; old workflow"),
-    ("20260529-r2ligp", BASE / "generations/20260529-r2ligp/generation_0", "05-29→31 main run; old workflow"),
-    ("20260531-f2jcpm", BASE / "generations/20260531-f2jcpm/generation_0", "05-31 reshape run; native source_excerpt"),
-    ("20260531-uz1hbx-aborted", BASE / "_archive_2026-05-31/generation_0_run1_aborted", "05-31 aborted; native source_excerpt"),
-    ("LIVE-generation_0", BASE / "generations/generation_0", "ACTIVE run snapshot (read-only); native source_excerpt"),
-]
+
+def _run_id_for_generation_dir(gen_dir: Path, base: Path) -> str:
+    try:
+        rel = gen_dir.relative_to(base)
+    except ValueError:
+        rel = gen_dir
+    parts = rel.parts
+    if len(parts) >= 2 and parts[0] == "generations":
+        if parts[1].startswith("generation_"):
+            return f"LIVE-{parts[1]}"
+        if len(parts) >= 3:
+            return f"{parts[1]}-{parts[2]}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(rel)).strip("-") or "unknown-run"
+
+
+def _discover_runs(base: Path) -> list[tuple[str, Path, str]]:
+    runs: list[tuple[str, Path, str]] = []
+    seen_paths: set[Path] = set()
+    for all_episodes_path in sorted(base.rglob("all_episodes.jsonl")):
+        if "aggregated_sft" in all_episodes_path.parts:
+            continue
+        gen_dir = all_episodes_path.parent
+        resolved = gen_dir.resolve()
+        if resolved in seen_paths:
+            continue
+        seen_paths.add(resolved)
+        runs.append(
+            (
+                _run_id_for_generation_dir(gen_dir, base),
+                gen_dir,
+                "auto-discovered all_episodes.jsonl; transformed with current ExperimentReasoningRows",
+            )
+        )
+    return runs
 
 
 def _load_episodes(gen_dir: Path):
@@ -69,7 +93,12 @@ def _load_episodes(gen_dir: Path):
     return gd, n, skipped
 
 
-def _build_rows(task, gen_dir: Path, max_per_family: int) -> tuple[list[dict], int, int, str | None]:
+def _build_rows(
+    task,
+    gen_dir: Path,
+    max_per_family: int,
+    max_coordinate_provenance_rows: int,
+) -> tuple[list[dict], int, int, str | None, dict]:
     from src.training_data.transforms import (
         build_export_recipe,
         build_training_export,
@@ -79,7 +108,7 @@ def _build_rows(task, gen_dir: Path, max_per_family: int) -> tuple[list[dict], i
 
     gd, n_lines, skipped = _load_episodes(gen_dir)
     if gd is None:
-        return [], n_lines, skipped, None
+        return [], n_lines, skipped, None, {}
     meta_path = gen_dir / "metadata.json"
     metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     # Mirror task.training_data_transforms() but override only the per-family
@@ -88,6 +117,7 @@ def _build_rows(task, gen_dir: Path, max_per_family: int) -> tuple[list[dict], i
     transforms = (
         ExperimentReasoningRows(
             max_per_family=max_per_family,
+            max_coordinate_provenance_rows=max_coordinate_provenance_rows,
             dataset_dir=str(getattr(task, "_dataset_dir", "") or ""),
         ),
     )
@@ -101,7 +131,7 @@ def _build_rows(task, gen_dir: Path, max_per_family: int) -> tuple[list[dict], i
         export_recipe_hash=recipe.recipe_hash,
     )
     export = build_training_export(gd, transforms, ctx)
-    return export.rows, n_lines, skipped, recipe.recipe_hash
+    return export.rows, n_lines, skipped, recipe.recipe_hash, export.report
 
 
 def _pair_hash(row: dict) -> str:
@@ -116,7 +146,8 @@ def _has_evidence(row: dict) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(BASE / "aggregated_sft" / "20260601-pooled"))
+    ap.add_argument("--out", default=str(BASE / "aggregated_sft" / "20260606-v2-full-refresh"))
+    ap.add_argument("--discover-root", default=str(BASE))
     ap.add_argument(
         "--max-per-family",
         type=int,
@@ -124,25 +155,51 @@ def main() -> None:
         help="per-family diversity cap in _curate (canonical default 5; 10**9 ≈ lift fully). "
         "Exact prompt/response dedup always applies.",
     )
+    ap.add_argument(
+        "--max-coordinate-provenance-rows",
+        type=int,
+        default=3,
+        help="cap for per-episode coordinate_provenance rows; exact dedup still applies",
+    )
+    ap.add_argument(
+        "--exclude-pair-kind",
+        action="append",
+        default=["code_synthesis"],
+        help=(
+            "pair_kind/task_kind to exclude from the pooled aggregate after rebuilding rows; "
+            "repeat to exclude more. Defaults to code_synthesis so this aggregate omits "
+            "code-writing targets."
+        ),
+    )
     args = ap.parse_args()
 
     from src.task.loader import load_task
 
     task = load_task(TASK_CLASS)
-    current_hash = None
+    recipe_hashes: set[str] = set()
 
     pooled: list[dict] = []
     seen: set[str] = set()
     per_run: list[dict] = []
     dropped_dupes = 0
+    excluded_by_kind = Counter()
+    excluded_pair_kinds = {str(kind) for kind in (args.exclude_pair_kind or []) if str(kind)}
+    runs = _discover_runs(Path(args.discover_root))
 
-    for run_id, gen_dir, note in RUNS:
+    for run_id, gen_dir, note in runs:
         if not (gen_dir / "all_episodes.jsonl").is_file():
             per_run.append({"run_id": run_id, "status": "MISSING", "note": note})
             continue
-        rows, n_lines, skipped, rhash = _build_rows(task, gen_dir, args.max_per_family)
-        current_hash = current_hash or rhash
+        rows, n_lines, skipped, rhash, report = _build_rows(
+            task,
+            gen_dir,
+            args.max_per_family,
+            args.max_coordinate_provenance_rows,
+        )
+        if rhash:
+            recipe_hashes.add(rhash)
         kinds = Counter((r.get("record_meta") or {}).get("task_kind", "?") for r in rows)
+        routes = Counter((r.get("record_meta") or {}).get("artifact_route", "?") for r in rows)
         n_success = sum(1 for r in rows if r.get("success"))
         n_evid = sum(1 for r in rows if _has_evidence(r))
         # evidence-bearing kinds only
@@ -151,7 +208,14 @@ def main() -> None:
             1 for r in rows if (r.get("record_meta") or {}).get("task_kind") in ev_kinds
         )
         kept = 0
+        run_excluded_by_kind = Counter()
         for r in rows:
+            meta = r.get("record_meta") if isinstance(r.get("record_meta"), dict) else {}
+            pair_kind = str(meta.get("pair_kind") or meta.get("task_kind") or "")
+            if pair_kind in excluded_pair_kinds:
+                excluded_by_kind[pair_kind] += 1
+                run_excluded_by_kind[pair_kind] += 1
+                continue
             h = _pair_hash(r)
             if h in seen:
                 dropped_dupes += 1
@@ -168,11 +232,25 @@ def main() -> None:
             "episode_lines_skipped": skipped,
             "rows_built": len(rows),
             "rows_kept_after_dedup": kept,
+            "rows_excluded_by_pair_kind": dict(run_excluded_by_kind),
             "rows_success_true": n_success,
             "rows_with_evidence_block": n_evid,
             "evidence_eligible_rows": n_evid_eligible,
             "task_kind_dist": dict(kinds),
+            "artifact_route_dist": dict(routes),
             "recipe_hash": rhash,
+            "export_report": {
+                key: report.get(key)
+                for key in (
+                    "training_row_count",
+                    "rows_by_pair_kind",
+                    "rows_by_artifact_route",
+                    "episodes_with_value_grid",
+                    "episodes_with_feature_geometry",
+                    "creative_fallback_rows_method_framed",
+                )
+                if key in report
+            },
         })
 
     out_dir = Path(args.out)
@@ -184,21 +262,30 @@ def main() -> None:
 
     total_success = sum(1 for r in pooled if r.get("success"))
     total_evid = sum(1 for r in pooled if _has_evidence(r))
+    pooled_kinds = Counter((r.get("record_meta") or {}).get("task_kind", "?") for r in pooled)
+    pooled_routes = Counter((r.get("record_meta") or {}).get("artifact_route", "?") for r in pooled)
     manifest = {
-        "schema_version": 1,
-        "created_for": "pooled SFT finetune across recent Kazakhstan runs",
+        "schema_version": 2,
+        "created_for": "pooled v2 SFT finetune across all recoverable Kazakhstan runs",
         "max_per_family": args.max_per_family,
-        "recipe_hash": current_hash,
+        "max_coordinate_provenance_rows": args.max_coordinate_provenance_rows,
+        "excluded_pair_kinds": sorted(excluded_pair_kinds),
+        "rows_excluded_by_pair_kind": dict(excluded_by_kind),
+        "discover_root": str(Path(args.discover_root)),
+        "recipe_hashes": sorted(recipe_hashes),
         "recipe_note": (
-            "max_per_family overridden from canonical 5; recipe_hash therefore "
-            "differs from the run-time ee073501 (row SCHEMA is identical, only "
-            "the diversity cap differs). Exact prompt/response dedup still applied."
+            "Rows are rebuilt from all discovered all_episodes.jsonl files using the current "
+            "ExperimentReasoningRows[v2] transform. Exact prompt/response dedup is applied "
+            "across runs after per-run curation."
         ),
         "pooled_rows": len(pooled),
         "pooled_rows_success_true": total_success,
         "pooled_rows_with_evidence_block": total_evid,
+        "pooled_rows_by_pair_kind": dict(pooled_kinds),
+        "pooled_rows_by_artifact_route": dict(pooled_routes),
         "cross_run_exact_dupes_dropped": dropped_dupes,
         "trainer_note": "src.train.qlora skips rows where success is falsy; uses prompt+raw_response only",
+        "discovered_run_count": len(runs),
         "runs": per_run,
         "sft_training_rows_path": rows_path.name,
     }
@@ -214,7 +301,7 @@ def main() -> None:
     print(f"  success=True (trainable) ... {total_success}")
     print(f"  with 'Source examined' ..... {total_evid}")
     print(f"  cross-run dupes dropped .... {dropped_dupes}")
-    print(f"  current recipe hash ........ {current_hash}")
+    print(f"  recipe hashes .............. {', '.join(sorted(recipe_hashes)) or 'none'}")
     print(f"\n  {'run':26} {'lines':>6} {'skip':>4} {'built':>6} {'kept':>5} {'succ':>5} {'evid':>5}")
     for pr in per_run:
         if pr.get("status") == "MISSING":
