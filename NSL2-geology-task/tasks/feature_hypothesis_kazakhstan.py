@@ -193,11 +193,9 @@ _SYSTEM_PROMPT = """You are analyzing Kazakhstan mineral prospects.
 
 Grid: lon 66.5–71.5°E, lat 49.5–52.5°N, depth 0–80m (200×200×8 voxels, ~1.75km/voxel).
 
-Feature admission uses the real two-stage gate:
-- Stage 1: once at least two admitted layers exist, adding the candidate must improve system-wide MAE.
-- Stage 2: the candidate must improve normalized BIC (`bic_delta < 0`).
+Feature success uses the real lift gate: once enough admitted layers exist, adding the candidate must improve held-out MAE/lift. Crossbreed KG admission is stricter: the lift-success candidate must also improve raw BIC (`bic_delta < 0`).
 
-Optimize for both gates, but match spatial support to the geological claim. Dense basin-scale surfaces are appropriate only when evidence and mechanism justify broad support; sparse localized layers are acceptable when the theory is localized.
+Optimize for success first and KG admission second, but match spatial support to the geological claim. Dense basin-scale surfaces are appropriate only when evidence and mechanism justify broad support; sparse localized layers are acceptable when the theory is localized.
 """
 
 
@@ -506,6 +504,10 @@ class FeatureHypothesisKazakhstanState:
     stage_1_bic_rescue_threshold: float | None = None
     stage_completed: str = "stage_2_completed"
     admission_path: str = "normal"
+    lift_success_passed: bool | None = None
+    training_success: bool | None = None
+    bic_admission_passed: bool | None = None
+    kg_admission_gate_passed: bool | None = None
     proposal_evidence_tier: str = "mixed"
     confidence: float | None = None
     evidence_strength: float | None = None
@@ -557,6 +559,10 @@ _FORBIDDEN_TELEMETRY_FIELDS: frozenset[str] = frozenset(
         "candidate_predictor_lift_mean",
         "candidate_predictor_lift_by_target",
         "admitted",
+        "lift_success_passed",
+        "training_success",
+        "bic_admission_passed",
+        "kg_admission_gate_passed",
         "admission_path",
         "admission_threshold",
         "masking_test_passed",
@@ -1684,6 +1690,10 @@ class ExperimentReasoningRows:
                 "bic_delta",
                 "bic_delta_by_target",
                 "admitted",
+                "lift_success_passed",
+                "training_success",
+                "bic_admission_passed",
+                "kg_admission_gate_passed",
                 "admission_path",
                 "admission_threshold",
                 "masking_test_passed",
@@ -4680,6 +4690,8 @@ finally:
         # Auto-append BIC result to training pair response
         bic_delta = evaluate.get("bic_delta")
         admitted = evaluate.get("admitted", False)
+        workflow_kind = ctx.episode_context.get("workflow_kind", "survey")
+        evaluate["workflow_kind"] = workflow_kind
         if isinstance(training_pair.get("response"), str) and bic_delta is not None:
             verdict = "Admitted" if admitted else "Not admitted"
             training_pair["response"] += (
@@ -4705,6 +4717,27 @@ finally:
         stage_1_bic_rescue_threshold = evaluate.get('stage_1_bic_rescue_threshold')
         stage_completed = evaluate.get('stage_completed', 'stage_2_completed')
         admission_path = evaluate.get('admission_path', 'normal')
+        lift_success_passed = bool(evaluate.get('lift_success_passed', admitted))
+        training_success = bool(evaluate.get('training_success', admitted))
+        try:
+            bic_value = float(bic_delta) if bic_delta is not None else None
+        except (TypeError, ValueError):
+            bic_value = None
+        bic_admission_passed = bool(bic_value is not None and bic_value < 0.0)
+        seed_phase = self._in_seed_phase(ctx.episode_context)
+        kg_admission_gate_passed = self._should_persist_to_kg(
+            masking_test_passed=masking_test_passed,
+            admitted=admitted,
+            bic_delta=bic_delta,
+            stage_completed=stage_completed,
+            admission_path=admission_path,
+            seed_phase=seed_phase,
+            workflow_kind=workflow_kind,
+        )
+        evaluate["lift_success_passed"] = lift_success_passed
+        evaluate["training_success"] = training_success
+        evaluate["bic_admission_passed"] = bic_admission_passed
+        evaluate["kg_admission_gate_passed"] = kg_admission_gate_passed
         proposal_evidence_tier = self._normalise_evidence_tier(hypothesise.get("evidence_tier"))
         self_assessment = hypothesise.get("self_assessment")
         if not isinstance(self_assessment, dict):
@@ -4718,6 +4751,11 @@ finally:
             'episode_id': episode_id,
             'timestamp': time.time(),
             'admitted': admitted,
+            'lift_success_passed': lift_success_passed,
+            'training_success': training_success,
+            'bic_admission_passed': bic_admission_passed,
+            'kg_admission_gate_passed': kg_admission_gate_passed,
+            'workflow_kind': workflow_kind,
             'layer_name': translate.get('feature_layer_name', ''),
             # Two-stage scoring results
             'masking_test_passed': masking_test_passed,
@@ -4752,6 +4790,10 @@ finally:
                     'stage_1_bic_rescue_threshold': stage_1_bic_rescue_threshold,
                     'stage_completed': stage_completed,
                     'admission_path': admission_path,
+                    'lift_success_passed': lift_success_passed,
+                    'training_success': training_success,
+                    'bic_admission_passed': bic_admission_passed,
+                    'kg_admission_gate_passed': kg_admission_gate_passed,
                     'scoring_version': 'two_stage_v2'
                 }
             }
@@ -4779,10 +4821,9 @@ finally:
         except Exception as e:
             print(f"Warning: Failed to save training data: {e}")
         
-        # Save to knowledge graph (ONLY experiments that passed BOTH stages)
-        # Stage 1: predictive capacity test; Stage 2: BIC improvement.
-        # See ``_should_persist_to_kg`` for the gate semantics, including
-        # the stage_completed string allowlist.
+        # Save to knowledge graph only when the stricter admission gate passes.
+        # Training success is lift-based and was recorded above; KG admission
+        # can additionally require raw BIC during crossbreed.
         #
         # Every SURVEY-phase admit seeds the KG and bypasses the co-location
         # scorer's verdict (it rejects distributed layers at supports distinct
@@ -4790,15 +4831,7 @@ finally:
         # there is enough co-location for the scorer to discriminate; in
         # crossbreed the scorer governs again. The geometry/provenance floor in
         # _admit_with_dedup is the real quality gate during the survey.
-        seed_phase = self._in_seed_phase(ctx.episode_context)
-        both_stages_passed = self._should_persist_to_kg(
-            masking_test_passed=masking_test_passed,
-            admitted=admitted,
-            bic_delta=bic_delta,
-            stage_completed=stage_completed,
-            admission_path=admission_path,
-            seed_phase=seed_phase,
-        )
+        both_stages_passed = kg_admission_gate_passed
         
         # Prefer the kg_dir wired through populate() so dedup ledger and
         # experiments.jsonl always live next to each other. Fall back to the
@@ -4849,13 +4882,17 @@ finally:
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
                     "stage_completed": stage_completed,
                     "admission_path": admission_path,
-                    "workflow_kind": ctx.episode_context.get("workflow_kind", "survey"),
+                    "workflow_kind": workflow_kind,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": training_success,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     # True when this admit rode the explicit diverse-seed
                     # bootstrap rather than a negative predictor-lift BIC.
                     "seed_phase_bypass": bool(
                         seed_phase
                         and admission_path == "diverse_seed"
-                        and not (bic_delta is not None and bic_delta < 0)
+                        and not bic_admission_passed
                     ),
                     "scoring_version": evaluate.get("scoring_objective", "spatial_predictor_lift_v1"),
                     "scoring_objective": evaluate.get("scoring_objective"),
@@ -4866,6 +4903,7 @@ finally:
                     "relative_mae_min": evaluate.get('relative_mae_min'),
                     "relative_mae_max": evaluate.get('relative_mae_max'),
                     "bic_delta_raw": evaluate.get('bic_delta_raw'),
+                    "bic_delta_per_sample_mean": evaluate.get('bic_delta_per_sample_mean'),
                     "n_effective_samples": evaluate.get('n_effective_samples'),
                     "n_spatial_folds": evaluate.get("n_spatial_folds"),
                     "n_signal_folds_by_target": evaluate.get("n_signal_folds_by_target"),
@@ -5001,6 +5039,7 @@ finally:
             except Exception as e:
                 print(f"Warning: Failed to save knowledge graph data: {e}")
 
+        ctx.episode_context.setdefault("layer_admitted_to_kg", False)
         ctx.episode_context["terminal_record"] = {
             "graph_node": graph_node,
             "training_pair": training_pair,
@@ -5028,7 +5067,11 @@ finally:
                 "two_stage_results": {
                     "stage_1_passed": masking_test_passed,
                     "stage_1_improvement": masking_test_improvement,
-                    "stage_2_passed": admitted,
+                    "stage_2_passed": lift_success_passed,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": training_success,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     "bic_delta": bic_delta,
                     "final_admitted": both_stages_passed and not duplicate_rejected,
                 }
@@ -5904,6 +5947,7 @@ finally:
                     translate_record["timestamp"] = __import__('time').time()
                 
                 # Store evaluation results
+                result["workflow_kind"] = ctx.episode_context.get("workflow_kind", "survey")
                 phase_records["evaluate"] = result
                 quarantine_info = self._quarantine_rejected_candidate(
                     store_dir=store_dir,
@@ -5993,6 +6037,10 @@ finally:
             stage_1_bic_rescue_threshold=evaluate.get("stage_1_bic_rescue_threshold"),
             stage_completed=evaluate.get("stage_completed", "stage_2_completed"),
             admission_path=evaluate.get("admission_path", "normal"),
+            lift_success_passed=evaluate.get("lift_success_passed"),
+            training_success=evaluate.get("training_success"),
+            bic_admission_passed=evaluate.get("bic_admission_passed"),
+            kg_admission_gate_passed=evaluate.get("kg_admission_gate_passed"),
             proposal_evidence_tier=self._normalise_evidence_tier(hypothesise.get("evidence_tier")),
             confidence=(hypothesise.get("self_assessment") or {}).get("confidence")
             if isinstance(hypothesise.get("self_assessment"), dict)
@@ -6021,6 +6069,33 @@ finally:
         stage_1_bic_rescue_threshold = final.stage_1_bic_rescue_threshold
         admitted = final.admitted
         stage_completed = final.stage_completed
+        lift_success_passed = (
+            bool(final.lift_success_passed)
+            if final.lift_success_passed is not None
+            else bool(admitted)
+        )
+        training_success = (
+            bool(final.training_success)
+            if final.training_success is not None
+            else bool(masking_test_passed and lift_success_passed)
+        )
+        bic_admission_passed = bool(
+            final.bic_admission_passed
+            if final.bic_admission_passed is not None
+            else bic_delta is not None and float(bic_delta) < 0.0
+        )
+        kg_admission_gate_passed = (
+            bool(final.kg_admission_gate_passed)
+            if final.kg_admission_gate_passed is not None
+            else self._should_persist_to_kg(
+                masking_test_passed=bool(masking_test_passed),
+                admitted=bool(admitted),
+                bic_delta=bic_delta,
+                stage_completed=stage_completed,
+                admission_path=final.admission_path,
+                workflow_kind=final.workflow_kind,
+            )
+        )
 
         if bic_delta is None and final.admission_path == "first_layer_auto" and admitted:
             return TaskReward(
@@ -6029,6 +6104,10 @@ finally:
                 breakdown={
                     "stage_1_passed": True,
                     "stage_2_passed": False,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": True,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     "first_layer_auto": True,
                     "bic_delta": None,
                     "proposal_evidence_tier": final.proposal_evidence_tier,
@@ -6046,14 +6125,19 @@ finally:
                 success=False,
                 breakdown={
                     "no_feature": True,
-                    "stage_completed": stage_completed
+                    "stage_completed": stage_completed,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": False,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": False,
                 }
             )
 
-        # Two-stage reward — bic_delta is per-sample normalized post-scoring fix.
+        # Success is training-data eligibility: the candidate cleared the lift
+        # success gate. KG admission is stricter and reported separately.
         # auto_pass / first_layer cannot compute a before/after MAE delta, so they
         # take full Stage 1 credit (no baseline to compare against).
-        if masking_test_passed and admitted:
+        if training_success:
             if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0
             else:
@@ -6070,12 +6154,16 @@ finally:
                     "stage_1_tolerance_used": stage_1_tolerance_used,
                     "stage_1_mae_tolerance": stage_1_mae_tolerance,
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
-                    "stage_2_passed": True,
+                    "stage_2_passed": lift_success_passed,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": True,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
                     "stage2_reward": stage2_reward,
                     "final_reward": value,
-                    "both_stages_passed": True,
+                    "both_stages_passed": kg_admission_gate_passed,
                     "proposal_evidence_tier": final.proposal_evidence_tier,
                     "evidence_strength": final.evidence_strength,
                     "admission_tier": final.admission_tier,
@@ -6083,7 +6171,7 @@ finally:
                     "region": "kazakhstan",
                 },
             )
-        elif masking_test_passed and not admitted:
+        elif masking_test_passed:
             if masking_test_direction in ("auto_pass", "first_layer", "first_layer_auto"):
                 stage1_reward = 1.0
             else:
@@ -6099,7 +6187,11 @@ finally:
                     "stage_1_tolerance_used": stage_1_tolerance_used,
                     "stage_1_mae_tolerance": stage_1_mae_tolerance,
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
-                    "stage_2_passed": False,
+                    "stage_2_passed": lift_success_passed,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": False,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     "bic_delta": bic_delta,
                     "stage1_reward": stage1_reward,
                     "partial_success": True,
@@ -6120,7 +6212,11 @@ finally:
                     "stage_1_tolerance_used": stage_1_tolerance_used,
                     "stage_1_mae_tolerance": stage_1_mae_tolerance,
                     "stage_1_bic_rescue_threshold": stage_1_bic_rescue_threshold,
-                    "stage_2_passed": admitted,
+                    "stage_2_passed": lift_success_passed,
+                    "lift_success_passed": lift_success_passed,
+                    "training_success": False,
+                    "bic_admission_passed": bic_admission_passed,
+                    "kg_admission_gate_passed": kg_admission_gate_passed,
                     "bic_delta": bic_delta,
                     "no_predictive_value": True,
                     "proposal_evidence_tier": final.proposal_evidence_tier,
@@ -6174,6 +6270,9 @@ finally:
             # (and its trajectory becomes SFT-eligible via training_success).
             reward = self._enforce_admission_success(reward, episode_context)
             breakdown = dict(reward.breakdown or {})
+            breakdown["kg_admission_passed"] = bool(
+                episode_context.get("layer_admitted_to_kg", False)
+            )
             # The framework's max_bootstrap_episodes guard inspects
             # task_breakdown["bootstrap_active"] (src/execution/generation.py).
             # For feature_hypothesis, "bootstrap" == the early phase before
@@ -6187,10 +6286,15 @@ finally:
             kg_dir_ctx = episode_context.get("kg_dir")
             if isinstance(kg_dir_ctx, str) and kg_dir_ctx:
                 try:
+                    produced_new_admit = (
+                        bool(episode_context["layer_admitted_to_kg"])
+                        if "layer_admitted_to_kg" in episode_context
+                        else bool(breakdown.get("kg_admission_gate_passed"))
+                    )
                     interweave_state = self._record_interweave_episode_result(
                         Path(kg_dir_ctx),
                         workflow_kind=final.workflow_kind,
-                        produced_new_admit=bool(reward.success)
+                        produced_new_admit=produced_new_admit
                         and not bool(episode_context.get("duplicate_rejected")),
                         interweave_bootstrap=bool(
                             episode_context.get("interweave_bootstrap")
@@ -6968,20 +7072,13 @@ finally:
         stage_completed: str,
         admission_path: str | None = None,
         seed_phase: bool = False,
+        workflow_kind: str | None = None,
     ) -> bool:
-        """Gate ``_admit_with_dedup`` so only fully-scored, two-stage-passing
-        experiments enter the kg pool.
+        """Gate ``_admit_with_dedup`` for KG admission.
 
-        Normal path (crossbreed) — all hold:
-          - ``masking_test_passed`` — stage 1 predictive-capacity check.
-          - ``admitted`` — the scorer admitted the layer. CALIBRATED 2026-06-05 to
-            LIFT-PRIMARY (validity + cross-layer lift > bar), so this is the
-            authority and ``bic_delta`` no longer gates here (it is telemetry).
-            The old ``bic_delta < 0`` re-check contradicted lift-primary and dropped
-            every positive-bic crossbreed child at the kg_gate.
-          - ``bic_delta is not None`` — scoring must have produced a delta.
-          - ``stage_completed`` in the allowlist — proves scoring actually ran
-            (vs. partial / aborted).
+        Success/training is lift-based. Crossbreed KG admission is stricter:
+        the same lift-success candidate must also improve raw extensive BIC.
+        Survey/diverse-seed paths keep their existing bootstrap semantics.
 
         ``seed_phase`` (``workflow_kind == "survey"``, decided at the call site
         via ``_in_seed_phase``) no longer admits every completed scorer reject.
@@ -7011,15 +7108,18 @@ finally:
             return False
         if not bool(admitted):
             return False
-        # Calibrated 2026-06-05 (lift-primary): the scorer's `admitted` is the
-        # authority (validity + cross-layer lift > bar). The old `bic_delta < 0`
-        # "defense in depth" contradicted it and dropped every positive-bic
-        # crossbreed child at the kg_gate (e.g. vladimirov_kirey_intersection,
-        # bic +0.264, lift +0.024). Keep only the None-guard (scoring produced a
-        # delta); bic_delta is telemetry. The novelty guard still dedups.
         if bic_delta is None:
             return False
-        return stage_completed in cls._STAGE_COMPLETED_ALLOWLIST
+        if stage_completed not in cls._STAGE_COMPLETED_ALLOWLIST:
+            return False
+        if (workflow_kind or "survey") == "crossbreed":
+            try:
+                bic_value = float(bic_delta)
+            except (TypeError, ValueError):
+                return False
+            if bic_value >= 0.0:
+                return False
+        return True
 
     @classmethod
     def _should_quarantine_rejected_candidate(cls, evaluate: dict[str, Any]) -> bool:
@@ -7037,6 +7137,8 @@ finally:
             admitted=bool(evaluate.get("admitted", False)),
             bic_delta=bic_delta,
             stage_completed=stage_completed,
+            admission_path=evaluate.get("admission_path"),
+            workflow_kind=str(evaluate.get("workflow_kind", "survey")),
         )
 
     @staticmethod
@@ -7837,9 +7939,11 @@ finally:
                 continue
 
             bic_delta_raw = float(bic_with - bic_without)
-            bic_delta = bic_delta_raw / float(comparison_n)
+            bic_delta_per_sample = bic_delta_raw / float(comparison_n)
+            bic_delta = bic_delta_raw
             record["bic_delta"] = bic_delta
             record["bic_delta_raw"] = bic_delta_raw
+            record["bic_delta_per_sample_mean"] = bic_delta_per_sample
             record["bic_comparison_n_effective_samples"] = comparison_n
             record["n_effective_samples"] = n_eff_with
             record["first_layer_rescored_at"] = time.time()

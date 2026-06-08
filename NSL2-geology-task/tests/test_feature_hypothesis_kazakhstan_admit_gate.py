@@ -38,6 +38,7 @@ class TestStageCompletedAllowlist:
             admitted=True,
             bic_delta=-76738.5,
             stage_completed="mae_bic_completed",
+            workflow_kind="crossbreed",
         )
 
     def test_first_layer_auto_admits_without_bic_delta(self) -> None:
@@ -120,12 +121,9 @@ class TestSeedPhasePersistBypass:
             seed_phase=False,
         )
 
-    def test_normal_positive_bic_admit_persists_on_lift(self) -> None:
-        # Calibrated 2026-06-05 (lift-primary): the scorer's `admitted` is
-        # authoritative. A NORMAL/crossbreed child the lift gate admitted persists
-        # even at positive bic_delta — the old bic<0 "defense in depth" contradicted
-        # lift-primary and dropped every +bic crossbreed child at the kg_gate (e.g.
-        # vladimirov_kirey_intersection: bic +0.264, lift +0.024). Novelty still dedups.
+    def test_survey_positive_bic_success_persists_on_lift(self) -> None:
+        # Survey is success/training-data oriented. Crossbreed admission adds the
+        # raw-BIC criterion separately below.
         assert _GATE(
             masking_test_passed=True,
             admitted=True,
@@ -133,6 +131,29 @@ class TestSeedPhasePersistBypass:
             stage_completed="mae_bic_completed",
             admission_path="normal",
             seed_phase=False,
+            workflow_kind="survey",
+        )
+
+    def test_crossbreed_positive_bic_success_does_not_persist_to_kg(self) -> None:
+        assert not _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=0.264,
+            stage_completed="mae_bic_completed",
+            admission_path="normal",
+            seed_phase=False,
+            workflow_kind="crossbreed",
+        )
+
+    def test_crossbreed_negative_bic_success_persists_to_kg(self) -> None:
+        assert _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=-0.264,
+            stage_completed="mae_bic_completed",
+            admission_path="normal",
+            seed_phase=False,
+            workflow_kind="crossbreed",
         )
 
     def test_seed_phase_default_is_false(self) -> None:
@@ -193,16 +214,38 @@ class TestOtherGateConditions:
         )
 
     @pytest.mark.parametrize("bic", [-50.0, 0.0, 0.001, 100.0])
-    def test_bic_sign_does_not_gate_persist_when_admitted(self, bic: float) -> None:
-        # Calibrated 2026-06-05 (lift-primary): bic_delta is telemetry, not a gate.
-        # The lift gate already set admitted=True, so the layer persists for any
-        # finite bic sign; the novelty guard (not bic) prevents pile-on.
+    def test_bic_sign_does_not_gate_survey_success(self, bic: float) -> None:
         assert _GATE(
             masking_test_passed=True,
             admitted=True,
             bic_delta=bic,
             stage_completed="mae_bic_completed",
+            workflow_kind="survey",
         )
+
+    @pytest.mark.parametrize("bic, expected", [(-50.0, True), (0.0, False), (0.001, False), (100.0, False)])
+    def test_bic_sign_gates_crossbreed_admission(self, bic: float, expected: bool) -> None:
+        assert _GATE(
+            masking_test_passed=True,
+            admitted=True,
+            bic_delta=bic,
+            stage_completed="mae_bic_completed",
+            workflow_kind="crossbreed",
+        ) is expected
+
+
+class TestQuarantineMirrorsAdmissionGate:
+    def test_crossbreed_lift_success_positive_bic_is_quarantined_at_kg_gate(self) -> None:
+        evaluate = {
+            "masking_test_passed": True,
+            "admitted": True,
+            "bic_delta": 4.2,
+            "stage_completed": "mae_bic_completed",
+            "workflow_kind": "crossbreed",
+        }
+
+        assert FeatureHypothesisKazakhstanTask._should_quarantine_rejected_candidate(evaluate)
+        assert FeatureHypothesisKazakhstanTask._rejection_stage(evaluate) == "kg_gate"
 
 
 class TestEvidenceParentage:

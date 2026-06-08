@@ -44,9 +44,9 @@ def test_prompt_names_true_two_stage_gate_and_support_matching(tmp_path: Path) -
 
     prompt = spec.system_instruction
     assert "A feature layer is admitted if bic_delta < 0." not in prompt
-    assert "Stage 1" in prompt
+    assert "Feature success" in prompt
     assert "MAE" in prompt
-    assert "Stage 2" in prompt
+    assert "Crossbreed KG admission" in prompt
     assert "bic_delta < 0" in prompt
     assert "Prefer a dense prospectivity surface" not in prompt
     assert "match spatial support to the geological claim" in prompt

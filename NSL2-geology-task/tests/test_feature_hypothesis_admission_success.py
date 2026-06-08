@@ -16,8 +16,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from src.task.types import EpisodeArtifacts
 from src.task.types import TaskReward
-from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
+from tasks.feature_hypothesis_kazakhstan import (
+    FeatureHypothesisKazakhstanState,
+    FeatureHypothesisKazakhstanTask,
+)
 
 
 def _task(tmp_path: Path) -> FeatureHypothesisKazakhstanTask:
@@ -55,3 +59,25 @@ def test_already_successful_is_idempotent(tmp_path: Path) -> None:
     out = task._enforce_admission_success(base, {"layer_admitted_to_kg": True})
     assert out.success is True
     assert out.value == 1.0
+
+
+def test_lift_success_is_episode_success_even_without_kg_admission(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    initial = FeatureHypothesisKazakhstanState(workflow_kind="crossbreed")
+    final = FeatureHypothesisKazakhstanState(
+        workflow_kind="crossbreed",
+        bic_delta=8.0,
+        masking_test_passed=True,
+        masking_test_improvement=0.02,
+        masking_test_direction="candidate_predictor_lift",
+        admitted=True,
+        stage_completed="mae_bic_completed",
+        admission_path="normal",
+    )
+
+    reward = task.compute_reward(initial, final, EpisodeArtifacts())
+
+    assert reward.success is True
+    assert reward.breakdown["stage_1_passed"] is True
+    assert reward.breakdown["stage_2_passed"] is True
+    assert reward.breakdown["kg_admission_gate_passed"] is False

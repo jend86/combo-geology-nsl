@@ -98,7 +98,7 @@ _SPATIAL_NULL_MAX_ROWS = 2000
 _SPATIAL_SEED_POOL_TARGET = 6
 _SPATIAL_REJECTION_BIC_DELTA = 1_000_000.0
 _SPATIAL_MIN_LIFT = 1e-6
-# Calibrated ADMISSION bar on mean cross-layer predictor lift (2026-06-05). The
+# Calibrated SUCCESS bar on mean cross-layer predictor lift (2026-06-05). The
 # uncalibrated `bic_delta < 0` gate inverted the ranking: tiny low-DOF self-
 # predictive blobs admitted while richer high-DOF crossbreed children with
 # genuine cross-layer lift were rejected -> KG frozen at 7, 25 consecutive
@@ -116,19 +116,15 @@ def predictor_lift_admission_decision(
     bic_delta: float,
     admit_min_lift: float = _SPATIAL_ADMIT_MIN_LIFT,
 ) -> bool:
-    """Calibrated admission policy for ``spatial_predictor_lift_v1``.
+    """Calibrated lift-success policy for ``spatial_predictor_lift_v1``.
 
     Gates on the CROSS-LAYER predictor lift (validity + a meaningful lift bar),
-    NOT the per-sample ``bic_delta``. ``bic_delta`` penalises a candidate's
-    effective DOF, which perversely rejected rich, distributed (high-DOF)
-    crossbreed children that genuinely improved cross-layer prediction while
-    admitting tiny low-DOF self-predictive blobs. ``bic_delta`` is retained for
-    telemetry (and as a future veto hook) but does NOT gate admission here;
-    ``validity_passed`` (self coherence) plus held-out buffered-CV lift guard
-    against blanket layers. The ``bic_delta`` argument is intentionally accepted
-    and unused so callers/telemetry keep a stable signature.
+    not BIC. KG admission can layer a raw-BIC parsimony gate on top of this;
+    training success remains lift-based so successful episodes are a superset
+    of KG admissions. The ``bic_delta`` argument is intentionally accepted and
+    unused so callers/telemetry keep a stable signature.
     """
-    _ = bic_delta  # telemetry / future veto hook; deliberately not a gate
+    _ = bic_delta  # telemetry; KG admission applies BIC outside this lift gate.
     if not validity_passed:
         return False
     return float(lift_mean) > float(admit_min_lift)
@@ -1728,6 +1724,8 @@ def spatial_predictor_lift_score(
             "bic_after": None,
             "bic_delta": None,
             "bic_delta_raw": None,
+            "bic_delta_per_sample_mean": None,
+            "bic_delta_per_sample_by_target": {},
             "bic_before_observed": None,
             "bic_after_observed": None,
             "bic_comparison_n_effective_samples": 0,
@@ -1749,6 +1747,9 @@ def spatial_predictor_lift_score(
             "masking_test_improvement": 0.0,
             "masking_test_direction": "no_existing_targets",
             "admitted": False,
+            "lift_success_passed": False,
+            "training_success": False,
+            "bic_admission_passed": False,
             "admission_threshold": 0.0,
             "permutation_null_bic_deltas": [],
             "score_note": "no_existing_targets",
@@ -1760,6 +1761,8 @@ def spatial_predictor_lift_score(
             "bic_after": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_delta": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_delta_raw": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_per_sample_mean": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_per_sample_by_target": {},
             "bic_before_observed": 0.0,
             "bic_after_observed": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_comparison_n_effective_samples": 0,
@@ -1783,6 +1786,9 @@ def spatial_predictor_lift_score(
             "masking_test_improvement": 0.0,
             "masking_test_direction": "self_validity_gate",
             "admitted": False,
+            "lift_success_passed": False,
+            "training_success": False,
+            "bic_admission_passed": False,
             "admission_threshold": 0.0,
             "permutation_null_bic_deltas": [],
             "score_note": "rejected_by_validity_gate",
@@ -1883,6 +1889,8 @@ def spatial_predictor_lift_score(
             "bic_after": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_delta": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_delta_raw": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_per_sample_mean": _SPATIAL_REJECTION_BIC_DELTA,
+            "bic_delta_per_sample_by_target": {},
             "bic_before_observed": 0.0,
             "bic_after_observed": _SPATIAL_REJECTION_BIC_DELTA,
             "bic_comparison_n_effective_samples": 0,
@@ -1904,6 +1912,9 @@ def spatial_predictor_lift_score(
             "masking_test_improvement": 0.0,
             "masking_test_direction": "insufficient_evidence",
             "admitted": False,
+            "lift_success_passed": False,
+            "training_success": False,
+            "bic_admission_passed": False,
             "admission_threshold": 0.0,
             "permutation_null_bic_deltas": [],
             "score_note": "no_scorable_targets",
@@ -1912,7 +1923,13 @@ def spatial_predictor_lift_score(
     bic_before_by_target = {payload["name"]: payload["bic_before"] for payload in target_payloads}
     bic_after_by_target = {payload["name"]: payload["bic_after"] for payload in target_payloads}
     delta_by_target = {
-        payload["name"]: (payload["bic_after"] - payload["bic_before"]) / max(payload["n_rows"], 1)
+        payload["name"]: payload["bic_after"] - payload["bic_before"]
+        for payload in target_payloads
+    }
+    delta_per_sample_by_target = {
+        payload["name"]: (
+            payload["bic_after"] - payload["bic_before"]
+        ) / max(payload["n_rows"], 1)
         for payload in target_payloads
     }
     rel_before_by_target = {payload["name"]: payload["rel_before"] for payload in target_payloads}
@@ -1934,7 +1951,8 @@ def spatial_predictor_lift_score(
     bic_before = float(sum(bic_before_by_target.values()))
     bic_after = float(sum(bic_after_by_target.values()))
     bic_delta_raw = float(bic_after - bic_before)
-    bic_delta = float(np.mean(list(delta_by_target.values())))
+    bic_delta = bic_delta_raw
+    bic_delta_per_sample_mean = float(np.mean(list(delta_per_sample_by_target.values())))
     n_total = int(sum(n_rows_by_target.values()))
     rel_after_array = np.array(list(rel_after_by_target.values()), dtype=float)
     lift_mean = float(np.mean(list(lift_by_target.values()))) if lift_by_target else 0.0
@@ -2002,23 +2020,24 @@ def spatial_predictor_lift_score(
     admission_threshold = float(effective_min_lift)
 
     stage1_passed = bool(validity_passed and lift_mean > _SPATIAL_MIN_LIFT)
-    # Calibrated 2026-06-05: admit on cross-layer predictor lift, NOT the
-    # complexity-penalised bic_delta (which rejected rich, distributed crossbreed
-    # children that genuinely lifted prediction). 2026-06-06: the lift bar is the
-    # permutation null's upper percentile when active (above). bic_delta +
-    # admission_threshold remain telemetry. See predictor_lift_admission_decision.
+    # Calibrated 2026-06-05: success is cross-layer predictor lift. KG admission
+    # can layer raw-BIC parsimony on top without changing training success.
     admitted = predictor_lift_admission_decision(
         validity_passed=validity_passed,
         lift_mean=lift_mean,
         bic_delta=bic_delta,
         admit_min_lift=effective_min_lift,
     )
+    lift_success_passed = bool(admitted)
+    bic_admission_passed = bool(bic_delta < 0.0)
     return {
         **base_result,
         "bic_before": bic_before,
         "bic_after": bic_after,
         "bic_delta": bic_delta,
         "bic_delta_raw": bic_delta_raw,
+        "bic_delta_per_sample_mean": bic_delta_per_sample_mean,
+        "bic_delta_per_sample_by_target": delta_per_sample_by_target,
         "bic_before_observed": bic_before,
         "bic_after_observed": bic_after,
         "bic_before_by_target": bic_before_by_target,
@@ -2045,6 +2064,9 @@ def spatial_predictor_lift_score(
         "masking_test_improvement": lift_mean,
         "masking_test_direction": "candidate_predictor_lift",
         "admitted": admitted,
+        "lift_success_passed": lift_success_passed,
+        "training_success": lift_success_passed,
+        "bic_admission_passed": bic_admission_passed,
         "admission_threshold": admission_threshold,
         "admit_min_lift": float(effective_min_lift),
         "admission_policy": "predictor_lift_v1",
@@ -3002,7 +3024,7 @@ def evaluate_new_layer(
             - bic_before/after/delta: Laplace likelihood BIC scores
             - cv_mse_before/after/delta: MAE-derived MSE (legacy compatibility)
             - mutual_info: MI with existing layers
-            - admitted: whether layer improves BIC
+            - admitted: whether the layer is kept in the scoring store
             - predicted_value: BIC improvement (higher = better hypothesis)
     """
     existing_layers = list(store.layer_names)
@@ -3050,6 +3072,8 @@ def evaluate_new_layer(
             "bic_after": None,
             "bic_delta": None,
             "bic_delta_raw": None,
+            "bic_delta_per_sample_mean": None,
+            "bic_delta_per_sample_by_target": {},
             "bic_before_observed": None,
             "bic_after_observed": None,
             "bic_comparison_n_effective_samples": 0,
@@ -3068,6 +3092,9 @@ def evaluate_new_layer(
             "mutual_info": {},
             "pairwise_distance": {},
             "admitted": True,
+            "lift_success_passed": False,
+            "training_success": True,
+            "bic_admission_passed": False,
             "predicted_value": 1.0,
             "masking_test_passed": True,
             "masking_test_improvement": 0.0,
@@ -3157,14 +3184,20 @@ def evaluate_new_layer(
         elif admitted:
             print(
                 f"✅ Layer {layer_name} admitted: "
-                f"BIC/sample={float(bic_delta):.6f}, lift={mae_improvement:.6f}"
+                f"BIC={float(bic_delta):.6f}, lift={mae_improvement:.6f}"
             )
         else:
             print(
                 f"❌ Layer {layer_name} rejected at Stage 2: "
-                f"BIC/sample={float(bic_delta):.6f}, "
+                f"BIC={float(bic_delta):.6f}, "
                 f"threshold={float(score_after.get('admission_threshold', 0.0)):.6f}"
             )
+
+    lift_success_passed = bool(
+        score_after.get("lift_success_passed", score_after.get("admitted", False))
+    )
+    training_success = bool(admitted)
+    bic_admission_passed = bool(bic_delta is not None and float(bic_delta) < 0.0)
 
     stage1_fields = {
         "masking_test_passed": stage1_passed,
@@ -3202,8 +3235,11 @@ def evaluate_new_layer(
     return {
         "bic_before": bic_before,
         "bic_after": bic_after,
-        "bic_delta": bic_delta,          # normalized per-sample; range ~[-0.5, 0] for good layers
-        "bic_delta_raw": bic_delta_raw,  # raw (grid-size-dependent); diagnostic only
+        # Raw extensive delta; negative improves parsimony-adjusted fit.
+        "bic_delta": bic_delta,
+        "bic_delta_raw": bic_delta_raw,
+        "bic_delta_per_sample_mean": score_after.get("bic_delta_per_sample_mean"),
+        "bic_delta_per_sample_by_target": score_after.get("bic_delta_per_sample_by_target", {}),
         "bic_before_observed": bic_before_observed,
         "bic_after_observed": bic_after_observed,
         "bic_comparison_n_effective_samples": bic_comparison_n_eff,
@@ -3222,6 +3258,9 @@ def evaluate_new_layer(
         "mutual_info": mi_scores,
         "pairwise_distance": pairwise_distances,
         "admitted": admitted,
+        "lift_success_passed": lift_success_passed,
+        "training_success": training_success,
+        "bic_admission_passed": bic_admission_passed,
         "admission_path": admission_path,
         # For hypothesis agent training: positive = improvement (higher = better)
         "predicted_value": -float(bic_delta) if bic_delta is not None else 0.0,

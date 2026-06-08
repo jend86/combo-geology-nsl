@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from voxel_features import scoring
 
@@ -38,6 +39,40 @@ def test_offset_candidate_lifts_existing_target_without_colocation() -> None:
     assert result["candidate_predictor_lift_by_target"]["target"] > 0.0
     assert result["bic_delta"] < 0.0
     assert result["admitted"] is True
+    assert result["lift_success_passed"] is True
+    assert result["training_success"] is True
+
+
+def test_bic_delta_is_raw_extensive_and_normalized_value_is_telemetry() -> None:
+    shape = (40, 40, 3)
+    target = _blob(shape, (16, 20), radius=2)
+    candidate = _blob(shape, (24, 20), radius=2)
+
+    result = scoring.spatial_predictor_lift_score(
+        [target.ravel()],
+        ["target"],
+        candidate.ravel(),
+        shape,
+        ridge_alpha=1e-2,
+        null_permutations=0,
+    )
+
+    raw_by_target = {
+        name: result["bic_after_by_target"][name] - result["bic_before_by_target"][name]
+        for name in result["bic_before_by_target"]
+    }
+    per_sample_mean = float(
+        np.mean([
+            raw_by_target[name] / max(result["n_holdout_rows_by_target"][name], 1)
+            for name in raw_by_target
+        ])
+    )
+
+    assert result["bic_delta"] == pytest.approx(sum(raw_by_target.values()))
+    assert result["bic_delta_raw"] == pytest.approx(result["bic_delta"])
+    assert result["bic_delta_by_target"] == pytest.approx(raw_by_target)
+    assert result["bic_delta_per_sample_mean"] == pytest.approx(per_sample_mean)
+    assert result["bic_delta"] != pytest.approx(result["bic_delta_per_sample_mean"])
 
 
 def test_clone_into_identical_pool_has_no_predictor_lift() -> None:

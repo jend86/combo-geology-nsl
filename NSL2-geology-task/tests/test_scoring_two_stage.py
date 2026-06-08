@@ -131,6 +131,7 @@ def test_spatial_predictor_lift_admits_non_colocated_candidate(
     # seed window, which is raised to build a diverse founder pool
     # (see test_seed_bootstrap_extends_to_diverse_founder_pool).
     monkeypatch.setattr(scoring, "_SPATIAL_SEED_POOL_TARGET", 3)
+    monkeypatch.setenv("VFM_SPATIAL_NULL_PERMUTATIONS", "0")
     store = _store(tmp_path / "normal_admit")
     _seed_normal_pool(store)
 

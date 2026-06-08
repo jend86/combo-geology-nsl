@@ -43,12 +43,14 @@ def _seed_crossbreed_ready(variation: FeatureHypothesisKazakhstanVariation) -> N
                         "hypothesis": f"seed hypothesis {i}",
                         "layer_name": f"layer_{i}",
                         "bic_delta": -(i + 1.0),
+                        "admission_path": "normal",
+                        "crossbreed_parent_eligible": True,
                     }
                 )
                 + "\n"
             )
     (kg / "file_rotation_state.json").write_text(
-        json.dumps({"counts": {s["key"]: 1 for s in _KAZAKHSTAN_SOURCE_FILES}}),
+        json.dumps({"counts": {s["key"]: 2 for s in _KAZAKHSTAN_SOURCE_FILES}}),
         encoding="utf-8",
     )
     (kg / "greedy_init_complete.json").write_text(
@@ -236,6 +238,23 @@ def test_crossbreed_failure_streak_updates_on_finalize(tmp_path: Path) -> None:
 
     assert state_after_failure["consecutive_failed_crossbreed"] == 1
     assert state_after_success["consecutive_failed_crossbreed"] == 0
+
+
+def test_crossbreed_lift_success_without_kg_admission_counts_toward_plateau(tmp_path: Path) -> None:
+    task = _task(tmp_path)
+    variation = _variation(tmp_path)
+    kg = Path(variation.kg_dir)
+
+    _finalize_crossbreed(
+        task,
+        variation,
+        episode_id="ep_lift_only_1",
+        admitted=True,
+        bic_delta=1.5,
+    )
+
+    state = json.loads((kg / "interweave_state.json").read_text())
+    assert state["consecutive_failed_crossbreed"] == 1
 
 
 def test_duplicate_crossbreed_admit_counts_toward_plateau(tmp_path: Path) -> None:
