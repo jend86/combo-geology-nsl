@@ -15,11 +15,18 @@ from loguru import logger
 
 
 DEFAULT_MAX_SEQ_LENGTH = 2048
+IGNORE_INDEX = -100
 TrainingExportFormat = Literal["lora", "merged_16bit", "gguf"]
 ConfiguredTrainingExportFormat = Literal["auto", "lora", "merged_16bit", "gguf"]
 SFTConfig: Any | None = None
 SFTTrainer: Any | None = None
 load_dataset: Any | None = None
+SEQUENCE_FEATURE_KEYS = (
+    "input_ids",
+    "attention_mask",
+    "token_type_ids",
+    "mm_token_type_ids",
+)
 LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -61,9 +68,9 @@ class _FastLanguageModelProxy:
 FastLanguageModel = _FastLanguageModelProxy()
 
 
-class _SimpleDataset(list[dict[str, str]]):
+class _SimpleDataset(list[dict[str, Any]]):
     @classmethod
-    def from_list(cls, rows: list[dict[str, str]]) -> "_SimpleDataset":
+    def from_list(cls, rows: list[dict[str, Any]]) -> "_SimpleDataset":
         return cls(rows)
 
     @property
@@ -84,7 +91,7 @@ class _SimpleSFTConfig:
             setattr(self, key, value)
 
 
-def _dataset_from_list(rows: list[dict[str, str]]) -> Any:
+def _dataset_from_list(rows: list[dict[str, Any]]) -> Any:
     try:
         from datasets import Dataset
     except ImportError:
@@ -289,10 +296,244 @@ def _training_metadata_path(artifact_path: Path) -> Path:
     return artifact_path / "training_info.json"
 
 
+def _as_1d_int_list(value: Any, *, key: str) -> list[int]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list):
+        raise ValueError(f"Encoded field '{key}' is not a sequence")
+    if value and isinstance(value[0], list):
+        if len(value) != 1:
+            raise ValueError(f"Encoded field '{key}' is batched with {len(value)} rows")
+        value = value[0]
+    return [int(item) for item in value]
+
+
+def _encoded_sequence(encoded: Any, key: str) -> list[int] | None:
+    if isinstance(encoded, dict):
+        value = encoded.get(key)
+    else:
+        value = getattr(encoded, key, None)
+    if value is None:
+        return None
+    return _as_1d_int_list(value, key=key)
+
+
+def _is_gemma_vlm_processor(tokenizer: Any) -> bool:
+    class_name = tokenizer.__class__.__name__.lower()
+    return (
+        "gemma" in class_name
+        and hasattr(tokenizer, "tokenizer")
+        and hasattr(tokenizer, "image_processor")
+    )
+
+
+def _encode_text(tokenizer: Any, text: str) -> dict[str, list[int]]:
+    try:
+        encoded = tokenizer(text=text, truncation=False, padding=False)
+    except Exception:  # noqa: BLE001 - VLM processors and text tokenizers differ here.
+        text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+        if text_tokenizer is tokenizer:
+            raise
+        encoded = text_tokenizer(text, truncation=False, padding=False)
+
+    row: dict[str, list[int]] = {}
+    for key in SEQUENCE_FEATURE_KEYS:
+        sequence = _encoded_sequence(encoded, key)
+        if sequence is not None:
+            row[key] = sequence
+
+    input_ids = row.get("input_ids")
+    if input_ids is None:
+        raise ValueError("Tokenizer did not return input_ids for SFT row")
+
+    for key, sequence in row.items():
+        if len(sequence) != len(input_ids):
+            raise ValueError(
+                f"Encoded field '{key}' has length {len(sequence)} but input_ids has length {len(input_ids)}"
+            )
+
+    # Gemma 4 is a text+multimodal architecture whose training forward may require
+    # text-only token type tensors. Add the semantically correct all-zero values
+    # when the processor did not emit them, while avoiding these extra kwargs for
+    # ordinary text-only models.
+    if _is_gemma_vlm_processor(tokenizer):
+        zeros = [0] * len(input_ids)
+        row.setdefault("token_type_ids", zeros)
+        row.setdefault("mm_token_type_ids", zeros)
+
+    return row
+
+
+def _tokenize_text(tokenizer: Any, text: str) -> list[int]:
+    return _encode_text(tokenizer, text)["input_ids"]
+
+
+def _build_query_response_sft_row(
+    tokenizer: Any,
+    *,
+    prompt: str,
+    raw_response: str,
+) -> dict[str, Any]:
+    prompt_text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    full_text = tokenizer.apply_chat_template(
+        [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": raw_response},
+        ],
+        tokenize=False,
+        add_generation_prompt=False,
+    )
+
+    prompt_ids = _tokenize_text(tokenizer, prompt_text)
+    row = _encode_text(tokenizer, full_text)
+    input_ids = row["input_ids"]
+    if input_ids[: len(prompt_ids)] != prompt_ids:
+        raise ValueError(
+            "Cannot build completion-only SFT mask: tokenized query template is not "
+            "a prefix of the tokenized query+response template. Check the chat template."
+        )
+
+    completion_len = len(input_ids) - len(prompt_ids)
+    if completion_len <= 0:
+        raise ValueError("Cannot build completion-only SFT row with no response tokens")
+
+    row["completion_mask"] = [0] * len(prompt_ids) + [1] * completion_len
+    return row
+
+
+def _build_completion_only_labels(
+    *,
+    input_ids: Sequence[int],
+    completion_mask: Sequence[int],
+    attention_mask: Sequence[int] | None = None,
+) -> list[int]:
+    if len(input_ids) != len(completion_mask):
+        raise ValueError("input_ids and completion_mask must have the same length")
+    if attention_mask is not None and len(input_ids) != len(attention_mask):
+        raise ValueError("input_ids and attention_mask must have the same length")
+
+    labels: list[int] = []
+    for index, token_id in enumerate(input_ids):
+        is_completion = bool(completion_mask[index])
+        is_attended = attention_mask is None or bool(attention_mask[index])
+        labels.append(int(token_id) if is_completion and is_attended else IGNORE_INDEX)
+    return labels
+
+
+def _pad_token_id(tokenizer: Any) -> int:
+    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    for attr in ("pad_token_id", "eos_token_id"):
+        value = getattr(text_tokenizer, attr, None)
+        if value is not None:
+            return int(value)
+    raise ValueError("Tokenizer must define pad_token_id or eos_token_id")
+
+
+class _CompletionOnlyDataCollator:
+    def __init__(self, *, pad_token_id: int, max_seq_length: int) -> None:
+        self.pad_token_id = pad_token_id
+        self.max_seq_length = max_seq_length
+
+    @staticmethod
+    def _pad(values: Sequence[int], *, length: int, value: int) -> list[int]:
+        return list(values) + [value] * (length - len(values))
+
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        import torch
+
+        if not examples:
+            raise ValueError("Cannot collate an empty SFT batch")
+
+        rows: list[dict[str, list[int]]] = []
+        for example in examples:
+            input_ids = _as_1d_int_list(example["input_ids"], key="input_ids")
+            completion_mask = _as_1d_int_list(
+                example["completion_mask"], key="completion_mask"
+            )
+            if len(input_ids) != len(completion_mask):
+                raise ValueError("input_ids and completion_mask must have the same length")
+
+            row: dict[str, list[int]] = {}
+            truncated_len = min(len(input_ids), self.max_seq_length)
+            row["input_ids"] = input_ids[:truncated_len]
+            row["completion_mask"] = completion_mask[:truncated_len]
+
+            attention_mask = example.get("attention_mask")
+            if attention_mask is None:
+                row["attention_mask"] = [1] * truncated_len
+            else:
+                attention = _as_1d_int_list(attention_mask, key="attention_mask")
+                if len(attention) != len(input_ids):
+                    raise ValueError("input_ids and attention_mask must have the same length")
+                row["attention_mask"] = attention[:truncated_len]
+
+            for key in ("token_type_ids", "mm_token_type_ids"):
+                if key not in example:
+                    continue
+                values = _as_1d_int_list(example[key], key=key)
+                if len(values) != len(input_ids):
+                    raise ValueError(f"input_ids and {key} must have the same length")
+                row[key] = values[:truncated_len]
+
+            row["labels"] = _build_completion_only_labels(
+                input_ids=row["input_ids"],
+                completion_mask=row["completion_mask"],
+                attention_mask=row["attention_mask"],
+            )
+            rows.append(row)
+
+        batch_length = max(len(row["input_ids"]) for row in rows)
+        output: dict[str, Any] = {}
+        output["input_ids"] = torch.tensor(
+            [
+                self._pad(row["input_ids"], length=batch_length, value=self.pad_token_id)
+                for row in rows
+            ],
+            dtype=torch.long,
+        )
+        output["attention_mask"] = torch.tensor(
+            [
+                self._pad(row["attention_mask"], length=batch_length, value=0)
+                for row in rows
+            ],
+            dtype=torch.long,
+        )
+        output["labels"] = torch.tensor(
+            [
+                self._pad(row["labels"], length=batch_length, value=IGNORE_INDEX)
+                for row in rows
+            ],
+            dtype=torch.long,
+        )
+        for key in ("token_type_ids", "mm_token_type_ids"):
+            if not all(key in row for row in rows):
+                continue
+            output[key] = torch.tensor(
+                [self._pad(row[key], length=batch_length, value=0) for row in rows],
+                dtype=torch.long,
+            )
+        return output
+
+
+def _make_completion_only_data_collator(
+    tokenizer: Any, *, max_seq_length: int
+) -> _CompletionOnlyDataCollator:
+    return _CompletionOnlyDataCollator(
+        pad_token_id=_pad_token_id(tokenizer),
+        max_seq_length=max_seq_length,
+    )
+
+
 def _load_self_generated_sft_rows(
     training_data_paths: Sequence[Path], tokenizer: Any
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     for training_data_path in training_data_paths:
         resolved_path = Path(training_data_path).expanduser().resolve()
         with open(resolved_path, "r", encoding="utf-8") as handle:
@@ -310,35 +551,21 @@ def _load_self_generated_sft_rows(
                 if not isinstance(prompt, str) or not isinstance(raw_response, str):
                     continue
 
-                # Emit a single full-conversation `text` field (user+assistant
-                # templated together). This is the format the proven nsl2 finetune
-                # used. The earlier prompt/completion split — two apply_chat_template
-                # calls sliced by character length, fed to TRL's prompt-completion
-                # path — index-asserted in the gemma-4 forward (ATen IndexKernel.cu:111)
-                # regardless of completion_only_loss; full-sequence `text` does not.
-                text = tokenizer.apply_chat_template(
-                    [
-                        {"role": "user", "content": prompt},
-                        {"role": "assistant", "content": raw_response},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=False,
+                # Keep one full-conversation encoding to avoid the Gemma 4
+                # prompt/completion concat crash, but attach an explicit mask so
+                # only response tokens contribute to the loss.
+                rows.append(
+                    _build_query_response_sft_row(
+                        tokenizer,
+                        prompt=prompt,
+                        raw_response=raw_response,
+                    )
                 )
-                rows.append({"text": text})
     return rows
 
 
 def _tokenized_length(tokenizer: Any, text: str) -> int:
-    # Gemma 4 is a VLM: its processor's __call__ maps the first positional arg to
-    # `images`, not `text` (transformers>=5.5 / unsloth_zoo patched call), so
-    # `tokenizer(text)` sends the string to the image slot and crashes on text[0].
-    # Unwrap to the inner text tokenizer for a plain token count.
-    text_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
-    encoded = text_tokenizer(text, truncation=False, padding=False)
-    input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
-    if input_ids and isinstance(input_ids[0], list):
-        return len(input_ids[0])
-    return len(input_ids)
+    return len(_tokenize_text(tokenizer, text))
 
 
 def _warn_if_dataset_would_truncate(
@@ -350,27 +577,42 @@ def _warn_if_dataset_would_truncate(
     longest_tokens = 0
     longest_index = -1
     truncated_count = 0
+    fully_masked_after_truncation = 0
     for index, row in enumerate(dataset):
-        text = row.get("text") if isinstance(row, dict) else None
-        if not isinstance(text, str):
-            continue
-        token_count = _tokenized_length(tokenizer, text)
+        completion_mask = None
+        if isinstance(row, dict) and isinstance(row.get("input_ids"), list):
+            token_count = len(row["input_ids"])
+            if isinstance(row.get("completion_mask"), list):
+                completion_mask = row["completion_mask"]
+        else:
+            text = row.get("text") if isinstance(row, dict) else None
+            if not isinstance(text, str):
+                continue
+            token_count = _tokenized_length(tokenizer, text)
         if token_count > longest_tokens:
             longest_tokens = token_count
             longest_index = index
         if token_count > max_seq_length:
             truncated_count += 1
+            if completion_mask is not None and 1 not in completion_mask[:max_seq_length]:
+                fully_masked_after_truncation += 1
 
     if truncated_count == 0:
         return
 
-    logger.warning(
+    message = (
         f"Training dataset would truncate {truncated_count}/{len(dataset)} rows with "
         f"max_seq_length={max_seq_length}; longest row is {longest_tokens} tokens "
         f"at dataset index {longest_index}. Set max_seq_length to at least "
         f"{longest_tokens} to preserve every row, or deliberately pre-clip/export "
         "shorter training examples before SFT."
     )
+    if fully_masked_after_truncation:
+        message += (
+            f" {fully_masked_after_truncation} rows would have no response tokens "
+            "left after truncation."
+        )
+    logger.warning(message)
 
 
 def _load_rehearsal_sft_rows(
@@ -384,7 +626,7 @@ def _load_rehearsal_sft_rows(
     seed: int,
     prompt_chars: int,
     max_chars: int,
-) -> list[list[dict[str, str]]]:
+) -> list[list[dict[str, Any]]]:
     if rows_per_epoch <= 0:
         return [[] for _ in range(virtual_epochs)]
 
@@ -403,7 +645,7 @@ def _load_rehearsal_sft_rows(
             f"No rehearsal text found in dataset '{dataset_name}' field '{text_field}'"
         )
 
-    rows_by_epoch: list[list[dict[str, str]]] = []
+    rows_by_epoch: list[list[dict[str, Any]]] = []
     for epoch in range(virtual_epochs):
         rng = random.Random(seed + epoch)
         if rows_per_epoch <= len(valid_texts):
@@ -411,7 +653,7 @@ def _load_rehearsal_sft_rows(
         else:
             selected_texts = [rng.choice(valid_texts) for _ in range(rows_per_epoch)]
 
-        epoch_rows: list[dict[str, str]] = []
+        epoch_rows: list[dict[str, Any]] = []
         for text in selected_texts:
             excerpt = text[:prompt_chars].rstrip()
             prompt = "Continue the following geoscience passage"
@@ -419,17 +661,13 @@ def _load_rehearsal_sft_rows(
                 prompt += f":\n\n{excerpt}"
             else:
                 prompt += "."
-            # Same single-`text` chat format as the self-generated rows so both
-            # share one SFTConfig(dataset_text_field="text") full-sequence path.
-            templated = tokenizer.apply_chat_template(
-                [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": text},
-                ],
-                tokenize=False,
-                add_generation_prompt=False,
+            epoch_rows.append(
+                _build_query_response_sft_row(
+                    tokenizer,
+                    prompt=prompt,
+                    raw_response=text,
+                )
             )
-            epoch_rows.append({"text": templated})
         rows_by_epoch.append(epoch_rows)
 
     return rows_by_epoch
@@ -458,7 +696,7 @@ def _load_sft_dataset(
     if not rows:
         raise ValueError("No training rows found")
 
-    rehearsal_rows_by_epoch: list[list[dict[str, str]]]
+    rehearsal_rows_by_epoch: list[list[dict[str, Any]]]
     if rehearsal_dataset:
         rehearsal_rows_by_epoch = _load_rehearsal_sft_rows(
             tokenizer=tokenizer,
@@ -474,7 +712,7 @@ def _load_sft_dataset(
     else:
         rehearsal_rows_by_epoch = [[] for _ in range(virtual_epochs)]
 
-    expanded_rows: list[dict[str, str]] = []
+    expanded_rows: list[dict[str, Any]] = []
     for epoch in range(virtual_epochs):
         expanded_rows.extend(rows)
         expanded_rows.extend(rehearsal_rows_by_epoch[epoch])
@@ -617,16 +855,22 @@ def train_sft(
             save_strategy="no",
             report_to=report_to,
             max_length=max_seq_length,
-            # Full-sequence language-modeling on a single `text` column (both self-
-            # generated and rehearsal rows carry it). This is the proven nsl2 format;
-            # TRL's prompt/completion path index-asserted in the gemma-4 forward.
-            dataset_text_field="text",
+            # Pre-tokenized full-chat sequences with completion_mask. This keeps
+            # the proven one-pass Gemma 4 encoding path while masking query tokens
+            # out of the loss in the collator.
+            completion_only_loss=True,
+            dataset_kwargs={"skip_prepare_dataset": True},
+            remove_unused_columns=False,
             seed=seed,
             **_mixed_precision_kwargs(),
             optim="paged_adamw_8bit",
         ),
         train_dataset=dataset,
         processing_class=tokenizer,
+        data_collator=_make_completion_only_data_collator(
+            tokenizer,
+            max_seq_length=max_seq_length,
+        ),
     )
     trainer.train()
 
@@ -656,6 +900,8 @@ def train_sft(
             "lora_dropout": lora_dropout,
             "seed": seed,
             "row_count": row_count,
+            "completion_only_loss": True,
+            "masking": "completion_mask",
             "training_data_paths": resolved_training_paths,
             "rehearsal_dataset": rehearsal_dataset,
             "rehearsal_split": rehearsal_split,

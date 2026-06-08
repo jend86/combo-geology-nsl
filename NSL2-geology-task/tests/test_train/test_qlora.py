@@ -62,17 +62,25 @@ class TestLoadSftDataset(unittest.TestCase):
                 fh.write(json.dumps(row) + "\n")
 
     def _make_tokenizer(self):
-        tokenizer = MagicMock()
+        class FakeTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
 
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            user_content = messages[0]["content"]
-            if len(messages) == 1:
-                return f"<user>{user_content}</user><asst>"
-            asst_content = messages[1]["content"]
-            return f"<user>{user_content}</user><asst>{asst_content}</asst>"
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+                user_content = messages[0]["content"]
+                if len(messages) == 1:
+                    return f"<user>{user_content}</user><asst>"
+                asst_content = messages[1]["content"]
+                return f"<user>{user_content}</user><asst>{asst_content}</asst>"
 
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
-        return tokenizer
+            def __call__(self, text=None, **_kwargs):
+                assert isinstance(text, str)
+                return {
+                    "input_ids": [ord(char) for char in text],
+                    "attention_mask": [1] * len(text),
+                }
+
+        return FakeTokenizer()
 
     def _make_row(self, *, success: bool = True, **kwargs) -> dict:
         base = {
@@ -98,11 +106,13 @@ class TestLoadSftDataset(unittest.TestCase):
             self._make_jsonl([self._make_row(), self._make_row()], path)
             dataset = _load_sft_dataset([path], tokenizer)
         self.assertGreater(len(dataset), 0)
-        self.assertIn("text", dataset.column_names)
+        self.assertIn("input_ids", dataset.column_names)
+        self.assertIn("completion_mask", dataset.column_names)
+        self.assertNotIn("text", dataset.column_names)
         self.assertNotIn("prompt", dataset.column_names)
         self.assertNotIn("completion", dataset.column_names)
 
-    def test_load_sft_dataset_templates_full_text(self):
+    def test_load_sft_dataset_templates_and_masks_response(self):
         from src.train.qlora import _load_sft_dataset
 
         tokenizer = self._make_tokenizer()
@@ -111,7 +121,47 @@ class TestLoadSftDataset(unittest.TestCase):
             self._make_jsonl([self._make_row(prompt="Question", raw_response="Answer")], path)
             dataset = _load_sft_dataset([path], tokenizer)
 
-        self.assertEqual(dataset[0]["text"], "<user>Question</user><asst>Answer</asst>")
+        full_text = "<user>Question</user><asst>Answer</asst>"
+        prompt_text = "<user>Question</user><asst>"
+        self.assertEqual(dataset[0]["input_ids"], [ord(char) for char in full_text])
+        self.assertEqual(
+            dataset[0]["completion_mask"][: len(prompt_text)],
+            [0] * len(prompt_text),
+        )
+        self.assertEqual(
+            dataset[0]["completion_mask"][len(prompt_text) :],
+            [1] * (len(full_text) - len(prompt_text)),
+        )
+
+    def test_build_query_response_sft_row_rejects_non_prefix_template(self):
+        from src.train.qlora import _build_query_response_sft_row
+
+        tokenizer = self._make_tokenizer()
+        original = tokenizer.apply_chat_template
+
+        def bad_template(messages, tokenize, add_generation_prompt):
+            if len(messages) == 1:
+                return "<other-prefix>"
+            return original(messages, tokenize, add_generation_prompt)
+
+        tokenizer.apply_chat_template = bad_template
+
+        with self.assertRaises(ValueError):
+            _build_query_response_sft_row(
+                tokenizer,
+                prompt="Question",
+                raw_response="Answer",
+            )
+
+    def test_completion_only_labels_mask_query_tokens(self):
+        from src.train.qlora import IGNORE_INDEX, _build_completion_only_labels
+
+        labels = _build_completion_only_labels(
+            input_ids=[10, 11, 12, 13],
+            completion_mask=[0, 0, 1, 1],
+        )
+
+        self.assertEqual(labels, [IGNORE_INDEX, IGNORE_INDEX, 12, 13])
 
     def test_load_sft_dataset_multiple_files(self):
         from src.train.qlora import _load_sft_dataset
@@ -187,15 +237,17 @@ class TestLoadSftDataset(unittest.TestCase):
             split="train",
         )
         self.assertEqual(len(dataset), 6)
+        texts = ["".join(chr(token_id) for token_id in row["input_ids"]) for row in dataset]
         self.assertEqual(
-            sum(row["text"] == "<user>Kazakhstan task</user><asst>Hypothesis</asst>" for row in dataset),
+            sum(text == "<user>Kazakhstan task</user><asst>Hypothesis</asst>" for text in texts),
             2,
         )
-        rehearsal_rows = [row for row in dataset if "Continue the following" in row["text"]]
-        self.assertEqual(len(rehearsal_rows), 4)
+        rehearsal_texts = [text for text in texts if "Continue the following" in text]
+        self.assertEqual(len(rehearsal_texts), 4)
         self.assertTrue(
-            all("Geology rehearsal passage" in row["text"] for row in rehearsal_rows)
+            all("Geology rehearsal passage" in text for text in rehearsal_texts)
         )
+        self.assertTrue(all(1 in row["completion_mask"] for row in dataset))
 
     @patch("src.train.qlora.logger.warning")
     def test_warn_if_dataset_would_truncate_suggests_preserving_length(
@@ -204,14 +256,12 @@ class TestLoadSftDataset(unittest.TestCase):
     ) -> None:
         from src.train.qlora import _warn_if_dataset_would_truncate
 
-        tokenizer = MagicMock()
-        tokenizer.side_effect = lambda text, **_kwargs: {"input_ids": list(range(len(text.split())))}
         dataset = [
-            {"text": "short row"},
-            {"text": "one two three four five six"},
+            {"input_ids": [1, 2]},
+            {"input_ids": [1, 2, 3, 4, 5, 6]},
         ]
 
-        _warn_if_dataset_would_truncate(dataset, tokenizer, max_seq_length=4)
+        _warn_if_dataset_would_truncate(dataset, MagicMock(), max_seq_length=4)
 
         mock_warning.assert_called_once()
         warning = mock_warning.call_args.args[0]
@@ -226,11 +276,9 @@ class TestLoadSftDataset(unittest.TestCase):
     ) -> None:
         from src.train.qlora import _warn_if_dataset_would_truncate
 
-        tokenizer = MagicMock()
-        tokenizer.side_effect = lambda text, **_kwargs: {"input_ids": list(range(len(text.split())))}
-        dataset = [{"text": "one two three"}]
+        dataset = [{"input_ids": [1, 2, 3]}]
 
-        _warn_if_dataset_would_truncate(dataset, tokenizer, max_seq_length=3)
+        _warn_if_dataset_would_truncate(dataset, MagicMock(), max_seq_length=3)
 
         mock_warning.assert_not_called()
 
@@ -299,6 +347,33 @@ class TestTrainSft(unittest.TestCase):
             "episode_score": 100.0,
         }
 
+    def _make_tokenizer(self):
+        tokenizer = MagicMock()
+        tokenizer.pad_token_id = 0
+        tokenizer.eos_token_id = 2
+
+        def apply_chat_template(messages, tokenize, add_generation_prompt):
+            user_content = messages[0]["content"]
+            if len(messages) == 1:
+                return f"<user>{user_content}</user><asst>"
+            asst_content = messages[1]["content"]
+            return f"<user>{user_content}</user><asst>{asst_content}</asst>"
+
+        def tokenize(text=None, **_kwargs):
+            assert isinstance(text, str)
+            return {
+                "input_ids": [ord(char) for char in text],
+                "attention_mask": [1] * len(text),
+            }
+
+        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer.side_effect = tokenize
+        return tokenizer
+
+    def _run_train_sft(self, train_sft, **kwargs):
+        with patch.dict(sys.modules, {"unsloth": MagicMock()}):
+            return train_sft(**kwargs)
+
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
@@ -308,12 +383,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            return f"<text>{messages[0]['content']}</text>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
 
@@ -325,7 +395,8 @@ class TestTrainSft(unittest.TestCase):
             self._make_jsonl([self._make_row()], data_path)
             output_dir = Path(tmpdir) / "adapter"
 
-            result = train_sft(
+            result = self._run_train_sft(
+                train_sft,
                 base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                 training_data_paths=[str(data_path)],
                 output_dir=str(output_dir),
@@ -334,7 +405,13 @@ class TestTrainSft(unittest.TestCase):
 
         trainer_instance.train.assert_called_once()
         trainer_args = mock_sft_trainer_cls.call_args.kwargs["args"]
-        self.assertEqual(trainer_args.dataset_text_field, "text")
+        self.assertTrue(trainer_args.completion_only_loss)
+        self.assertEqual(trainer_args.dataset_kwargs, {"skip_prepare_dataset": True})
+        self.assertFalse(trainer_args.remove_unused_columns)
+        trainer_dataset = mock_sft_trainer_cls.call_args.kwargs["train_dataset"]
+        self.assertIn("input_ids", trainer_dataset.column_names)
+        self.assertIn("completion_mask", trainer_dataset.column_names)
+        self.assertIn("data_collator", mock_sft_trainer_cls.call_args.kwargs)
         model.save_pretrained.assert_called_once()
         tokenizer.save_pretrained.assert_called_once()
         model.save_pretrained_merged.assert_not_called()
@@ -352,12 +429,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            return f"<text>{messages[0]['content']}</text>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
         trainer_instance = MagicMock()
@@ -372,7 +444,8 @@ class TestTrainSft(unittest.TestCase):
 
             with patch.dict(os.environ, {}, clear=True):
                 with patch("src.train.qlora.find_dotenv", return_value=str(env_path)):
-                    result = train_sft(
+                    result = self._run_train_sft(
+                        train_sft,
                         base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                         training_data_paths=[str(data_path)],
                         output_dir=str(output_dir),
@@ -397,7 +470,8 @@ class TestTrainSft(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 with patch("src.train.qlora.find_dotenv", return_value=""):
                     with self.assertRaises(RuntimeError):
-                        train_sft(
+                        self._run_train_sft(
+                            train_sft,
                             base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                             training_data_paths=[str(data_path)],
                             output_dir=str(output_dir),
@@ -414,12 +488,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            return f"<text>{messages[0]['content']}</text>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
 
@@ -431,7 +500,8 @@ class TestTrainSft(unittest.TestCase):
             self._make_jsonl([self._make_row()], data_path)
             output_dir = Path(tmpdir) / "adapter"
 
-            result = train_sft(
+            result = self._run_train_sft(
+                train_sft,
                 base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                 training_data_paths=[str(data_path)],
                 output_dir=str(output_dir),
@@ -458,12 +528,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            return f"<text>{messages[0]['content']}</text>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
         mock_sft_trainer_cls.return_value = MagicMock()
@@ -474,7 +539,8 @@ class TestTrainSft(unittest.TestCase):
             output_dir = Path(tmpdir) / "artifact"
             mock_save_training_artifact.return_value = output_dir.resolve()
 
-            train_sft(
+            self._run_train_sft(
+                train_sft,
                 base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                 training_data_paths=[str(data_path)],
                 output_dir=str(output_dir),
@@ -502,12 +568,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            return f"<text>{messages[0]['content']}</text>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
         mock_sft_trainer_cls.return_value = MagicMock()
@@ -518,7 +579,8 @@ class TestTrainSft(unittest.TestCase):
             output_dir = Path(tmpdir) / "adapter"
             mock_save_training_artifact.return_value = output_dir.resolve()
 
-            train_sft(
+            self._run_train_sft(
+                train_sft,
                 base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                 training_data_paths=[str(data_path)],
                 output_dir=str(output_dir),
@@ -551,15 +613,7 @@ class TestTrainSft(unittest.TestCase):
         from src.train.qlora import train_sft
 
         model = MagicMock()
-        tokenizer = MagicMock()
-
-        def apply_chat_template(messages, tokenize, add_generation_prompt):
-            user_content = messages[0]["content"]
-            if len(messages) == 1:
-                return f"<user>{user_content}</user><asst>"
-            return f"<user>{user_content}</user><asst>{messages[1]['content']}</asst>"
-
-        tokenizer.apply_chat_template.side_effect = apply_chat_template
+        tokenizer = self._make_tokenizer()
         mock_load_base_model.return_value = (model, tokenizer)
         mock_attach_lora_adapter.return_value = model
         mock_sft_trainer_cls.return_value = MagicMock()
@@ -580,7 +634,8 @@ class TestTrainSft(unittest.TestCase):
             ]
 
             with patch("src.train.qlora.load_dataset", return_value=rehearsal):
-                train_sft(
+                self._run_train_sft(
+                    train_sft,
                     base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
                     training_data_paths=[str(data_path)],
                     output_dir=str(output_dir),
