@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -154,6 +155,55 @@ class TestLoadSftDataset(unittest.TestCase):
         kept = "".join(chr(token_id) for token_id in dataset[0]["input_ids"])
         self.assertIn("hi", kept)
         self.assertIn(1, dataset[0]["completion_mask"][:40])
+
+    def test_completion_survives_truncation_helper(self):
+        from src.train.qlora import _completion_survives_truncation
+
+        self.assertTrue(
+            _completion_survives_truncation(
+                {"completion_mask": [0, 1]},
+                max_seq_length=2,
+            )
+        )
+        self.assertFalse(
+            _completion_survives_truncation(
+                {"completion_mask": [0, 0, 1]},
+                max_seq_length=2,
+            )
+        )
+        self.assertTrue(
+            _completion_survives_truncation(
+                {"completion_mask": [0, 0, 1]},
+                max_seq_length=None,
+            )
+        )
+
+    def test_load_sft_dataset_drops_rehearsal_rows_with_fully_truncated_response(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row(prompt="hi", raw_response="ok")], path)
+
+            with patch(
+                "src.train.qlora.load_dataset",
+                return_value=[{"text": "x" * 120}],
+            ):
+                dataset = _load_sft_dataset(
+                    [path],
+                    tokenizer,
+                    max_seq_length=40,
+                    rehearsal_dataset="demo/rehearsal",
+                    rehearsal_rows_per_epoch=1,
+                    rehearsal_prompt_chars=100,
+                    rehearsal_max_chars=120,
+                )
+
+        self.assertEqual(len(dataset), 1)
+        kept = "".join(chr(token_id) for token_id in dataset[0]["input_ids"])
+        self.assertIn("hi", kept)
+        self.assertNotIn("Continue the following", kept)
 
     def test_load_sft_dataset_keeps_all_rows_when_max_seq_length_unset(self):
         from src.train.qlora import _load_sft_dataset
@@ -467,6 +517,111 @@ class TestTrainSft(unittest.TestCase):
     def _run_train_sft(self, train_sft, **kwargs):
         with patch.dict(sys.modules, {"unsloth": MagicMock()}):
             return train_sft(**kwargs)
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_does_not_patch_dataset_map_for_preprocessed_rows(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train import qlora
+        from src.train.qlora import train_sft
+
+        class FakeArrowDataset:
+            def map(self, *args, **kwargs):
+                return self
+
+        original_map = FakeArrowDataset.map
+        fake_arrow = SimpleNamespace(Dataset=FakeArrowDataset)
+        fake_datasets = SimpleNamespace(arrow_dataset=fake_arrow)
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            with patch.dict(
+                sys.modules,
+                {"datasets": fake_datasets, "datasets.arrow_dataset": fake_arrow},
+            ):
+                with patch(
+                    "src.train.qlora._dataset_from_list",
+                    side_effect=qlora._SimpleDataset.from_list,
+                ):
+                    self._run_train_sft(
+                        train_sft,
+                        base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                        training_data_paths=[str(data_path)],
+                        output_dir=str(output_dir),
+                        max_steps=1,
+                    )
+
+        self.assertIs(FakeArrowDataset.map, original_map)
+        self.assertFalse(hasattr(FakeArrowDataset.map, "_nsl_inproc"))
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._write_metadata")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_rejects_checkpointing_for_non_lora_exports(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_write_metadata,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_path = Path(tmpdir) / "artifact.gguf"
+            mock_save_training_artifact.return_value = output_path.resolve()
+
+            cases = [
+                {"export_format": "gguf", "save_steps": 40},
+                {"export_format": "merged_16bit", "resume_from_checkpoint": True},
+            ]
+            for case in cases:
+                with self.subTest(case=case):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "checkpointing is only supported for LoRA",
+                    ):
+                        self._run_train_sft(
+                            train_sft,
+                            base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                            training_data_paths=[str(data_path)],
+                            output_dir=str(output_path),
+                            max_steps=1,
+                            **case,
+                        )
+
+        mock_load_base_model.assert_not_called()
+        mock_attach_lora_adapter.assert_not_called()
+        mock_sft_trainer_cls.assert_not_called()
+        mock_save_training_artifact.assert_not_called()
+        mock_write_metadata.assert_not_called()
 
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._attach_lora_adapter")

@@ -421,6 +421,17 @@ def _build_query_response_sft_row(
     return row
 
 
+def _completion_survives_truncation(
+    row: dict[str, Any],
+    *,
+    max_seq_length: int | None,
+) -> bool:
+    if max_seq_length is None:
+        return True
+    completion_mask = _as_1d_int_list(row["completion_mask"], key="completion_mask")
+    return 1 in completion_mask[:max_seq_length]
+
+
 def _build_completion_only_labels(
     *,
     input_ids: Sequence[int],
@@ -582,9 +593,9 @@ def _load_self_generated_sft_rows(
                 # token survives, so every label is IGNORE_INDEX. Such a row carries
                 # zero training signal and, alone in a batch (bs=1), divides the loss
                 # by zero valid tokens -> nan that poisons gradient accumulation.
-                if (
-                    max_seq_length is not None
-                    and 1 not in row["completion_mask"][:max_seq_length]
+                if not _completion_survives_truncation(
+                    row,
+                    max_seq_length=max_seq_length,
                 ):
                     dropped_fully_truncated += 1
                     continue
@@ -663,6 +674,7 @@ def _load_rehearsal_sft_rows(
     seed: int,
     prompt_chars: int,
     max_chars: int,
+    max_seq_length: int | None = None,
 ) -> list[list[dict[str, Any]]]:
     if rows_per_epoch <= 0:
         return [[] for _ in range(virtual_epochs)]
@@ -683,6 +695,7 @@ def _load_rehearsal_sft_rows(
         )
 
     rows_by_epoch: list[list[dict[str, Any]]] = []
+    dropped_fully_truncated = 0
     for epoch in range(virtual_epochs):
         rng = random.Random(seed + epoch)
         if rows_per_epoch <= len(valid_texts):
@@ -698,15 +711,29 @@ def _load_rehearsal_sft_rows(
                 prompt += f":\n\n{excerpt}"
             else:
                 prompt += "."
-            epoch_rows.append(
-                _build_query_response_sft_row(
-                    tokenizer,
-                    prompt=prompt,
-                    raw_response=text,
-                )
+            row = _build_query_response_sft_row(
+                tokenizer,
+                prompt=prompt,
+                raw_response=text,
             )
+            if not _completion_survives_truncation(
+                row,
+                max_seq_length=max_seq_length,
+            ):
+                dropped_fully_truncated += 1
+                continue
+            epoch_rows.append(row)
         rows_by_epoch.append(epoch_rows)
 
+    if dropped_fully_truncated:
+        kept = sum(len(epoch_rows) for epoch_rows in rows_by_epoch)
+        logger.warning(
+            "Dropped {} rehearsal SFT row(s) whose response is fully truncated "
+            "at max_seq_length={} (prompt alone fills the window); kept {}.",
+            dropped_fully_truncated,
+            max_seq_length,
+            kept,
+        )
     return rows_by_epoch
 
 
@@ -748,6 +775,7 @@ def _load_sft_dataset(
             seed=rehearsal_seed,
             prompt_chars=rehearsal_prompt_chars,
             max_chars=rehearsal_max_chars,
+            max_seq_length=max_seq_length,
         )
     else:
         rehearsal_rows_by_epoch = [[] for _ in range(virtual_epochs)]
@@ -795,6 +823,15 @@ def train_sft(
     group_by_length: bool = False,
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
+
+    if export_format != "lora" and (
+        (save_steps and save_steps > 0) or resume_from_checkpoint
+    ):
+        raise ValueError(
+            "Training checkpointing is only supported for LoRA adapter exports. "
+            "Use export_format='lora' for checkpointed runs, then perform any "
+            "larger merged_16bit or GGUF export from the final adapter."
+        )
 
     # Import unsloth FIRST — before trl/transformers/peft are pulled in by
     # _load_sft_classes / _load_base_model below. Unsloth patches the gemma-4
@@ -858,29 +895,6 @@ def train_sft(
     )
     row_count = len(dataset)
     effective_warmup_steps = 0 if warmup_ratio > 0 else warmup_steps
-
-    # TRL's _prepare_dataset tokenizes via dataset.map(tokenize_fn); tokenize_fn is a closure
-    # over `self` (the trainer). datasets runs that map under a process Pool for ANY num_proc
-    # >= 1 (arrow_dataset: `if num_proc is not None and num_proc >= 1`), and Unsloth/TRL default
-    # num_proc to os.cpu_count() -- so it dill-pickles the closure to ship to workers and dies
-    # with "cannot pickle 'ConfigModuleInstance'" (a torch dynamo/inductor config object
-    # reachable from the trainer) on the torch 2.10 stack. Force every map here to run
-    # in-process (num_proc=None takes datasets' non-Pool branch); the dataset is small, so
-    # single-process tokenization costs only seconds.
-    try:
-        import datasets.arrow_dataset as _hf_arrow
-    except ImportError:
-        _hf_arrow = None
-
-    if _hf_arrow is not None and not getattr(_hf_arrow.Dataset.map, "_nsl_inproc", False):
-        _orig_dataset_map = _hf_arrow.Dataset.map
-
-        def _inproc_map(self, *map_args, **map_kwargs):
-            map_kwargs["num_proc"] = None
-            return _orig_dataset_map(self, *map_args, **map_kwargs)
-
-        _inproc_map._nsl_inproc = True
-        _hf_arrow.Dataset.map = _inproc_map
 
     # Periodic checkpointing (crash insurance for long runs). save_steps>0 keeps the
     # last few step-checkpoints under output_dir/checkpoint-*; 0 preserves the
