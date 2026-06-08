@@ -57,9 +57,9 @@ min_healthy_endpoint_capacity = 4
 # local-4090 endpoint REMOVED 2026-06-05 for external-only run (0 local slots).
 
 [[vllm.endpoints]]
-id          = "runpod-h100-nvl-stress"
-base_url    = "http://38.143.35.131:19610"  # H100 NVL pod v9wvkamxkvoqq0 (2026-06-05 STRESS re-provision; community, 94GB, fp8 KV, --max-num-seqs 128)
-capacity    = 96                      # 28->96 (2026-06-05 stress): new pod BAKED at --max-num-seqs 128 (a CEILING; KV pool ~834k tok = num_gpu_blocks 52128*16, sized by gpu_mem_util 0.92 NOT max-num-seqs -> 128 costs no VRAM unless active; ~22% used @24 streams). parallel_episodes=64 drives ~64 concurrent (~60% KV). Ramp slots via restart (cheap) to find the throughput knee; max-num-seqs is baked -> needs a re-provision to change. Monitor preemptions(was 0)/KV%/RAM/timeout-rate.
+id          = "runpod-rtx6000-ada-secure"
+base_url    = "http://195.26.233.87:43495"  # RTX 6000 Ada pod bfdl68gh49egas (2026-06-06: CHEAPER endpoint ~$0.79/hr vs H100 ~$2.5-3.5, after the 92-slot/H100 throughput goal was met. Both prior H100 NVL pods died within 7h: community v9wvkamxkvoqq0 RECLAIMED @02:55, secure kbhn124z0v92si host-failure @~10:05 -> NOT billing (account provisions fine; RunPod host/platform issue). 48GB Ada (fp8 KV works, sm_89), num_gpu_blocks~17628 (~282k tok = ~1/3 of H100's 834k), --max-num-seqs 32 baked. SCALED-DOWN cheap run while we examine voxel quality.
+capacity    = 32                      # 28->32 for the RTX 6000 Ada (= baked --max-num-seqs 32, the real ceiling) so parallel_episodes=28 has a 4-slot slack for non-inference pipelining. KV pool ~282k tok (~79% @28 streams). Card is slower (~4s/req vs H100 ~0.6s) so throughput is lower by design - cheap "keep going" tier, not the stress test.
 api_key_env = "RUNPOD_VLLM_KEY"       # pod injects VLLM_API_KEY; bearer the pool sends
 
 [task]
@@ -126,7 +126,7 @@ container_rebuild_interval = 10
 # slots pipeline NON-inference work (explore/code-exec/scoring) while waiting for an inference slot --
 # a modest gain, NOT extra decode throughput. NOT pushing past ~32: beyond it just deepens the endpoint
 # queue (no decode gain) and 32 is the tested RAM-stable ceiling. Applies on next restart; live run = 28.
-parallel_episodes = 84   # 64->84 (2026-06-06 perm-null restart; measured KV ~63%@64 => ~84%@84, knee >64, preempt 0). Ramp THIS (cheap, restart-only) NOT max-num-seqs (baked, =128 ceiling). Watch host RAM (~0.25GB/slot -> ~21GB@84) + H100 preemption/KV; back off toward 64 if preempt>0.
+parallel_episodes = 28   # 24->28 (2026-06-06 user-directed "push to 28 on the NEXT restart"; live run stays 24). RTX 6000 Ada 48GB, KV pool ~282k tok: MEASURED 24 streams = KV 67.8%/0 preempt -> 28 projects ~79% KV, under the ~95% preempt knee (feasible; watch preempt at peak-context). capacity 32 (= baked max-num-seqs) gives 4 slack. Resumes the existing KG (NOT fresh).
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20

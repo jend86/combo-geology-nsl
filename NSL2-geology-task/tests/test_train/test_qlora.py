@@ -133,6 +133,63 @@ class TestLoadSftDataset(unittest.TestCase):
             [1] * (len(full_text) - len(prompt_text)),
         )
 
+    def test_load_sft_dataset_drops_rows_with_fully_truncated_response(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            # FakeTokenizer: input_ids = [ord(c) for c in text].
+            # short prompt -> prompt prefix "<user>hi</user><asst>" = 21 tokens (< 40),
+            #   response tokens survive the max_seq_length=40 window -> KEPT.
+            short = self._make_row(prompt="hi", raw_response="ok")
+            # long prompt -> prompt prefix "<user>" + 100 + "</user><asst>" = 119 tokens
+            #   (>= 40), so completion_mask[:40] is all zeros -> response fully
+            #   truncated -> all-(-100) labels -> nan-loss row -> DROPPED.
+            long_prompt = self._make_row(prompt="x" * 100, raw_response="answer")
+            self._make_jsonl([short, long_prompt], path)
+            dataset = _load_sft_dataset([path], tokenizer, max_seq_length=40)
+
+        self.assertEqual(len(dataset), 1)
+        kept = "".join(chr(token_id) for token_id in dataset[0]["input_ids"])
+        self.assertIn("hi", kept)
+        self.assertIn(1, dataset[0]["completion_mask"][:40])
+
+    def test_load_sft_dataset_keeps_all_rows_when_max_seq_length_unset(self):
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl(
+                [
+                    self._make_row(prompt="hi", raw_response="ok"),
+                    self._make_row(prompt="x" * 100, raw_response="answer"),
+                ],
+                path,
+            )
+            # No max_seq_length -> no truncation-based dropping (default behaviour).
+            dataset = _load_sft_dataset([path], tokenizer)
+
+        self.assertEqual(len(dataset), 2)
+
+    def test_load_sft_dataset_adds_length_column_for_grouping(self):
+        # group_by_length needs a per-row length; expose it as a "length" column
+        # (TrainingArguments.length_column_name default) so the sampler groups
+        # similar-length rows without re-tokenizing.
+        from src.train.qlora import _load_sft_dataset
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl(
+                [self._make_row(prompt="Question", raw_response="Answer")], path
+            )
+            dataset = _load_sft_dataset([path], tokenizer)
+
+        self.assertIn("length", dataset.column_names)
+        self.assertEqual(dataset[0]["length"], len(dataset[0]["input_ids"]))
+
     def test_build_query_response_sft_row_rejects_non_prefix_template(self):
         from src.train.qlora import _build_query_response_sft_row
 
@@ -152,6 +209,43 @@ class TestLoadSftDataset(unittest.TestCase):
                 prompt="Question",
                 raw_response="Answer",
             )
+
+    def test_build_query_response_sft_row_handles_thinking_channel_scaffold(self):
+        # Regression: Gemma 4's chat template appends a thought-channel scaffold when
+        # add_generation_prompt=True that is absent from the assistant-message
+        # rendering, so the generation prompt is NOT a token-prefix of the full
+        # conversation. _build_query_response_sft_row must render the boundary with
+        # add_generation_prompt=False (assistant style) so masking still works.
+        from src.train.qlora import _build_query_response_sft_row
+
+        class ThinkingTokenizer:
+            pad_token_id = 0
+            eos_token_id = 2
+
+            def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+                user = messages[0]["content"]
+                base = f"<user>{user}</user><model>"
+                if len(messages) == 1:
+                    # add_generation_prompt=True injects a scaffold that diverges
+                    # from the response; =False is the clean assistant-style prefix.
+                    return base + ("<think>" if add_generation_prompt else "")
+                return base + messages[1]["content"] + "</model>"
+
+            def __call__(self, text=None, **_kwargs):
+                assert isinstance(text, str)
+                return {"input_ids": [ord(c) for c in text], "attention_mask": [1] * len(text)}
+
+        row = _build_query_response_sft_row(
+            ThinkingTokenizer(), prompt="Q", raw_response="Answer"
+        )
+        prefix = "<user>Q</user><model>"  # add_generation_prompt=False rendering
+        full = "<user>Q</user><model>Answer</model>"
+        self.assertEqual(row["input_ids"], [ord(c) for c in full])
+        self.assertEqual(row["completion_mask"][: len(prefix)], [0] * len(prefix))
+        self.assertEqual(
+            row["completion_mask"][len(prefix) :],
+            [1] * (len(full) - len(prefix)),
+        )
 
     def test_completion_only_labels_mask_query_tokens(self):
         from src.train.qlora import IGNORE_INDEX, _build_completion_only_labels
@@ -676,6 +770,145 @@ class TestTrainSft(unittest.TestCase):
         self.assertEqual(metadata["virtual_epochs"], 2)
         self.assertEqual(metadata["row_count"], 6)
         self.assertEqual(metadata["rehearsal_rows_per_epoch"], 2)
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_checkpointing_enables_step_saves(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        trainer_instance = MagicMock()
+        mock_sft_trainer_cls.return_value = trainer_instance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            self._run_train_sft(
+                train_sft,
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=-1,
+                save_steps=40,
+            )
+
+        args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(args.save_strategy, "steps")
+        self.assertEqual(args.save_steps, 40)
+        self.assertGreaterEqual(args.save_total_limit, 1)
+        # No --resume-from-checkpoint -> fresh run (None passed to train()).
+        trainer_instance.train.assert_called_once_with(resume_from_checkpoint=None)
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_default_disables_checkpointing(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            self._run_train_sft(
+                train_sft,
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+            )
+
+        args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(args.save_strategy, "no")
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_group_by_length_sets_sampler_flag(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            self._run_train_sft(
+                train_sft,
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=-1,
+                per_device_train_batch_size=4,
+                group_by_length=True,
+            )
+
+        args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertTrue(args.group_by_length)
+        self.assertEqual(args.per_device_train_batch_size, 4)
+
+    def test_train_sft_cli_accepts_checkpoint_flags(self):
+        from src.train.qlora import _build_arg_parser
+
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--base-model",
+                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "--training-data",
+                "./data/sft.jsonl",
+                "--output",
+                "./adapter",
+                "--save-steps",
+                "40",
+                "--resume-from-checkpoint",
+                "--group-by-length",
+            ]
+        )
+        self.assertEqual(args.save_steps, 40)
+        self.assertTrue(args.resume_from_checkpoint)
+        self.assertTrue(args.group_by_length)
 
     def test_train_sft_cli_multiple_training_data(self):
         """CLI should accept multiple --training-data arguments."""

@@ -376,10 +376,20 @@ def _build_query_response_sft_row(
     prompt: str,
     raw_response: str,
 ) -> dict[str, Any]:
+    # Render the masked-prompt boundary WITHOUT the generation prompt. Gemma 4's
+    # chat template, with add_generation_prompt=True, appends a "thinking channel"
+    # scaffold ("<start_of_turn>model\n<|channel>thought\n<channel|>") that the
+    # assistant-message rendering below does NOT emit (it places the response
+    # directly after "<start_of_turn>model\n"). Using the generation prompt here
+    # therefore makes prompt_text diverge from full_text right after the model turn
+    # marker, so it is not a token-prefix and the mask cannot be built. The
+    # assistant-style rendering (add_generation_prompt=False) is the user turn only,
+    # which IS a clean prefix of the user+assistant conversation; the completion
+    # then covers the model turn marker plus the response.
     prompt_text = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         tokenize=False,
-        add_generation_prompt=True,
+        add_generation_prompt=False,
     )
     full_text = tokenizer.apply_chat_template(
         [
@@ -404,6 +414,10 @@ def _build_query_response_sft_row(
         raise ValueError("Cannot build completion-only SFT row with no response tokens")
 
     row["completion_mask"] = [0] * len(prompt_ids) + [1] * completion_len
+    # Expose the token length so a length-grouped sampler (group_by_length) can
+    # batch similar-length rows together; this is TrainingArguments' default
+    # length_column_name and is ignored by the collator.
+    row["length"] = len(input_ids)
     return row
 
 
@@ -531,9 +545,13 @@ def _make_completion_only_data_collator(
 
 
 def _load_self_generated_sft_rows(
-    training_data_paths: Sequence[Path], tokenizer: Any
+    training_data_paths: Sequence[Path],
+    tokenizer: Any,
+    *,
+    max_seq_length: int | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    dropped_fully_truncated = 0
     for training_data_path in training_data_paths:
         resolved_path = Path(training_data_path).expanduser().resolve()
         with open(resolved_path, "r", encoding="utf-8") as handle:
@@ -554,13 +572,32 @@ def _load_self_generated_sft_rows(
                 # Keep one full-conversation encoding to avoid the Gemma 4
                 # prompt/completion concat crash, but attach an explicit mask so
                 # only response tokens contribute to the loss.
-                rows.append(
-                    _build_query_response_sft_row(
-                        tokenizer,
-                        prompt=prompt,
-                        raw_response=raw_response,
-                    )
+                row = _build_query_response_sft_row(
+                    tokenizer,
+                    prompt=prompt,
+                    raw_response=raw_response,
                 )
+                # Drop rows whose prompt alone fills the sequence window: after the
+                # collator truncates to the first max_seq_length tokens, no response
+                # token survives, so every label is IGNORE_INDEX. Such a row carries
+                # zero training signal and, alone in a batch (bs=1), divides the loss
+                # by zero valid tokens -> nan that poisons gradient accumulation.
+                if (
+                    max_seq_length is not None
+                    and 1 not in row["completion_mask"][:max_seq_length]
+                ):
+                    dropped_fully_truncated += 1
+                    continue
+                rows.append(row)
+
+    if dropped_fully_truncated:
+        logger.warning(
+            "Dropped {} self-generated SFT row(s) whose response is fully truncated "
+            "at max_seq_length={} (prompt alone fills the window); kept {}.",
+            dropped_fully_truncated,
+            max_seq_length,
+            len(rows),
+        )
     return rows
 
 
@@ -677,6 +714,7 @@ def _load_sft_dataset(
     training_data_paths: Sequence[Path],
     tokenizer: Any,
     *,
+    max_seq_length: int | None = None,
     virtual_epochs: int = 1,
     rehearsal_dataset: str | None = None,
     rehearsal_split: str = "train",
@@ -691,7 +729,9 @@ def _load_sft_dataset(
     if virtual_epochs < 1:
         raise ValueError("virtual_epochs must be at least 1")
 
-    rows = _load_self_generated_sft_rows(training_data_paths, tokenizer)
+    rows = _load_self_generated_sft_rows(
+        training_data_paths, tokenizer, max_seq_length=max_seq_length
+    )
 
     if not rows:
         raise ValueError("No training rows found")
@@ -750,6 +790,9 @@ def train_sft(
     wandb_project: str | None = None,
     export_format: TrainingExportFormat = "lora",
     gguf_quantize: str = "f16",
+    save_steps: int = 0,
+    resume_from_checkpoint: bool = False,
+    group_by_length: bool = False,
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
@@ -798,6 +841,7 @@ def train_sft(
     dataset = _load_sft_dataset(
         [Path(path) for path in resolved_training_paths],
         tokenizer,
+        max_seq_length=max_seq_length,
         virtual_epochs=num_train_epochs,
         rehearsal_dataset=rehearsal_dataset,
         rehearsal_split=rehearsal_split,
@@ -838,33 +882,54 @@ def train_sft(
         _inproc_map._nsl_inproc = True
         _hf_arrow.Dataset.map = _inproc_map
 
+    # Periodic checkpointing (crash insurance for long runs). save_steps>0 keeps the
+    # last few step-checkpoints under output_dir/checkpoint-*; 0 preserves the
+    # original "save only the final adapter" behaviour. The checkpoints carry the
+    # optimizer/scheduler state so --resume-from-checkpoint can continue them.
+    if save_steps and save_steps > 0:
+        checkpoint_kwargs: dict[str, Any] = {
+            "save_strategy": "steps",
+            "save_steps": save_steps,
+            "save_total_limit": 3,
+        }
+    else:
+        checkpoint_kwargs = {"save_strategy": "no"}
+
+    training_args = sft_config_cls(
+        output_dir=str(resolved_output_dir),
+        max_steps=max_steps,
+        num_train_epochs=1,
+        per_device_train_batch_size=per_device_train_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        learning_rate=learning_rate,
+        warmup_steps=effective_warmup_steps,
+        warmup_ratio=warmup_ratio,
+        lr_scheduler_type=lr_scheduler_type,
+        weight_decay=weight_decay,
+        logging_steps=logging_steps,
+        **checkpoint_kwargs,
+        report_to=report_to,
+        max_length=max_seq_length,
+        # Pre-tokenized full-chat sequences with completion_mask. This keeps
+        # the proven one-pass Gemma 4 encoding path while masking query tokens
+        # out of the loss in the collator.
+        completion_only_loss=True,
+        dataset_kwargs={"skip_prepare_dataset": True},
+        remove_unused_columns=False,
+        seed=seed,
+        **_mixed_precision_kwargs(),
+        optim="paged_adamw_8bit",
+    )
+    # Set group_by_length AFTER construction: Unsloth's compiled SFTConfig wrapper
+    # rejects it as an __init__ kwarg (TypeError) even though it is a standard
+    # TrainingArguments field. The base Trainer reads args.group_by_length when it
+    # builds the sampler, so a post-init assignment takes effect; length_column_name
+    # stays at its "length" default, which matches the per-row length we attach.
+    training_args.group_by_length = group_by_length
+
     trainer = sft_trainer_cls(
         model=model,
-        args=sft_config_cls(
-            output_dir=str(resolved_output_dir),
-            max_steps=max_steps,
-            num_train_epochs=1,
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            learning_rate=learning_rate,
-            warmup_steps=effective_warmup_steps,
-            warmup_ratio=warmup_ratio,
-            lr_scheduler_type=lr_scheduler_type,
-            weight_decay=weight_decay,
-            logging_steps=logging_steps,
-            save_strategy="no",
-            report_to=report_to,
-            max_length=max_seq_length,
-            # Pre-tokenized full-chat sequences with completion_mask. This keeps
-            # the proven one-pass Gemma 4 encoding path while masking query tokens
-            # out of the loss in the collator.
-            completion_only_loss=True,
-            dataset_kwargs={"skip_prepare_dataset": True},
-            remove_unused_columns=False,
-            seed=seed,
-            **_mixed_precision_kwargs(),
-            optim="paged_adamw_8bit",
-        ),
+        args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
         data_collator=_make_completion_only_data_collator(
@@ -872,7 +937,19 @@ def train_sft(
             max_seq_length=max_seq_length,
         ),
     )
-    trainer.train()
+    last_checkpoint = None
+    if resume_from_checkpoint:
+        from transformers.trainer_utils import get_last_checkpoint
+
+        last_checkpoint = get_last_checkpoint(str(resolved_output_dir))
+        if last_checkpoint:
+            logger.info("Resuming SFT from checkpoint {}", last_checkpoint)
+        else:
+            logger.warning(
+                "--resume-from-checkpoint set but no checkpoint found in {}; starting fresh.",
+                resolved_output_dir,
+            )
+    trainer.train(resume_from_checkpoint=last_checkpoint)
 
     artifact_path = _save_training_artifact(
         model,
@@ -902,6 +979,8 @@ def train_sft(
             "row_count": row_count,
             "completion_only_loss": True,
             "masking": "completion_mask",
+            "save_steps": save_steps,
+            "group_by_length": group_by_length,
             "training_data_paths": resolved_training_paths,
             "rehearsal_dataset": rehearsal_dataset,
             "rehearsal_split": rehearsal_split,
@@ -952,6 +1031,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="lora",
     )
     parser.add_argument("--quantize", default="f16")
+    parser.add_argument(
+        "--save-steps",
+        type=int,
+        default=0,
+        help="checkpoint every N steps (0 = save only the final adapter)",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        action="store_true",
+        help="resume from the latest checkpoint-* in --output, if present",
+    )
+    parser.add_argument(
+        "--group-by-length",
+        action="store_true",
+        help="batch similar-length rows together (needs per-device batch size > 1 "
+        "to reduce padding waste on long-tailed data)",
+    )
     return parser
 
 
@@ -991,6 +1087,9 @@ def main(argv: list[str] | None = None) -> int:
         wandb_project=args.wandb_project,
         export_format=args.export_format,
         gguf_quantize=args.quantize,
+        save_steps=args.save_steps,
+        resume_from_checkpoint=args.resume_from_checkpoint,
+        group_by_length=args.group_by_length,
     )
 
     print(output_path)
