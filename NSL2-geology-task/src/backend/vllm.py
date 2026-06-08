@@ -24,13 +24,14 @@ from src.typing.config import AppConfig
 
 from .session import BackendSession
 
-VLLM_IMAGE = "vllm/vllm-openai:nightly-01d4d1ad375dc5854779c593eee093bcebb0cada"
-# Pinned to the 2026-05-04 nightly because v0.20.1 (current `:latest`) was
-# branched from v0.20.0 on 2026-04-27 and never received the gemma4 PP fix
-# from PR #40786 (merged 2026-04-29). The fix replaces a broken
-# `intermediate_tensors.get("per_layer_inputs")` call (gemma4.py L1320 in
-# v0.20.1) with a subscript access. Relax this pin only after the target vLLM
-# tag is smoke-tested with gemma4 pipeline parallelism.
+VLLM_IMAGE = "vllm/vllm-openai:v0.20.2"
+# 2026-06-08: the old 2026-05-04 nightly SHA pin (01d4d1ad) was PRUNED from Docker Hub AND
+# no longer cached locally, so the local container could not start. Re-pinned to the stable
+# v0.20.2 RELEASE that the external pod also uses (provision_runpod_vllm.py) for local↔external
+# parity. CAVEAT: the local box runs gemma4 with PP=2, which needs the PP fix from PR #40786
+# (merged 2026-04-29); v0.20.2 must be smoke-tested with PP=2 before trusting it (the old pin
+# existed precisely because v0.20.1 lacked that fix). If v0.20.2 reintroduces the broken
+# `intermediate_tensors.get("per_layer_inputs")` path, pin a newer post-fix tag instead.
 CONTAINER_NAME_PREFIX = "nsl-vllm"
 HF_CACHE_HOST = Path.home() / ".cache" / "huggingface"
 HF_CACHE_CONTAINER = "/tmp/huggingface"

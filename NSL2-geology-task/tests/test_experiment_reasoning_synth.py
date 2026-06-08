@@ -356,6 +356,22 @@ class TestMaskingLeakage:
                 for token in forbidden:
                     assert token.lower() not in text
 
+    def test_per_sample_bic_telemetry_lines_are_sanitized(self) -> None:
+        text = (
+            "keep geological context\n"
+            "bic_delta_per_sample_mean: -0.123\n"
+            "bic_delta_per_sample_by_target: {'target_a': -0.1}\n"
+            "keep interpretation"
+        )
+
+        prompt = ExperimentReasoningRows._sanitize_prompt_context(text)
+        completion = ExperimentReasoningRows._sanitize_completion_text(text)
+
+        for sanitized in (prompt, completion):
+            assert "keep geological context" in sanitized
+            assert "keep interpretation" in sanitized
+            assert "bic_delta_per_sample" not in sanitized.lower()
+
     def test_outcome_narrative_strips_exact_bic_result_appendix(self) -> None:
         """Outcome narrative completions must NOT contain the
         'Result: <bic> BIC delta.' appendix that _exec_submit_rewrite injects."""

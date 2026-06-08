@@ -212,8 +212,9 @@ def test_perm_null_rejects_clone_that_cannot_beat_its_own_null() -> None:
 
 
 def test_perm_null_off_preserves_handset_bar() -> None:
-    """null_permutations=0 → fall back to the hand-set _SPATIAL_ADMIT_MIN_LIFT;
-    decision + telemetry unchanged from prior behaviour (regression guard)."""
+    """null_permutations=0 → fall back to the hand-set _SPATIAL_ADMIT_MIN_LIFT
+    (now 0.0 under the mae>0 policy); the offset candidate has positive lift so it
+    is admitted. Tautological floor-equality assertion is a wiring regression guard."""
     shape = (40, 40, 3)
     target = _blob(shape, (16, 20), radius=2)
     candidate = _blob(shape, (24, 20), radius=2)
@@ -224,3 +225,32 @@ def test_perm_null_off_preserves_handset_bar() -> None:
     assert result["null_calibrated"] is False
     assert result["admit_min_lift"] == scoring._SPATIAL_ADMIT_MIN_LIFT
     assert result["admitted"] is True
+
+
+# --- 2026-06-08: mae>0 lift gate ---------------------------------------------------
+# Any positive held-out MAE improvement (lift > 0) clears stage-1 for BOTH training
+# success and KG admission. The hand-set 0.005 floor is dropped to 0.0 (raw-Σ BIC,
+# commit 629a2c4, now carries parsimony/triviality), and the permutation-null gating
+# is DISABLED by default (_SPATIAL_NULL_PERMUTATIONS=0) — the null code is retained
+# and still exercised by the tests above when null_permutations>0 is passed explicitly.
+
+
+def test_mae_gt_zero_constants() -> None:
+    """The mae>0 policy: admission floor == the 'any positive lift' floor (1e-6, not the old
+    0.005), and null gating off by default (code retained)."""
+    assert scoring._SPATIAL_ADMIT_MIN_LIFT == scoring._SPATIAL_MIN_LIFT
+    assert scoring._SPATIAL_ADMIT_MIN_LIFT < 0.005
+    assert scoring._SPATIAL_NULL_PERMUTATIONS == 0
+
+
+def test_any_positive_lift_clears_stage1() -> None:
+    """Any genuine positive lift clears the stage-1 gate; float-noise (<1e-6), zero, negative
+    lift and invalid layers do not. A small positive lift (0 < lift < the old 0.005 floor) is
+    now admitted, where before it was rejected."""
+    d = scoring.predictor_lift_admission_decision
+    assert d(validity_passed=True, lift_mean=0.002, bic_delta=10.0) is True     # was rejected by 0.005
+    assert d(validity_passed=True, lift_mean=1e-4, bic_delta=10.0) is True
+    assert d(validity_passed=True, lift_mean=1e-9, bic_delta=10.0) is False     # float noise (clone)
+    assert d(validity_passed=True, lift_mean=0.0, bic_delta=-10.0) is False
+    assert d(validity_passed=True, lift_mean=-0.01, bic_delta=-10.0) is False
+    assert d(validity_passed=False, lift_mean=0.9, bic_delta=-10.0) is False

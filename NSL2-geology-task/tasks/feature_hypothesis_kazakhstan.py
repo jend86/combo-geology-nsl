@@ -556,6 +556,8 @@ _FORBIDDEN_TELEMETRY_FIELDS: frozenset[str] = frozenset(
         "bic_delta",
         "bic_delta_raw",
         "bic_delta_by_target",
+        "bic_delta_per_sample_mean",
+        "bic_delta_per_sample_by_target",
         "candidate_predictor_lift_mean",
         "candidate_predictor_lift_by_target",
         "admitted",
@@ -6414,13 +6416,16 @@ finally:
         entries are treated as "unknown" (not a duplicate) so an empty or
         partial index never falsely blocks the survey advance.
 
-        Greedy selection sorted by |bic_delta| descending so stronger parents
-        are preferred when breaking ties. N is bounded by KG saturation (~20)
-        so O(N²) is negligible.
+        Greedy selection sorted by per-sample |bic| descending so stronger
+        parents are preferred when breaking ties. N is bounded by KG saturation
+        (~20) so O(N²) is negligible.
         """
+        # Tie-break by per-voxel quality (intensive bic_delta_per_sample_mean),
+        # NOT the extensive raw-Σ bic_delta — raw-Σ favours big (many-row) layers
+        # in greedy set-cover. Mirrors _enumerate_pairs' quality term.
         sorted_exps = sorted(
             experiments,
-            key=lambda e: abs(float(e.get("bic_delta") or 0.0)),
+            key=lambda e: abs(float(e.get("bic_delta_per_sample_mean") or 0.0)),
             reverse=True,
         )
         selected: list[str] = []
@@ -8508,10 +8513,19 @@ finally:
                 # scoring artifact, not a quality signal, so neutralize it: seeds rank
                 # by diversity (the λ·dist term), NOT by their inflated bic, so they
                 # cannot dominate the queue or crowd out normal admits.
+                #
+                # The quality term uses the INTENSIVE per-sample BIC
+                # (bic_delta_per_sample_mean), NOT the extensive raw-Σ bic_delta.
+                # Raw-Σ (commit 629a2c4) scales with n_holdout_rows, which both biases
+                # ordering toward big (many-voxel) layers over small high-quality ones
+                # AND inflates log1p(|bic|) out of the single-digit regime λ=2.0 was
+                # tuned for (drowning the diversity term). Per-sample keeps ordering
+                # size-independent and in that regime. Raw-Σ bic_delta still GATES
+                # admission (sign) in _load_successful_experiments — unaffected here.
                 bic_a = 0.0 if exp_a.get("admission_path") in ("diverse_seed", "first_layer_auto") \
-                    else abs(float(exp_a.get("bic_delta") or 0.0))
+                    else abs(float(exp_a.get("bic_delta_per_sample_mean") or 0.0))
                 bic_b = 0.0 if exp_b.get("admission_path") in ("diverse_seed", "first_layer_auto") \
-                    else abs(float(exp_b.get("bic_delta") or 0.0))
+                    else abs(float(exp_b.get("bic_delta_per_sample_mean") or 0.0))
                 # Distance is symmetric and uses the alphabetically-sorted
                 # pair id (matches `_update_pairwise_distance_index`).
                 dist_pair_id = (

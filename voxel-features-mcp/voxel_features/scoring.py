@@ -86,7 +86,14 @@ _SPATIAL_MAX_PREDICTOR_LAYERS = 6
 # host cost @ pool=15: N=50 ~= 19s/score, scaling ~linearly with n_targets (pool size).
 # The host is GPU-bound / ~98% CPU-idle so this overlaps inference-wait. Env override:
 # VFM_SPATIAL_NULL_PERMUTATIONS (dial down at very large pools if scoring stalls slots).
-_SPATIAL_NULL_PERMUTATIONS = 50
+#
+# DISABLED by default under the mae>0 policy (2026-06-08): the null bar was the DOMINANT lift
+# gate (it pushed the effective threshold to 0.02-0.10 in live gen-1, rejecting small-but-real
+# crossbreed lifts), which is incompatible with "any lift > 0 clears stage-1". The permutation
+# null CODE is intentionally RETAINED (gated on null_permutations>0; still tested explicitly)
+# and re-enabled by setting this back to 50 or `VFM_SPATIAL_NULL_PERMUTATIONS=50`. When 0,
+# null_calibrated is False and the bar is exactly _SPATIAL_ADMIT_MIN_LIFT (0.0) => lift > 0.
+_SPATIAL_NULL_PERMUTATIONS = 0
 _SPATIAL_NULL_PERCENTILE = 5.0
 _SPATIAL_NULL_MAX_ROWS = 2000
 # 3 -> 6 (2026-06-05): the seed bypass admits validity-passing layers WITHOUT
@@ -106,7 +113,17 @@ _SPATIAL_MIN_LIFT = 1e-6
 # lift" floor; admission now requires a MEANINGFUL lift (live: trivial blobs
 # ~0.0026 vs distributed children ~0.011-0.020). Tunable; validated offline on
 # scratch/scoring_validation. See predictor_lift_admission_decision.
-_SPATIAL_ADMIT_MIN_LIFT = 0.005
+# mae>0 policy (2026-06-08): the hand-set "meaningful lift" floor (0.005) is dropped to the
+# "any positive lift" floor _SPATIAL_MIN_LIFT (1e-6) — ANY genuine positive held-out MAE
+# improvement clears stage-1 for BOTH training success and KG admission. This is the SAME bar
+# stage-1's masking_test_passed already uses, so admission and stage-1 now agree. We use 1e-6
+# (not a literal 0.0) on purpose: an exact 0.0 floor admits floating-point-noise no-ops — e.g.
+# a clone of an existing layer has lift ~1e-9 and bic_delta ~-1e-10, so a 0.0 floor would admit
+# the duplicate. Rationale for dropping the 0.005 floor: the raw-Σ BIC gate
+# (bic_delta = bic_delta_raw < 0, commit 629a2c4) now carries the parsimony/triviality job the
+# 0.005 floor was hacked in for, so the lift gate can be permissive and let BIC + the
+# task-layer near-dup gate be the quality filters. The 0.005 history is below.
+_SPATIAL_ADMIT_MIN_LIFT = _SPATIAL_MIN_LIFT
 
 
 def predictor_lift_admission_decision(
