@@ -20,8 +20,10 @@ PYBIN="${PYBIN:-python}"
 phase() { echo; echo "======== $* ========"; }
 
 do_install() {
-  phase "install: unsloth qLoRA stack (Blackwell sm_120)"
-  export TORCH_CUDA_ARCH_LIST="12.0"
+  phase "install: unsloth qLoRA stack (arch ${TORCH_CUDA_ARCH_LIST:-12.0})"
+  # Default to Blackwell sm_120; override (e.g. TORCH_CUDA_ARCH_LIST=8.9) for Ada cards
+  # so triton/unsloth JIT kernels target the actual device.
+  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
   export DEBIAN_FRONTEND=noninteractive
   $PYBIN -m pip install --upgrade pip
   # Let unsloth resolve its own matched torch/transformers/peft/trl/bnb/triton set.
@@ -89,13 +91,19 @@ do_fetch() {
 
 do_train() {
   phase "train: gemma-4-31B qLoRA (r=${LORA_RANK:-128})"
-  export TORCH_CUDA_ARCH_LIST="12.0"
+  export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-12.0}"
   cd "$WORKDIR"   # so qlora's find_dotenv(usecwd) picks up ./.env (WANDB_API_KEY, HF_TOKEN)
   [ -f "$WORKDIR/.env" ] && set -a && . "$WORKDIR/.env" && set +a || true
 
   BASE_MODEL="${BASE_MODEL:-unsloth/gemma-4-31B-it-unsloth-bnb-4bit}"
   DATA="${DATA:-$WORKDIR/sft_training_rows.jsonl}"
   OUT="${OUT:-$WORKDIR/adapter}"
+  # RESUME=1 picks up the latest checkpoint-* in $OUT (after a process/pod restart).
+  RESUME_FLAG=""
+  [ -n "${RESUME:-}" ] && RESUME_FLAG="--resume-from-checkpoint"
+  # GROUP_BY_LENGTH=1 batches similar-length rows (use with BS>1 to cut padding waste).
+  GROUP_FLAG=""
+  [ -n "${GROUP_BY_LENGTH:-}" ] && GROUP_FLAG="--group-by-length"
 
   set -x
   $PYBIN "$QLORA" \
@@ -121,6 +129,9 @@ do_train() {
     --rehearsal-rows-per-epoch "${REHEARSAL_ROWS:-500}" \
     --rehearsal-seed "${SEED:-3407}" \
     --wandb-project "${WANDB_PROJECT:-feature-hypothesis-kazakhstan-r128}" \
+    --save-steps "${SAVE_STEPS:-0}" \
+    $RESUME_FLAG \
+    $GROUP_FLAG \
     --export-format lora
   set +x
   phase "train done -> $OUT"

@@ -17,6 +17,7 @@ find libstdc++.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -27,12 +28,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.colors import Normalize
 
+# Paths default to the live run but are overridable via env so the same script
+# can render a byte-consistent snapshot from a staged copy:
+#   KG_VIZ_STORE        -> admitted store dir (contains index.json + layers/)
+#   KG_VIZ_EXPERIMENTS  -> experiments.jsonl (for per-layer annotations)
+#   KG_VIZ_OUT          -> output dir for PNGs + INDEX.md
 ROOT = Path("data/kazakhstan/feature-hypothesis")
-STORE = ROOT / "store/teniz_basin/admitted"
+STORE = Path(os.environ.get("KG_VIZ_STORE", ROOT / "store/teniz_basin/admitted"))
 LAYERS_DIR = STORE / "layers"
 INDEX_JSON = STORE / "index.json"
-EXPERIMENTS = ROOT / "knowledge/teniz_basin/experiments.jsonl"
-OUT = ROOT / "viz/kg_voxels_2026-06-06"
+EXPERIMENTS = Path(os.environ.get("KG_VIZ_EXPERIMENTS", ROOT / "knowledge/teniz_basin/experiments.jsonl"))
+OUT = Path(os.environ.get("KG_VIZ_OUT", ROOT / "viz/kg_voxels_2026-06-06"))
 
 TS_RE = re.compile(r"_\d{13}$")
 
@@ -241,9 +247,12 @@ def main():
     (OUT / "layers").mkdir(parents=True, exist_ok=True)
     (OUT / "overview").mkdir(parents=True, exist_ok=True)
 
-    for name, arr in zip(names, arrays):
-        per_layer_figure(name, arr, grid, meta.get(name, {}), OUT / "layers" / f"{short(name)}.png")
-        print("layer", short(name), arr.shape, "nz", int((arr != 0).sum()))
+    # Prefix with the chronological index (matches INDEX.md "#" column) so that
+    # crossbreed layers sharing a short name (e.g. redox_boundary_prospectivity)
+    # don't overwrite each other — one PNG per admitted node.
+    for i, (name, arr) in enumerate(zip(names, arrays), 1):
+        per_layer_figure(name, arr, grid, meta.get(name, {}), OUT / "layers" / f"{i:02d}_{short(name)}.png")
+        print("layer", i, short(name), arr.shape, "nz", int((arr != 0).sum()))
 
     montage(names, arrays, grid, meta, OUT / "overview" / "montage_topdown.png")
     coverage_and_aggregate(

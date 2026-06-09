@@ -111,15 +111,72 @@ def _docker_args(args: argparse.Namespace) -> str:
             "--kv-cache-dtype", args.kv_cache_dtype,
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
-            # Skip torch.compile/cudagraph capture: a fresh pod has no compile cache,
-            # so default compilation adds minutes + OOM risk at startup for a 31B. The
-            # local box caches cudagraphs (compilation-config); an ephemeral pod can't,
-            # so eager trades ~10-20% decode for a fast, reliable boot.
-            "--enforce-eager",
             "--enable-auto-tool-choice",
             "--tool-call-parser", "gemma4",
         ]
+        + _compile_args(args)
+        + _lora_args(args)
     )
+
+
+def _compile_args(args: argparse.Namespace) -> list[str]:
+    """CUDA-graph / torch.compile controls. DEFAULT IS NOW GRAPHS-ON (no --enforce-eager).
+
+    History: --enforce-eager was hardcoded here (commit 0e1c001, 2026-06-03) purely to
+    dodge cold-boot cost on ephemeral pods ("fresh pod has no compile cache => default
+    compilation adds minutes + OOM risk"), NOT to fix a crash. Its comment guessed eager
+    cost "~10-20% decode". A live /metrics measurement (2026-06-08, see memory
+    h200-decode-duty-cycle-5pct) showed the real cost is ~20x: the eager engine loop on
+    this 60-layer Gemma-4 AWQ+LoRA stack is CPU-launch-bound (~hundreds of kernel launches
+    per decode step), running at ~5% of the bandwidth roofline. So eager is now OPT-IN.
+
+      --enforce-eager      : disable BOTH torch.compile and cudagraphs. Fast, OOM-safe cold
+                             boot; cripples decode throughput. Keep for boot-constrained or
+                             cudagraph-incompatible pods only.
+      --compilation-config : raw JSON passthrough to vLLM (the middle ground / fallback
+                             ladder for the awq_marlin full-graph crash GH#32834):
+                               '{"cudagraph_mode":"PIECEWISE"}'         attention stays
+                                   eager -> sidesteps the awq_marlin full-graph replay
+                                   crash, still captures the bulk of the launches.
+                               '{"cudagraph_mode":"FULL_DECODE_ONLY"}'  full decode graphs
+                                   WITHOUT the inductor compile (fast boot + duty fix).
+                             NOTE: pass COMPACT JSON (no spaces) — docker_args is a single
+                             space-joined string. Verify the field name against the pinned
+                             v0.20.2 image before relying on it.
+
+    Both unset => vLLM V1 default (FULL_AND_PIECEWISE): full piecewise compile + graphs,
+    highest throughput but slowest-boot / highest-OOM. Mitigate boot OOM with a modest
+    --max-num-seqs (fewer graph sizes to capture) + gpu-mem-util headroom.
+    """
+    out: list[str] = []
+    if getattr(args, "enforce_eager", False):
+        out.append("--enforce-eager")
+    if getattr(args, "compilation_config", None):
+        out += ["--compilation-config", args.compilation_config]
+    return out
+
+
+def _lora_args(args: argparse.Namespace) -> list[str]:
+    """vLLM LoRA flags when serving a finetuned adapter on top of the AWQ base.
+
+    vLLM applies LoRA on a quantized (AWQ) base WITHOUT merging; for AWQ it patches only the
+    attention/MLP projections — exactly this adapter's target_modules (q/k/v/o/gate/up/down,
+    no embeddings/lm_head). ``--lora-modules adapter=<hf_repo_id>`` lets vLLM resolve+download
+    the adapter from the HF Hub at startup (HF_TOKEN injected for private repos). Served module
+    name is "adapter" so the endpoint pool's single request-model name ("adapter") works across
+    the H200 pod and the local box (which serves the same adapter from a local path).
+    """
+    if not getattr(args, "adapter_repo", None):
+        return []
+    return [
+        "--enable-lora",
+        "--lora-modules",
+        f"adapter={args.adapter_repo}",
+        "--max-lora-rank",
+        str(args.max_lora_rank),
+        "--max-loras",
+        "1",
+    ]
 
 
 def cmd_up(args: argparse.Namespace) -> int:
@@ -146,12 +203,14 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"  image      : {args.image}")
     print(f"  vllm args  : {docker_args}")
     print(f"  ports      : {args.ports}  (8000 = TCP, public)")
+    print(f"  cuda guard : {args.allowed_cuda_versions}  (host driver must support these)")
     try:
         pod = runpod.create_pod(
             name=args.name,
             image_name=args.image,
             gpu_type_id=args.gpu_type,
             cloud_type=args.cloud,
+            allowed_cuda_versions=args.allowed_cuda_versions,
             gpu_count=1,
             container_disk_in_gb=args.container_disk,
             min_vcpu_count=8,
@@ -264,6 +323,12 @@ def main() -> int:
     up.add_argument("--gpu-type", default=GPU_TYPE_L40S)
     up.add_argument("--cloud", default="SECURE", choices=["SECURE", "COMMUNITY", "ALL"],
                     help="SECURE (~$0.86/hr, stable IP) vs COMMUNITY (~$0.79/hr, IP may change on restart)")
+    up.add_argument("--allowed-cuda-versions", nargs="+", default=["13.0"],
+                    help="REQUIRED guard: only land on hosts whose driver supports these CUDA "
+                         "versions. The pinned v0.20.2 image ships CUDA 13 / PyTorch 2.11, which "
+                         "hard-crashes at EngineCore init on an older driver ('NVIDIA driver too "
+                         "old (found version 12040)' = CUDA 12.4). Community hosts are a driver "
+                         "lottery, so default to ['13.0']. Widen only if you pin an older image.")
     up.add_argument("--capacity", type=int, default=16, help="endpoint pool capacity to print in the TOML block")
     up.add_argument("--max-num-seqs", type=int, default=18, help="vLLM concurrent seqs (>= capacity + slack)")
     up.add_argument("--max-model-len", type=int, default=65536)
@@ -274,7 +339,24 @@ def main() -> int:
                          "use 'auto' (fp16 KV): e4m3 fails the arch check AND fp8_e5m2 trips an "
                          "attention-backend assert (allows only fp8/e4m3/nvfp4) in v0.20.2.")
     up.add_argument("--gpu-mem-util", type=float, default=0.92)
-    up.add_argument("--container-disk", type=int, default=60, help="GB; holds image + ~18 GB AWQ weights")
+    up.add_argument("--enforce-eager", action="store_true",
+                    help="OPT-IN: disable torch.compile + cudagraphs. Default is GRAPHS-ON "
+                         "(omit this flag). Eager cripples decode (~5%% duty, ~20x slower per "
+                         "h200-decode-duty-cycle-5pct); keep only for boot-constrained pods.")
+    up.add_argument("--compilation-config", default=None,
+                    help="Raw COMPACT JSON passthrough to vLLM --compilation-config (no spaces; "
+                         "docker_args is space-joined). Fallback ladder for the awq_marlin "
+                         "full-graph crash GH#32834: '{\"cudagraph_mode\":\"PIECEWISE\"}' (attn "
+                         "eager, dodges the crash) or '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}' "
+                         "(full decode graphs without the inductor compile). Verify vs v0.20.2.")
+    up.add_argument("--adapter-repo", default=None,
+                    help="HF repo id of a LoRA adapter to serve on top of the base model "
+                         "(e.g. 0xEljh/recency-c-sft-r64-1ep-20260607). Adds --enable-lora "
+                         "--lora-modules adapter=<repo>; served module name is 'adapter'. "
+                         "vLLM resolves the repo from HF at startup (HF_TOKEN handles private).")
+    up.add_argument("--max-lora-rank", type=int, default=64, help="must be >= the adapter's r (r64)")
+    up.add_argument("--container-disk", type=int, default=60,
+                    help="GB; holds image + ~18 GB AWQ weights (+ ~2 GB LoRA — use 80 with --adapter-repo)")
     up.add_argument("--ports", default="8000/tcp,22/tcp")
     up.add_argument("--network-volume-id", default=None,
                     help="attach a RunPod network volume to persist the HF model cache "
