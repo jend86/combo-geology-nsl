@@ -137,7 +137,7 @@ def test_below_plateau_threshold_keeps_crossbreed(tmp_path: Path) -> None:
     variation = _variation(tmp_path)
     _seed_crossbreed_ready(variation)
     assert variation.interweave_failed_episode_threshold == 30
-    assert variation.interweave_survey_burst_episodes == 15
+    assert variation.interweave_survey_burst_episodes == 30
     _write_interweave_state(Path(variation.kg_dir), failures=29)
 
     outcome = _task(tmp_path).populate([], variation)
@@ -161,10 +161,10 @@ def test_plateau_threshold_enters_survey_burst(tmp_path: Path) -> None:
     assert first.episode_context["interweave_bootstrap"] is True
     assert first.episode_context["interweave_reason"] == "crossbreed_plateau"
     assert state_after_claim["consecutive_failed_crossbreed"] == 0
-    assert state_after_claim["interweave_survey_remaining"] == 14
+    assert state_after_claim["interweave_survey_remaining"] == 29
     assert second.episode_context["workflow_kind"] == "survey"
     assert second.episode_context.get("interweave_bootstrap") is True
-    assert state_after_second["interweave_survey_remaining"] == 13
+    assert state_after_second["interweave_survey_remaining"] == 28
 
 
 def test_failed_interweave_survey_continues_burst(tmp_path: Path) -> None:
@@ -188,7 +188,7 @@ def test_failed_interweave_survey_continues_burst(tmp_path: Path) -> None:
     assert reward.breakdown["interweave_bootstrap"] is True
     assert second.episode_context["workflow_kind"] == "survey"
     assert second.episode_context.get("interweave_bootstrap") is True
-    assert state_after_second["interweave_survey_remaining"] == 13
+    assert state_after_second["interweave_survey_remaining"] == 28
 
 
 def test_successful_interweave_survey_ends_burst(tmp_path: Path) -> None:

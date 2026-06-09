@@ -61,15 +61,32 @@ def test_provenance_lookup_matches_timestamped_layer_name(tmp_path):
     assert kg["provenance_guard_passed"] is True
 
 
-def test_provenance_all_creative_fallback_now_rejected(tmp_path):
-    # with the lookup fixed, a layer built only from invented coords must be REJECTED
+def test_provenance_all_creative_fallback_admits_by_default(tmp_path):
+    # Relaxed default: with the lookup fixed the guard FINDS the op (count==1,
+    # the FM4 regression point), but an all-invented-coords layer now PASSES the
+    # crossbreed/normal provenance guard. Keeping all-fallback FOUNDERS out is the
+    # override-proof survey seed gate's job, not this guard's.
     _make_spatial_db(tmp_path, "blob", coordinate_source="creative_fallback", n=1)
     kg: dict = {}
     FeatureHypothesisKazakhstanTask._stamp_candidate_provenance(
         kg, scratch_dir=tmp_path, layer_name="blob_1780408167199"
     )
     assert kg["spatial_operation_provenance_count"] == 1
+    assert kg["provenance_guard_passed"] is True
+    assert kg["provenance_rejection_reason"] == "none"
+
+
+def test_provenance_all_creative_fallback_rejected_when_disallow(tmp_path):
+    # Opt-in stricten: disallow_creative_fallback_admission=True restores the old
+    # rejection of an all-invented-coords layer in the crossbreed/normal path.
+    _make_spatial_db(tmp_path, "blob", coordinate_source="creative_fallback", n=1)
+    kg: dict = {"disallow_creative_fallback_admission": True}
+    FeatureHypothesisKazakhstanTask._stamp_candidate_provenance(
+        kg, scratch_dir=tmp_path, layer_name="blob_1780408167199"
+    )
+    assert kg["spatial_operation_provenance_count"] == 1
     assert kg["provenance_guard_passed"] is False
+    assert kg["provenance_rejection_reason"] == "all_creative_fallback"
 
 
 def test_missing_spatial_operation_provenance_rejected(tmp_path):

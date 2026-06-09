@@ -1,0 +1,101 @@
+# LOCAL engine config for the 2x4090 box serving base AWQ + recency-c r64 LoRA.
+# Used ONLY by scripts/start_local_vllm.py to bring up 127.0.0.1:8000 BEFORE the
+# endpoints-mode gen-2 run (config-feature-hypothesis-kazakhstan-gen2.toml) connects to it.
+#
+# lora_adapter_path (no served_model_name) => the framework mounts the adapter at
+# /adapters/local and serves `--enable-lora --lora-modules adapter=/adapters/local
+# --max-lora-rank 64`; config.model auto-becomes "adapter" (vllm.py:385). The base keeps its
+# real name (QuantTrio/...AWQ); requests use model="adapter" => base+LoRA. Matches the H200
+# pod's served module name so the endpoint pool's single request-model name works on both.
+#
+# Start it:
+#   nix develop -c uv run python scripts/start_local_vllm.py \
+#     config/config-feature-hypothesis-kazakhstan-vllm-lora.toml
+# Stop it later: docker rm -f nsl-vllm-8000
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+timeout = 600
+
+[vllm]
+# Serve the finetuned adapter on top of the AWQ base. Path resolved from cwd (NSL2-geology-task).
+lora_adapter_path = "./data/kazakhstan/feature-hypothesis/aggregated_sft/20260607-recency-c/adapter-r64"
+# Two RTX 4090s without NVLink. TP=2 (not PP=2): the pinned v0.20.2 image LACKS the gemma4
+# pipeline-parallel fix (PR #40786) — PP=2 crashes at gemma4.py:1320 with
+# `'IntermediateTensors' object has no attribute 'get'` (the bug the pruned nightly guarded).
+# TP=2 doesn't exercise that PP code path. Cost: per-layer all-reduce over PCIe (no NVLink) is
+# slower than PP, but fine for only 7 local slots while the H200 carries 120. To restore PP=2,
+# pin a vLLM image that contains PR #40786 (post-2026-04-29, pre-gemma4-regression).
+startup_timeout = 2400
+tensor_parallel_size = 2
+pipeline_parallel_size = 1
+kv_cache_dtype = "fp8"
+enable_chunked_prefill = true
+enable_prefix_caching = true
+max_model_len = 65536
+# 7 local slots + headroom. Local KV (2x4090) is small, so do NOT raise this the way the H200
+# does — the box is decode-starved past ~10 (see kazakhstan-decode-starvation).
+max_num_seqs = 10
+max_num_batched_tokens = 4096
+cudagraph_mode = "piecewise"
+extra_env = { PYTORCH_ALLOC_CONF = "expandable_segments:True" }
+enable_auto_tool_choice = true
+tool_call_parser = "gemma4"
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 28
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+parallel_episodes = 7
+target_training_rows = 4500
+max_episodes = 10000
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[orchestration]
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true

@@ -9,9 +9,15 @@ the wiring inside ``check_guards`` cannot silently regress.
 Contract:
   - a degenerate first root (single uniform point op) is ``guard_rejected`` and
     never reaches ``experiments.jsonl`` / the admitted pool;
-  - an all-creative_fallback first root is rejected even when the task is built
-    with ``allow_creative_fallback_admission=True`` (override-proof);
+  - an all-creative_fallback first root is rejected by the SURVEY seed gate
+    regardless of ``disallow_creative_fallback_admission`` (override-proof, and
+    independent of the crossbreed-scoped knob);
   - a graded, multi-op, artifact-backed first root admits.
+
+Crossbreed scope (separate contract, also pinned here):
+  - by DEFAULT an all-creative_fallback crossbreed layer admits (the provenance
+    guard is permissive); ``disallow_creative_fallback_admission=True`` restores
+    the strict rejection in the crossbreed/normal path only.
 """
 
 from __future__ import annotations
@@ -19,19 +25,20 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
 from voxel_features.spatial import SpatialVoxelStore
 from voxel_features.store import GridSpec
 
 
-def _task(tmp_path: Path, *, allow_fallback: bool = False) -> FeatureHypothesisKazakhstanTask:
+def _task(tmp_path: Path, *, disallow_fallback: bool = False) -> FeatureHypothesisKazakhstanTask:
     return FeatureHypothesisKazakhstanTask(
         {
             "store_dir": str(tmp_path / "store"),
             "kg_dir": str(tmp_path / "kg"),
             "dataset_dir": str(tmp_path / "data"),
-            "allow_creative_fallback_admission": allow_fallback,
+            "disallow_creative_fallback_admission": disallow_fallback,
         }
     )
 
@@ -86,6 +93,23 @@ def _multi_point(
             coordinate_source="artifact",
             source_file="analysis.csv",
             source_excerpt=f"row {i}",
+        )
+
+
+def _multi_point_fallback(scratch_dir: Path, layer_name: str) -> None:
+    # Multi-op, graded, but every op is an invented (creative_fallback) coordinate
+    # with no source provenance — the shape the provenance guard keys on.
+    store = SpatialVoxelStore(scratch_dir, _grid())
+    coords = [(0.5, 0.5, 0.5), (1.5, 1.5, 0.5), (2.5, 2.5, 1.5), (3.5, 0.5, 1.5)]
+    for i, (lon, lat, depth) in enumerate(coords):
+        store.add_point_feature(
+            name=layer_name,
+            longitude=lon,
+            latitude=lat,
+            depth=depth,
+            value=0.2 + 0.2 * i,
+            radius_m=1.0,
+            coordinate_source="creative_fallback",
         )
 
 
@@ -153,20 +177,65 @@ def test_degenerate_single_uniform_first_root_rejected(tmp_path: Path) -> None:
     assert not (store_dir / "admitted" / "layers" / f"{layer_name}.npy").exists()
 
 
-def test_all_creative_fallback_first_root_rejected_even_with_override(tmp_path: Path) -> None:
-    # Override globally enabled, yet the first root must still rest on real
-    # provenance.
-    task = _task(tmp_path, allow_fallback=True)
+@pytest.mark.parametrize("disallow", [False, True])
+def test_all_creative_fallback_first_root_rejected_regardless_of_disallow_flag(
+    tmp_path: Path, disallow: bool
+) -> None:
+    # Crossbreed-only scope: the SURVEY seed gate rejects an all-fallback first
+    # root whether or not disallow_creative_fallback_admission is set. The
+    # permissive crossbreed default (disallow=False) must NOT leak into the seed
+    # gate — the founder must still rest on real provenance.
+    task = _task(tmp_path, disallow_fallback=disallow)
     kg_dir = tmp_path / "kg"
     store_dir = tmp_path / "store"
-    layer_name = "fallback_root"
+    layer_name = f"fallback_root_{int(disallow)}"
     _single_uniform_point(store_dir / "scratch" / layer_name, layer_name, coordinate_source="creative_fallback")
-    record = _first_root_record("exp_fallback", layer_name)
+    record = _first_root_record(f"exp_fallback_{int(disallow)}", layer_name)
 
     admitted = _admit(task, kg_dir, store_dir, layer_name, record)
 
     assert admitted is False
     assert record["admission_tier"] == "guard_rejected"
+    assert not (kg_dir / "experiments.jsonl").exists()
+
+
+def test_crossbreed_all_creative_fallback_admits_by_default(tmp_path: Path) -> None:
+    # Relaxed default: outside the survey seed window an all-creative_fallback
+    # layer admits — the provenance guard no longer rejects on fallback.
+    task = _task(tmp_path)  # disallow_creative_fallback_admission defaults False
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "xbreed_fallback"
+    _multi_point_fallback(store_dir / "scratch" / layer_name, layer_name)
+    record = _first_root_record("exp_xbreed_fallback", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record, seed_phase=False)
+
+    assert admitted is True
+    assert record["provenance_guard_passed"] is True
+    assert record["provenance_rejection_reason"] == "none"
+    assert record["translate_fallback_used"] is True
+    assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_crossbreed_all_creative_fallback_rejected_when_disallow(tmp_path: Path) -> None:
+    # Opt-in stricten: disallow_creative_fallback_admission=True restores the
+    # old rejection in the crossbreed/normal path.
+    task = _task(tmp_path, disallow_fallback=True)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "xbreed_fallback_strict"
+    _multi_point_fallback(store_dir / "scratch" / layer_name, layer_name)
+    record = _first_root_record("exp_xbreed_fallback_strict", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record, seed_phase=False)
+
+    assert admitted is False
+    assert record["admission_tier"] == "guard_rejected"
+    assert record["provenance_guard_passed"] is False
+    assert record["provenance_rejection_reason"] == "all_creative_fallback"
+    # The new wiring stamped the knob onto the record (absent on the old code path).
+    assert record["disallow_creative_fallback_admission"] is True
     assert not (kg_dir / "experiments.jsonl").exists()
 
 

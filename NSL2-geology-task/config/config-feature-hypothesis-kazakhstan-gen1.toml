@@ -1,0 +1,139 @@
+# GEN-1 (post-finetune) data-generation run — 2026-06-08.
+# (Generations are 0-indexed: gen-0 was the prior run; this is gen-1, data namespace generation_1.)
+#
+# Regenerates Kazakhstan feature-hypothesis trajectories with the FINETUNED model
+# (base QuantTrio/gemma-4-31B-it-AWQ + recency-c r64 LoRA, served as module "adapter").
+# Endpoints-mode (NO local container is launched by the framework). Topology:
+#   - runpod-h200-1  : one community H200 SXM 141GB vLLM (v0.20.2, fp8 KV, TP1/PP1), serving
+#                      base AWQ + the adapter pulled from a private HF repo. 120 slots.
+# EXTERNAL-ONLY (2026-06-08 relaunch after a host reboot): the local 2x4090 box is dropped (one
+# 4090 fell off the bus post-reboot + the local vLLM was down) — the H200 is the SOLE inference
+# endpoint. 120 parallel episodes. vLLM max_num_seqs is set HIGH on the pod (256), independent of
+# slot count, for scheduler headroom. The HOST (32 cores / 125GB) running ~361 harness containers
+# is the ceiling on total slots, not the H200.
+#
+# served_model_name="adapter" makes every request use model="adapter" (base+LoRA). model_name
+# keeps the AWQ string so the gemma4 tool-call parser is still inferred (parser_model_name is
+# resolved from model_name BEFORE served_model_name overrides config.model; vllm.py:348,383).
+#
+# Run (generation-only; FRESH KG via archived gen-0 store/knowledge):
+#   source ~/.config/nsl-runpod/secrets.env          # RUNPOD_VLLM_KEY for the pool
+#   nix develop -c uv run python scripts/run_generation_only.py \
+#     config/config-feature-hypothesis-kazakhstan-gen1.toml --generation-id 1
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-kazakhstan/code/"
+container_ids = [
+  "feature-hypothesis-kazakhstan-compose-agent-1",
+  "feature-hypothesis-kazakhstan-compose-vfm-1",
+  "feature-hypothesis-kazakhstan-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+train_data_save_folder = "./data/kazakhstan/feature-hypothesis/train_data"
+
+[inference]
+# 600 (not 300): at 92 concurrent decode streams per-stream tok/s drops; 300 prematurely
+# kills episodes pre-upsert (see inference-timeout-l40s-oversubscription).
+timeout = 600
+
+[vllm]
+# Request model = "adapter" (base AWQ + recency-c LoRA) on every endpoint.
+served_model_name = "adapter"
+# Single endpoint now (external-only): any full H200 quarantine drops healthy capacity to 0 and
+# aborts the run (capacity floor) — there is NO local fallback. Keep 4 as the floor; the real
+# resilience lever is the endpoint-pool re-probe/retry, not this number.
+min_healthy_endpoint_capacity = 4
+
+[[vllm.endpoints]]
+id          = "runpod-h100nvl-1"
+base_url    = "http://205.196.17.170:18523"           # H100 NVL secure pod 91z2f6nqwhly9k ($3.19/hr, 3.9TB/s)
+capacity    = 92                                      # H100 NVL 94GB secure; max_num_seqs=128 on the pod
+api_key_env = "RUNPOD_VLLM_KEY"
+
+[task]
+class = "tasks.feature_hypothesis_kazakhstan.FeatureHypothesisKazakhstanTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-kazakhstan-compose"
+dataset_dir = "../Kazkhstan_data"
+# DEFAULT paths (kept in sync with the vfm compose mounts). Fresh KG is achieved by
+# archiving the gen-0 teniz_basin dirs aside before launch, not by changing these paths.
+store_dir = "./data/kazakhstan/feature-hypothesis/store"
+kg_dir = "./data/kazakhstan/feature-hypothesis/knowledge"
+variation_names = ["teniz_basin"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+tool_output_max_chars = 2500
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-kazakhstan"
+agent_type = "tool_calling_agent"
+max_iterations = 28
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 92 on the single H100 NVL secure endpoint (external-only). Sized by PER-STREAM decode
+# bandwidth: H100 NVL 3.9 TB/s / 92 ≈ 43 GB/s per stream ≈ the H200's proven 4.8 TB/s / 120 =
+# 40 GB/s per stream (that config ran 0 preemptions). KV lands ~85% (94GB is tighter per unit
+# bandwidth than the H200's 143GB) — watch live /metrics KV% + preemption and dial back toward
+# ~72 only if it saturates. HOST (32 cores / 125GB, ~276 containers @ 92) still fits.
+# max_num_seqs=128 ≥ 92, so no re-provision needed. (H100 NVL chosen for best bandwidth/$.)
+parallel_episodes = 92
+target_training_rows = 4500
+max_episodes = 10000
+max_bootstrap_episodes = 20
+checkpoint_every_episode = true
+# Namespaced by --generation-id 1; resumes only THIS run if interrupted (won't touch gen_0).
+resume_from_checkpoint = true
+generation_output_dir = "./data/kazakhstan/feature-hypothesis/generations"
+
+[training]
+# Inert under num_generations=1 (generation-only; no finetune in this run).
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-kazakhstan"
+wandb_project = "feature-hypothesis-kazakhstan"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "kazakhstan-teniz-basin", "gen1-postfinetune", "recency-c-r64", "mae0-scoring", "null-perm-off", "lift-success", "bic-admission", "gemma4", "runpod-h200", "external-only"]

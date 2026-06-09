@@ -327,8 +327,9 @@ class TestSeedPhaseHardening:
     each is held to a GEOMETRY/PROVENANCE floor a single arbitrary central blob
     cannot clear (docs/design/scoring-colocation-monoculture-2026-06-03):
 
-    1. An all-creative_fallback seed is rejected regardless of
-       allow_creative_fallback_admission (the seed must rest on real provenance).
+    1. An all-creative_fallback seed is rejected independent of the
+       crossbreed-scoped disallow_creative_fallback_admission knob (the seed must
+       rest on real provenance even when the crossbreed guard is relaxed).
     2. A single-op seed (the single central blob that drives the co-location
        monoculture) is rejected.
     3. Value uniformity / low entropy are NOT gated — a *distributed* uniform
@@ -374,11 +375,17 @@ class TestSeedPhaseHardening:
         ) is True
         assert record["first_root_rejection_reason"] == "none"
 
-    def test_all_creative_fallback_seed_rejected_despite_override(self) -> None:
+    @pytest.mark.parametrize("disallow", [False, True])
+    def test_all_creative_fallback_seed_rejected_independent_of_disallow_flag(
+        self, disallow: bool
+    ) -> None:
+        # The seed gate is override-proof and independent of the crossbreed-scoped
+        # disallow_creative_fallback_admission knob: an all-fallback seed is
+        # rejected whether the knob is permissive (False) or strict (True).
         record = self._healthy_seed()
         record["spatial_operation_provenance_count"] = 3
         record["coordinate_source_counts"] = {"creative_fallback": 3}
-        record["allow_creative_fallback_admission"] = True
+        record["disallow_creative_fallback_admission"] = disallow
         assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
             record, seed_phase=True
         ) is False

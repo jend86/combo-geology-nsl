@@ -461,12 +461,16 @@ class FeatureHypothesisKazakhstanVariation(Variation):
     # rendering uses an ellipsis when exceeded.
     novelty_max_chars_per_hypothesis: int = 280
     # Once steady-state crossbreed has stalled for this many completed attempts
-    # without a fresh KG admit, enter a short survey burst before returning to
+    # without a fresh KG admit, enter a survey burst before returning to
     # crossbreed. This interweaves fresh data-grounded hypotheses without
-    # changing scoring or adding an explicit novelty prompt.
+    # changing scoring or adding an explicit novelty prompt. The burst is sized
+    # symmetric to the trigger threshold (30 failures -> 30 surveys): once
+    # crossbreed has plateaued, re-explore as much as we exploited-and-failed,
+    # since survey finds the fresh, higher-lift feature spaces that refill the
+    # parent pool (was 15; raised 2026-06-09 to push more exploration per burst).
     interweave_bootstrap_enabled: bool = True
     interweave_failed_episode_threshold: int = 30
-    interweave_survey_burst_episodes: int = 15
+    interweave_survey_burst_episodes: int = 30
 
 
 @dataclass
@@ -2622,8 +2626,14 @@ class FeatureHypothesisKazakhstanTask(TaskSpec[FeatureHypothesisKazakhstanState]
         self._artifact_dir = Path(
             task_config.get("artifact_dir", default_artifacts)
         ).resolve()
-        self._allow_creative_fallback_admission = bool(
-            task_config.get("allow_creative_fallback_admission", False)
+        # Creative-fallback (invented-coordinate) layers admit by DEFAULT in the
+        # crossbreed/normal provenance guard; set
+        # disallow_creative_fallback_admission=True to restore the strict
+        # rejection. The survey/first-root seed gate (_seed_phase_admission_ok)
+        # rejects all-fallback seeds override-proof and is intentionally
+        # independent of this knob (the relaxation is crossbreed-scoped only).
+        self._disallow_creative_fallback_admission = bool(
+            task_config.get("disallow_creative_fallback_admission", False)
         )
         # Minimum admitted layers before survey may hand off to crossbreed AND
         # before greedy BIC init runs. 0 = source-coverage alone gates the
@@ -7613,9 +7623,10 @@ finally:
         telemetry only.
 
         For a survey seed reject only:
-          - all-creative_fallback, regardless of the
-            allow_creative_fallback_admission override (the seed must rest on
-            real provenance), and
+          - all-creative_fallback, independent of the crossbreed-scoped
+            disallow_creative_fallback_admission knob (the seed must rest on
+            real provenance — this gate stays strict even when the crossbreed
+            guard is relaxed), and
           - a single spatial op (the single central-blob anchor that drives the
             co-location monoculture).
 
@@ -7634,7 +7645,8 @@ finally:
         reasons: list[str] = []
 
         # Override-proof: re-derive all-fallback from the stamped provenance
-        # fields *without* consulting allow_creative_fallback_admission.
+        # fields *without* consulting disallow_creative_fallback_admission (the
+        # crossbreed knob never relaxes the seed founder).
         counts = kg_record.get("coordinate_source_counts") or {}
         if not isinstance(counts, dict):
             counts = {}
@@ -8102,9 +8114,13 @@ finally:
         fallback_count = source_counts.get("creative_fallback", 0)
         missing_provenance = not operations
         all_creative_fallback = bool(operations) and fallback_count == len(operations)
-        override_enabled = bool(kg_record.get("allow_creative_fallback_admission"))
+        # Permissive by default: an all-creative_fallback layer passes the
+        # crossbreed/normal provenance guard unless
+        # disallow_creative_fallback_admission is set. (missing_provenance — zero
+        # spatial ops — always rejects regardless of this knob.)
+        disallow_fallback = bool(kg_record.get("disallow_creative_fallback_admission"))
         guard_passed = (not missing_provenance) and (
-            (not all_creative_fallback) or override_enabled
+            (not all_creative_fallback) or not disallow_fallback
         )
         operation_signatures = [
             "|".join(
@@ -8129,7 +8145,7 @@ finally:
                 "missing_spatial_operation_provenance"
                 if missing_provenance
                 else "all_creative_fallback"
-                if all_creative_fallback and not override_enabled
+                if all_creative_fallback and disallow_fallback
                 else "none"
             ),
         })
@@ -8196,8 +8212,8 @@ finally:
         pre_admit = None
         if candidate_values is not None:
             def check_guards() -> bool:
-                if self._allow_creative_fallback_admission:
-                    kg_record["allow_creative_fallback_admission"] = True
+                if self._disallow_creative_fallback_admission:
+                    kg_record["disallow_creative_fallback_admission"] = True
                 provenance_passed = self._stamp_candidate_provenance(
                     kg_record,
                     scratch_dir=scratch_dir,
