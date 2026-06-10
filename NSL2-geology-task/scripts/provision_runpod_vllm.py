@@ -48,6 +48,15 @@ PINNED_VLLM_IMAGE = "vllm/vllm-openai:v0.20.2"
 DEFAULT_MODEL = "QuantTrio/gemma-4-31B-it-AWQ"
 GPU_TYPE_L40S = "NVIDIA L40S"  # exact gpuTypeId from RunPod gpuTypes()
 
+# AMD / ROCm path — for the MI300X throughput-per-dollar pilot (192 GB VRAM to attack the
+# re-prefill waste; see docs/design/throughput-per-dollar-and-mi300x-pilot-2026-06-10.md).
+# The CUDA image + cuda guard do NOT apply on AMD: pass --image ROCM_VLLM_IMAGE,
+# --allowed-cuda-versions with NO values (drops the guard), and --kv-cache-dtype auto (fp16 KV;
+# 192 GB has the room, and ROCm fp8-KV is unproven). VERIFY the exact gpuTypeId via gpuTypes()
+# before launch — RunPod has listed both "AMD Instinct MI300X" and "...MI300X OAM".
+ROCM_VLLM_IMAGE = "rocm/vllm:latest"
+GPU_TYPE_MI300X = "AMD Instinct MI300X OAM"
+
 
 def _bearer(vllm_key: str | None) -> dict[str, str]:
     return {"Authorization": f"Bearer {vllm_key}"} if vllm_key else {}
@@ -95,8 +104,16 @@ def _docker_args(args: argparse.Namespace) -> str:
     # --max-num-batched-tokens stays >= 2496 (gemma-4 multimodal floor) but is
     # NOT the local box's crippled 4096 decode-starvation hack — the L40S has KV
     # headroom for a healthy prefill budget.
+    # serve_cmd prefix: the NVIDIA vllm/vllm-openai image has ENTRYPOINT
+    # `python3 -m vllm.entrypoints.openai.api_server`, so docker_args are bare flags. ROCm
+    # nightly images (rocm/vllm-dev:nightly_*) have CMD ["/bin/bash"] and NO server entrypoint,
+    # so docker_args must START with the server command. Pass
+    # --serve-cmd "python3 -m vllm.entrypoints.openai.api_server" for those. RunPod injects the
+    # AMD devices (kfd/dri) for AMD gpu-types, so no --device flags are needed here.
+    prefix = args.serve_cmd.split() if getattr(args, "serve_cmd", None) else []
     return " ".join(
-        [
+        prefix
+        + [
             "--model", args.model,
             "--host", "0.0.0.0",
             "--port", "8000",
@@ -125,10 +142,13 @@ def _compile_args(args: argparse.Namespace) -> list[str]:
     History: --enforce-eager was hardcoded here (commit 0e1c001, 2026-06-03) purely to
     dodge cold-boot cost on ephemeral pods ("fresh pod has no compile cache => default
     compilation adds minutes + OOM risk"), NOT to fix a crash. Its comment guessed eager
-    cost "~10-20% decode". A live /metrics measurement (2026-06-08, see memory
-    h200-decode-duty-cycle-5pct) showed the real cost is ~20x: the eager engine loop on
-    this 60-layer Gemma-4 AWQ+LoRA stack is CPU-launch-bound (~hundreds of kernel launches
-    per decode step), running at ~5% of the bandwidth roofline. So eager is now OPT-IN.
+    cost "~10-20% decode". A 2026-06-08 /metrics read first looked like ~20x (the eager decode
+    loop is CPU-launch-bound), but the 2026-06-10 throughput/$ analysis CORRECTED this: the
+    workload is PREFILL-time-dominated (~84:1 input:output; each step is mostly a chunked-prefill
+    of ~10K-tok prompts), so eager's real penalty is the decode SLICE only — ~10-25% overall, not
+    20x (decode is ~5% of GPU-time). cudagraph is therefore a minor, risk-gated lever (GH#32834
+    awq_marlin full-graph crash, GH#39914 gemma-4 >4K-prefill hang), and --enforce-eager is a safe
+    default. See docs/design/throughput-per-dollar-and-mi300x-pilot-2026-06-10.md. Eager is OPT-IN.
 
       --enforce-eager      : disable BOTH torch.compile and cudagraphs. Fast, OOM-safe cold
                              boot; cripples decode throughput. Keep for boot-constrained or
@@ -210,7 +230,7 @@ def cmd_up(args: argparse.Namespace) -> int:
             image_name=args.image,
             gpu_type_id=args.gpu_type,
             cloud_type=args.cloud,
-            allowed_cuda_versions=args.allowed_cuda_versions,
+            allowed_cuda_versions=args.allowed_cuda_versions or None,  # None on AMD (empty list)
             gpu_count=1,
             container_disk_in_gb=args.container_disk,
             min_vcpu_count=8,
@@ -225,12 +245,13 @@ def cmd_up(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001 — surface RunPod stock/quota errors plainly
         print(f"ERROR: create_pod failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        print("  (L40S may be out of stock in the selected cloud — retry or try --cloud COMMUNITY)", file=sys.stderr)
+        print(f"  ({args.gpu_type} may be out of stock in {args.cloud} — retry or try --cloud COMMUNITY)", file=sys.stderr)
         return 1
 
     pod_id = pod.get("id")
-    rate = 0.86 if args.cloud == "SECURE" else 0.79
-    print(f"\n  POD ID: {pod_id}   (~${rate:.2f}/hr while running — `down {pod_id}` to stop billing)\n")
+    # The estimate is GPU-dependent; `status {pod_id}` prints the real costPerHr from RunPod.
+    print(f"\n  POD ID: {pod_id}   (billing now — `status {pod_id}` shows the real $/hr; "
+          f"`down {pod_id}` stops billing)\n")
 
     # Phase 1: wait for the pod to be RUNNING with a public TCP mapping for 8000.
     ip = port = None
@@ -271,7 +292,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     print(f"base_url : {base_url}")
     print("\nPaste into the run config (key stays in env via api_key_env):\n")
     print("[[vllm.endpoints]]")
-    print('id          = "runpod-l40s-1"')
+    print(f'id          = "{args.name}"')
     print(f'base_url    = "{base_url}"')
     print(f"capacity    = {args.capacity}")
     print('api_key_env = "RUNPOD_VLLM_KEY"')
@@ -323,12 +344,14 @@ def main() -> int:
     up.add_argument("--gpu-type", default=GPU_TYPE_L40S)
     up.add_argument("--cloud", default="SECURE", choices=["SECURE", "COMMUNITY", "ALL"],
                     help="SECURE (~$0.86/hr, stable IP) vs COMMUNITY (~$0.79/hr, IP may change on restart)")
-    up.add_argument("--allowed-cuda-versions", nargs="+", default=["13.0"],
-                    help="REQUIRED guard: only land on hosts whose driver supports these CUDA "
+    up.add_argument("--allowed-cuda-versions", nargs="*", default=["13.0"],
+                    help="NVIDIA-only guard: only land on hosts whose driver supports these CUDA "
                          "versions. The pinned v0.20.2 image ships CUDA 13 / PyTorch 2.11, which "
                          "hard-crashes at EngineCore init on an older driver ('NVIDIA driver too "
                          "old (found version 12040)' = CUDA 12.4). Community hosts are a driver "
-                         "lottery, so default to ['13.0']. Widen only if you pin an older image.")
+                         "lottery, so default to ['13.0']. Widen only if you pin an older image. "
+                         "On an AMD/ROCm pod (MI300X) pass it with NO values "
+                         "(--allowed-cuda-versions) to DROP the guard — CUDA is meaningless there.")
     up.add_argument("--capacity", type=int, default=16, help="endpoint pool capacity to print in the TOML block")
     up.add_argument("--max-num-seqs", type=int, default=18, help="vLLM concurrent seqs (>= capacity + slack)")
     up.add_argument("--max-model-len", type=int, default=65536)
@@ -338,11 +361,17 @@ def main() -> int:
                     help="fp8(=e4m3) needs Ada/Hopper sm_89+ (L40S/4090). On Ampere sm_86 (A40) "
                          "use 'auto' (fp16 KV): e4m3 fails the arch check AND fp8_e5m2 trips an "
                          "attention-backend assert (allows only fp8/e4m3/nvfp4) in v0.20.2.")
+    up.add_argument("--serve-cmd", default=None,
+                    help="Command PREFIX prepended to the vLLM flags, for images WITHOUT an "
+                         "api_server ENTRYPOINT. NVIDIA vllm/vllm-openai needs none (entrypoint runs "
+                         "the server). ROCm nightly (rocm/vllm-dev:nightly_*) has CMD /bin/bash, so "
+                         "pass --serve-cmd 'python3 -m vllm.entrypoints.openai.api_server'.")
     up.add_argument("--gpu-mem-util", type=float, default=0.92)
     up.add_argument("--enforce-eager", action="store_true",
                     help="OPT-IN: disable torch.compile + cudagraphs. Default is GRAPHS-ON "
-                         "(omit this flag). Eager cripples decode (~5%% duty, ~20x slower per "
-                         "h200-decode-duty-cycle-5pct); keep only for boot-constrained pods.")
+                         "(omit this flag). Eager penalty is the decode slice only (~10-25%%, "
+                         "NOT 20x — the workload is prefill-dominated); a safe default on "
+                         "cudagraph-risky stacks (AWQ GH#32834, ROCm). See the 2026-06-10 doc.")
     up.add_argument("--compilation-config", default=None,
                     help="Raw COMPACT JSON passthrough to vLLM --compilation-config (no spaces; "
                          "docker_args is space-joined). Fallback ladder for the awq_marlin "

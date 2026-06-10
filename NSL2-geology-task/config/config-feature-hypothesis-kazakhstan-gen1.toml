@@ -50,7 +50,7 @@ min_healthy_endpoint_capacity = 4
 [[vllm.endpoints]]
 id          = "runpod-h100nvl-1"
 base_url    = "http://205.196.17.170:18523"           # H100 NVL secure pod 91z2f6nqwhly9k ($3.19/hr, 3.9TB/s)
-capacity    = 92                                      # H100 NVL 94GB secure; max_num_seqs=128 on the pod
+capacity    = 80                                      # H100 NVL 94GB secure; 92→80 (2026-06-09 15:46) to cut endpoint-capacity-floor aborts
 api_key_env = "RUNPOD_VLLM_KEY"
 
 [task]
@@ -105,7 +105,10 @@ container_rebuild_interval = 10
 # bandwidth than the H200's 143GB) — watch live /metrics KV% + preemption and dial back toward
 # ~72 only if it saturates. HOST (32 cores / 125GB, ~276 containers @ 92) still fits.
 # max_num_seqs=128 ≥ 92, so no re-provision needed. (H100 NVL chosen for best bandwidth/$.)
-parallel_episodes = 92
+# 92→80 (2026-06-09 15:46): run-4 hit recurring endpoint_capacity_floor aborts (~every 3h) from
+# inference 600s-timeouts→sole-endpoint quarantine under load; 80 gives KV/decode headroom (~0.72
+# vs 0.84) to cut timeouts while still saturating 3.9 TB/s. Supervisor auto-recovers any that remain.
+parallel_episodes = 80
 target_training_rows = 4500
 max_episodes = 10000
 max_bootstrap_episodes = 20
