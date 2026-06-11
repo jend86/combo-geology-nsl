@@ -1,5 +1,7 @@
 import datetime
 import json
+import os
+import uuid
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -52,9 +54,21 @@ def save_generation_checkpoint(
     checkpoint: dict[str, Any],
     output_path: Path,
 ) -> None:
+    # Atomic write: a partial checkpoint.json must never be observable on disk
+    # (the live process reloads it on resume, and the 60s remote->local rsync
+    # mirror can capture it mid-write). Write a temp sibling then os.replace —
+    # the same pattern as run_train_loop.py's _write_run_doc.
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(checkpoint, handle, indent=2, default=str)
+    temp_path = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(checkpoint, handle, indent=2, default=str)
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 def load_generation_checkpoint(output_path: Path) -> dict[str, Any] | None:
