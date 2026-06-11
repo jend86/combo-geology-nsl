@@ -1,12 +1,12 @@
-"""Feature hypothesis task for the Coe Fairbairn (Western Australia) gold dataset.
+"""Feature hypothesis task for the Coe Fairbairn (Western Australia) exploration dataset.
 
-Agents explore the Coe Fairbairn (WA) gold exploration dataset, hypothesise about
+Agents explore the Coe Fairbairn (WA) mineral exploration dataset, hypothesise about
 informative feature layers, write code to test hypotheses, and have features
 evaluated via BIC on ridge CV.
 
 Sibling of tasks.feature_hypothesis_kazakhstan — same workflow + dedup gate +
 bootstrap permit machinery; only the grid spec, system prompt, dataset overview,
-source-file rotation, commodity vocabulary, and default paths differ.
+source-file rotation, domain vocabulary, and default paths differ.
 
 Architecture:
 - Hypothesis Agent: Survey → Hypothesise → (wait) → Translate
@@ -191,7 +191,7 @@ _NEAR_DUPLICATE_JACCARD_THRESHOLD = 0.15
 _DEGENERATE_FILL_FRACTION = 0.95
 
 
-# Coe Fairbairn (Western Australia) grid specification — deposit-scale gold project.
+# Coe Fairbairn (Western Australia) grid specification — deposit-scale exploration project.
 # Origin/maximum enclose the five tenement polygons + all geochem points
 # (data bbox lon 117.846–117.966, lat −27.410 to −27.300; P20-M reaches −27.441).
 _AUSTRALIA_COE_GRID = {
@@ -202,35 +202,33 @@ _AUSTRALIA_COE_GRID = {
 }
 
 
-_SYSTEM_PROMPT = """You are analyzing the Coe Fairbairn gold project (Murchison goldfield, Western Australia).
+_SYSTEM_PROMPT = """You are analyzing Western Australian mineral exploration data.
 
 Grid: lon 117.832–117.973°E, lat 27.441–27.300°S, depth 0–80m (200×200×8 voxels, ~70m/voxel).
 
 Feature success uses the real lift gate: once enough admitted layers exist, adding the candidate must improve held-out MAE/lift. Crossbreed KG admission is stricter: the lift-success candidate must also improve raw BIC (`bic_delta < 0`).
 
-Optimize for success first and KG admission second, but match spatial support to the geological claim. Broad surfaces are appropriate only when evidence and mechanism justify regional support; sparse localized layers are appropriate for deposit-scale controls (shears, lodes, supergene blankets, calcrete gold).
+Optimize for success first and KG admission second, but match spatial support to the geological claim. Project-scale surfaces are appropriate only when evidence and mechanism justify broad support; sparse localized layers are acceptable when the theory is localized.
 """
 
 
 _DATASET_OVERVIEW = """## Coe Fairbairn (WA) Dataset Overview
 
-A deposit-scale GOLD dataset for five adjacent Western Australian tenements (WAMEX
-public exploration data). Two corpus classes: a structured geochemistry backbone
-(the primary, quantitative source) and per-tenement report bundles for lithology,
-structure, and geophysics context. A good survey grounds its hypothesis in the
-geochemistry, then uses the report bundle for the geological mechanism.
+A deposit-scale Western Australian exploration dataset for five adjacent tenements
+(WAMEX public exploration data). Two corpus classes are available: structured
+geochemistry tables and per-tenement report bundles for lithology, structure,
+alteration, and geophysics context. A useful survey samples both tabular and
+report evidence.
 
-**Tabular geochemistry (CSV) — /workspace/input/amalgamated_csvs/ (START HERE):**
+**Tabular geochemistry (CSV) — /workspace/input/amalgamated_csvs/:**
 - geochemDrillhole.csv: 1,297 drillhole assay rows. Columns: longitude, latitude,
   maxdepth_drill (per-HOLE depth in metres — there is NO per-sample depth),
   holeid_drill, collarid, holetype, tenement, plus 80+ element assays: au_ppm,
   as_ppm, sb_ppm, w_ppm, ag_ppm, cu_ppm, pb_ppm, zn_ppm, … (selected_element=au_ppm).
-- geochemSurface.csv: 3,711 surface samples (SOIL + ROCKCHIP) with the same element
-  columns at surface coordinates. Best for near-surface anomalies, gossans, and
-  calcrete/laterite gold haloes.
-- minedex.csv: 21 KNOWN Au±Ag occurrences/mines (site_title, site_commo, site_type,
-  coordinates) — ground-truth mineralisation. A layer whose anomaly coincides with
-  these sites is geologically validated.
+- geochemSurface.csv: 3,711 surface samples (SOIL + ROCKCHIP) with the same
+  multi-element columns at surface coordinates.
+- minedex.csv: 21 recorded mineral occurrences/mines with listed material, type,
+  stage, and coordinates. Useful as contextual occurrence data.
 - boundary.csv / tenements.csv: the five tenement-lease polygons and tenure metadata.
 
 **Per-tenement WAMEX report bundles (one AGENT_GUIDE per tenement):**
@@ -240,8 +238,9 @@ geochemistry, then uses the report bundle for the geological mechanism.
   chunks (index.json + chunk text) plus some *.description.md figure summaries —
   narrative lithology, structure, alteration, and geophysics.
 
-**Commodity & setting:** Orogenic / greenstone-hosted GOLD (Murchison goldfield,
-Archean Youanmi Terrane). Pathfinders: As, Sb, W, Bi, Te, Ag, Cu, Pb, Zn, Mo.
+**Setting:** Archean greenstone / Murchison-region exploration setting. Reports
+include lithology, structure, alteration, and geophysical context; tables provide
+coordinates and multi-element assay observations.
 
 **Scale & depth note:** Each voxel covers ~70 m × 79 m × 10 m (deposit-scale).
 Drillhole rows carry only a per-hole maxdepth_drill, so a sample's true depth is
@@ -269,36 +268,35 @@ _AUSTRALIA_SOURCE_FILES = [
         "key": "tenement_e20_a",
         "path": "E_20_tenement_A_bundle/AGENT_GUIDE_e20_tenementA.md",
         "description": (
-            "E20 tenement A (Coe / Cuddingwarra-Wattagee) WAMEX knowledge base: a "
-            "reports table + where-to-start guide. Cross-reference amalgamated_csvs/"
-            "geochemDrillhole.csv & geochemSurface.csv for this area's Au assays."
+            "E20 tenement A (Coe / Cuddingwarra-Wattagee) WAMEX knowledge base: "
+            "reports table and where-to-start guide for lithology, structure, "
+            "alteration, geophysics, and local report context."
         ),
     },
     {
         "key": "tenement_e20_d",
         "path": "E_20_tenement_D_bundle/AGENT_GUIDE_e20_tenement_D.md",
         "description": (
-            "E20 tenement D WAMEX knowledge base: reports table + where-to-start "
-            "guide. Largest surface-geochem coverage in the project; cross-reference "
-            "the amalgamated_csvs/ assays and minedex.csv known occurrences."
+            "E20 tenement D WAMEX knowledge base: reports table and where-to-start "
+            "guide for local exploration history, mapped geology, and report context."
         ),
     },
     {
         "key": "tenement_m20_k",
         "path": "M_20_tenement_K_bundle/AGENT_GUIDE_M20_tenement_K.md",
         "description": (
-            "M20 tenement K (mining lease) WAMEX knowledge base: reports table + "
-            "where-to-start guide. Hosts most of the 21 known Au+/-Ag occurrences in "
-            "minedex.csv; cross-reference the drillhole assays here."
+            "M20 tenement K (mining lease) WAMEX knowledge base: reports table "
+            "and where-to-start guide for local exploration history, mapped geology, "
+            "and supporting report context."
         ),
     },
     {
         "key": "tenement_m20_l",
         "path": "M_20_tenement_L_bundle/AGENT_GUIDE_M20_tenement_L.md",
         "description": (
-            "M20 tenement L (mining lease) WAMEX knowledge base: reports table + "
-            "where-to-start guide. Strong drillhole + surface coverage; "
-            "cross-reference amalgamated_csvs/ assays."
+            "M20 tenement L (mining lease) WAMEX knowledge base: reports table "
+            "and where-to-start guide for lithology, structure, alteration, "
+            "geophysics, and report context."
         ),
     },
     {
@@ -306,8 +304,8 @@ _AUSTRALIA_SOURCE_FILES = [
         "path": "P_20_tenement_M_bundle/AGENT_GUIDE_P20_tenement_M.md",
         "description": (
             "P20 tenement M (prospecting licence) WAMEX knowledge base: reports "
-            "table + where-to-start guide. Southern extent of the project area; "
-            "cross-reference amalgamated_csvs/ assays."
+            "table and where-to-start guide for the southern project area, mapped "
+            "geology, and report context."
         ),
     },
 ]
@@ -774,10 +772,10 @@ class ExperimentReasoningRows:
         survey_context = self._survey_context(survey_row)
         if survey_row is explore_row and parent_ids:
             survey_context = (
-                "Coe Fairbairn (WA) dataset context: drillhole + surface gold "
-                "geochemistry (amalgamated_csvs/), known Au occurrences (minedex), "
+                "Coe Fairbairn (WA) dataset context: drillhole and surface "
+                "multi-element geochemistry tables, recorded occurrence data, "
                 "tenement boundaries, and per-tenement WAMEX exploration report "
-                "bundles (lithology, structure, geophysics)."
+                "bundles covering lithology, structure, alteration, and geophysics."
             )
 
         # Lift the source the agent read (assignment + pre-read sample, optionally
@@ -2490,7 +2488,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
     """Feature hypothesis discovery task."""
     
     name = "feature-hypothesis-australia"
-    description = "Discover informative feature layers from Australia Coe Fairbairn geological data through hypothesis-driven exploration."
+    description = "Discover informative feature layers from Coe Fairbairn geological data through hypothesis-driven exploration."
     metric_name = "bic_improvement"
     metric_unit = "nats"
     higher_is_better = False  # Lower BIC is better
@@ -2525,7 +2523,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
         )
         # Minimum admitted layers before survey may hand off to crossbreed AND
         # before greedy BIC init runs. 0 = source-coverage alone gates the
-        # transition (legacy). A higher floor keeps survey blanketing the basin
+        # transition (legacy). A higher floor keeps survey covering the project
         # until the pool is deep enough that greedy/crossbreed start from a rich
         # basis rather than ~4 layers. See list_variations / the greedy gate.
         self._min_features = int(task_config.get("min_features", 0))
@@ -2580,7 +2578,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
         return [
             FeatureHypothesisAustraliaVariation(
                 name="coe_fairbairn",
-                description="Coe Fairbairn (WA) - discover gold-prospectivity feature layers from drillhole/surface geochemistry and WAMEX reports.",
+                description="Coe Fairbairn (WA) - discover project-scale geological features from geochemistry and WAMEX reports.",
                 dataset_dir=str(self._dataset_dir),
                 store_dir=str(self._store_dir / "coe_fairbairn"),
                 kg_dir=str(self._kg_dir / "coe_fairbairn"),
@@ -2606,7 +2604,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
         # Check existing features to decide workflow. Crossbreeding is gated on
         # FULL source coverage + greedy BIC initialisation (rabbit-hole-bias fix,
         # ported from JenD86/file-rotation@72e3239): the -1.0 first-layer BIC
-        # sentinel used to flip the pipeline to crossbreed after only ~5/18
+        # sentinel used to flip the pipeline to crossbreed before full source
         # sources, collapsing the pool to a single hypothesis family.
         n_features = self._count_features(variation)
         all_sources_done = self._all_sources_visited(variation.kg_dir)
@@ -2899,7 +2897,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
                         "     A constant value discards your analysis and yields a flat presence mask.\n"
                         "   - CONTINUOUS-FIELD DELIVERABLE (preferred for gradients / smooth structure): build a 3-D\n"
                         "     numpy array named EXACTLY `value_grid` of shape (200, 200, 8) -- your interpolated /\n"
-                        "     kernel-density / distance-to-contact / prospectivity field over the basin (axes: lon\n"
+                        "     kernel-density / distance-to-contact / prospectivity field over the project grid (axes: lon\n"
                         "     index, lat index, depth index). It is auto-saved; the Translate phase deposits it\n"
                         "     verbatim as a CONTINUOUS layer. Use this to express a real distribution, not presence\n"
                         "     points.\n"
@@ -2976,7 +2974,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
                         "   **For text-based locations without coordinates:**\n"
                         "   1. Extract spatial references from analysis: formation names, map sheets, localities\n"
                         "   2. Use search tools as needed (no fixed call budget):\n"
-                        "      • search_web_geological('Cuddingwarra gold mining centre Western Australia')\n"
+                        "      • search_web_geological('Cuddingwarra Western Australia geology')\n"
                         "      • search_geonames_lookup('Cue', 'Australia')\n"
                         "   3. If search yields coordinates → use them\n"
                         "   4. If search fails or is ambiguous → BE CREATIVE and make geological sense:\n"
@@ -2997,7 +2995,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
                         "   B. geometry records:   spatial_upsert_geometry_batch(name='name', artifact_name='auto')\n"
                         "                          → scoring_create_feature_layer(name='name')  ← REQUIRED!\n"
                         "   \n"
-                        "Focus on regional geological intelligence for Australia basin analysis!"
+                        "Focus on project-scale geological evidence for the Coe Fairbairn project area."
                     ),
                     context_mode="isolated",
                     inherit_all_capabilities=False,
@@ -3492,7 +3490,7 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "Search query (e.g., 'Cuddingwarra gold mining centre Western Australia')"
+                            "description": "Search query (e.g., 'Cuddingwarra Western Australia geology')"
                         },
                     },
                     "required": ["query"],
@@ -3780,7 +3778,7 @@ except Exception as user_code_error:
 
         Property lists and counts here are surfaced directly to the coding
         agent — they must match the on-disk schemas. The geochemistry CSVs in
-        amalgamated_csvs/ are the primary quantitative source; the per-tenement
+        amalgamated_csvs/ provide structured observations; the per-tenement
         WAMEX bundles supply lithology / structure / geophysics context. Keep
         the column lists honest so the agent doesn't hallucinate fields.
         """
@@ -3807,7 +3805,7 @@ except Exception as user_code_error:
                     "sample as near-surface or use maxdepth_drill for depth_m. Use "
                     "pandas/polars read_csv(full_path); aggregate per voxel before mapping."
                 ),
-                "description": "Drillhole geochemistry — Au + 80 pathfinder elements (PRIMARY)",
+                "description": "Drillhole geochemistry — multi-element assay table",
             },
             {
                 "file": "amalgamated_csvs/geochemSurface.csv",
@@ -3822,10 +3820,10 @@ except Exception as user_code_error:
                 ],
                 "note": (
                     "3,711 surface samples (SOIL + ROCKCHIP) with the same element columns at "
-                    "surface coordinates (depth_m approx. 0). Best for near-surface anomalies, "
-                    "gossans, and calcrete/laterite gold haloes."
+                    "surface coordinates (depth_m approx. 0). Useful for comparing near-surface "
+                    "assay patterns with mapped and report context."
                 ),
-                "description": "Surface geochemistry — soil/rockchip Au + pathfinders",
+                "description": "Surface geochemistry — soil/rockchip multi-element assay table",
             },
             {
                 "file": "amalgamated_csvs/minedex.csv",
@@ -3837,11 +3835,11 @@ except Exception as user_code_error:
                     "site_commo", "site_type_", "site_stage", "target_com",
                 ],
                 "note": (
-                    "21 KNOWN Au+/-Ag occurrences/mines (GSWA MINEDEX) — ground-truth "
-                    "mineralisation. A candidate layer whose anomaly coincides with these "
-                    "sites is geologically validated. Most lie within M20 tenement K."
+                    "21 recorded mineral occurrences/mines (GSWA MINEDEX) with listed material, "
+                    "site type, stage, and coordinates. Use as contextual occurrence data; "
+                    "do not treat coincidence alone as validation. Most records lie within M20 tenement K."
                 ),
-                "description": "Known gold occurrences — prospectivity ground truth",
+                "description": "Recorded mineral occurrences and mine/prospect metadata",
             },
             {
                 "file": "amalgamated_csvs/boundary.csv",
@@ -3920,8 +3918,8 @@ except Exception as user_code_error:
             "known_occurrences_minedex": 21,
             "tenement_boundaries": 5,
             "report_bundles": 5,
-            "commodity": "gold",
-            "pathfinder_elements": ["As", "Sb", "W", "Bi", "Te", "Ag", "Cu", "Pb", "Zn", "Mo"],
+            "assay_tables": 2,
+            "assay_column_family": "80+ *_ppm multi-element assay columns",
             "crs": "EPSG:4326",
         }
         return enhanced
@@ -6264,7 +6262,7 @@ finally:
             return False
 
     # Minimum visits per source file before crossbreeding is allowed.
-    # Two full rotations ensure all 18 geological domains are seen twice,
+    # Two full rotations ensure every Australia source anchor is seen twice,
     # building a more diverse root population before lineage amplification.
     _MIN_SOURCE_VISITS_BEFORE_CROSSBREED = 2
 
@@ -6616,7 +6614,7 @@ finally:
         blocks = self._assigned_source_blocks(episode_context)
         if not blocks:
             blocks = (
-                "Explore the Australia Coe Fairbairn dataset to identify a regional feature opportunity.\n"
+                "Explore the Coe Fairbairn dataset to identify a project-scale feature opportunity.\n"
             )
 
         prompt = (

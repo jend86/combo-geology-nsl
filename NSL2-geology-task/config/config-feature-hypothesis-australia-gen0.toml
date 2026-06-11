@@ -1,0 +1,139 @@
+# GEN-0 data-generation run — Coe Fairbairn (Western Australia) gold — 2026-06-11.
+#
+# First generation: BASE gemma-4 (no adapter yet). External-inference-ONLY — the
+# framework starts NO local vLLM (the presence of [[vllm.endpoints]] routes to the
+# endpoint pool; src/backend/vllm.py:965). Local Docker still runs the agent/vfm/
+# analysis harness containers; only INFERENCE is remote.
+#
+# Topology: one SECURE H100 NVL (94GB, 3.9TB/s) RunPod vLLM, 80 slots (community was dry).
+#   Provision (2nd RunPod key) — serves the base AWQ, gemma4 tool parser, enforce-eager:
+#     source ~/.config/nsl-runpod/secrets.env
+#     RUNPOD_API_KEY=<2nd key> uv run --with runpod python scripts/provision_runpod_vllm.py up \
+#       --name nsl-vllm-au-gen0 --gpu-type "NVIDIA H100 NVL" --cloud COMMUNITY \
+#       --max-num-seqs 128 --max-num-batched-tokens 4096 --enforce-eager \
+#       --capacity 80 --container-disk 80 --ready-timeout 720
+#   Then paste the printed base_url into [[vllm.endpoints]] below and:
+#     export RUNPOD_VLLM_KEY=...   # from secrets.env
+#     nix develop -c uv run python scripts/run_generation_only.py \
+#       config/config-feature-hypothesis-australia-gen0.toml --generation-id 0
+#
+# Data corrections (report-verified, 2026-06-11) are delivered to the analysis
+# container via read-only overlay mounts in the compose — the raw dataset is
+# untouched. See docs/design/australia-data-quality-audit-2026-06-11.md.
+
+model_name = "vllm:QuantTrio/gemma-4-31B-it-AWQ"
+gpu_memory_utilization = 0.90
+code_host_cache_path = "./code/feature-hypothesis-australia/code/"
+container_ids = [
+  "feature-hypothesis-australia-compose-agent-1",
+  "feature-hypothesis-australia-compose-vfm-1",
+  "feature-hypothesis-australia-compose-analysis-1",
+]
+main_container_idx = 0
+dynamic_container = true
+docker_compose_dir = "./docker/feature-hypothesis-australia-compose"
+train_data_save_folder = "./data/australia/feature-hypothesis/train_data"
+
+[inference]
+# 600 (not 300): at 80 concurrent decode streams per-stream tok/s drops; 300
+# prematurely kills episodes pre-upsert (inference-timeout-l40s-oversubscription).
+timeout = 600
+
+[vllm]
+# GEN-0 serves the BASE model (no LoRA) — the pod is launched WITHOUT --adapter-repo,
+# so the request model name is the base AWQ id (gen-1+ would use "adapter").
+served_model_name = "QuantTrio/gemma-4-31B-it-AWQ"
+# Single endpoint (external-only): any full quarantine drops healthy capacity to 0
+# and aborts via the capacity floor. 4 is the standing floor; the real resilience
+# lever is the endpoint-pool re-probe + the supervisor resume, not this number.
+min_healthy_endpoint_capacity = 4
+
+[[vllm.endpoints]]
+id          = "runpod-h100nvl-au-gen0"
+base_url    = "http://205.196.17.170:18510"   # secure H100 NVL pod nmscvm6sej4ebn (2026-06-11)
+capacity    = 80
+api_key_env = "RUNPOD_VLLM_KEY"
+
+[task]
+class = "tasks.feature_hypothesis_australia.FeatureHypothesisAustraliaTask"
+
+[task.config]
+docker_compose_dir = "./docker/feature-hypothesis-australia-compose"
+dataset_dir = "../Australian_data"
+store_dir = "./data/australia/feature-hypothesis/store"
+kg_dir = "./data/australia/feature-hypothesis/knowledge"
+variation_names = ["coe_fairbairn"]
+
+[harness]
+name = "container"
+
+[harness.container]
+profile = "aiq"
+image = "nsl/aiq:0.1.0"
+max_wall_seconds = 7200
+mem_limit = "2g"
+network_mode = "host"
+inference_transport = "tcp"
+tool_output_max_chars = 2500
+context_compaction_enabled = true
+context_compaction_trigger_tokens = 52000
+context_compaction_target_tokens = 45000
+context_compaction_keep_recent_tool_outputs = 3
+context_compaction_keep_recent_assistant_reasoning = 3
+
+[harness.container.build]
+context = "docker/aiq"
+build_args = {}
+
+[harness.container.profile_config]
+model = "nsl-feature-hypothesis-australia"
+agent_type = "tool_calling_agent"
+max_iterations = 40
+tool_call_timeout_s = 600
+function_group_name = "capabilities"
+force_tool_choice = true
+
+[generation]
+variation_strategy = "round_robin"
+generation_timeout_s = 172800  # 48 hrs — must outlast the whole gen-0 run
+max_consecutive_verification_failures = 2
+container_rebuild_interval = 10
+# 80 parallel episodes against the single H100 NVL endpoint (capacity 80).
+parallel_episodes = 80
+# target_training_rows set high so the run is bounded by EPISODES, not rows —
+# stop when the success-rate curve clearly saturates (≈800 per prior runs).
+target_training_rows = 50000
+max_episodes = 800
+# Bootstrap abort-guard: if NOTHING admits in the first 40 survey episodes the run
+# stops (a fresh task + the new degenerate-fill gate may reject more early seeds;
+# 40 gives headroom while still failing loud if the task can't seed at all).
+max_bootstrap_episodes = 40
+checkpoint_every_episode = true
+# Resume THIS run if interrupted (community pod reclaim) — fresh on first launch
+# since data/australia is empty; namespaced by --generation-id 0.
+resume_from_checkpoint = true
+generation_output_dir = "./data/australia/feature-hypothesis/generations"
+
+[training]
+# Inert: run_generation_only.py never finetunes (num_generations is ignored by it).
+base_model = "unsloth/gemma-4-31B-it-unsloth-bnb-4bit"
+max_steps = 100
+per_device_train_batch_size = 1
+gradient_accumulation_steps = 1
+learning_rate = 2e-4
+warmup_steps = 2
+max_seq_length = 2048
+adapter_output_dir = "./models/adapters/feature-hypothesis-australia"
+wandb_project = "feature-hypothesis-australia"
+gpu_wait_min_free_memory_fraction = 0.7
+
+[orchestration]
+num_generations = 1
+training_window_size = 3
+
+[observability]
+enabled = true
+record_inference = true
+record_phases = true
+record_resources = true
+load_tags = ["feature-hypothesis", "coe-fairbairn", "australia", "gen0", "base-gemma4", "bic-scoring", "external-only", "runpod-h100nvl"]

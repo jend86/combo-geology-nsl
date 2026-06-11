@@ -14,6 +14,7 @@ Run from ``NSL2-geology-task/`` with the nix-ld ``ln`` shim (numpy native libs):
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,77 @@ class TestNoRegionBleed:
         # sibling Kazakhstan class (recipe-hash provenance). Anything more is bleed.
         src = Path(m.__file__).read_text()
         assert src.count("Kazakhstan") <= 1
+
+
+class TestPromptParity:
+    """Australia prompts should match Kazakhstan's neutral source-catalog style."""
+
+    def test_system_prompt_is_not_target_recipe(self) -> None:
+        text = m._SYSTEM_PROMPT
+        lowered = text.lower()
+        assert "gold project" not in lowered
+        assert "calcrete gold" not in lowered
+        assert "supergene blankets" not in lowered
+        assert "shears, lodes" not in lowered
+        assert "western australian mineral exploration data" in lowered
+        assert "project-scale" in lowered
+
+    def test_dataset_overview_avoids_directive_targeting(self) -> None:
+        text = m._DATASET_OVERVIEW
+        for phrase in (
+            "START HERE",
+            "deposit-scale GOLD",
+            "ground-truth",
+            "geologically validated",
+            "Commodity & setting",
+            "Pathfinders:",
+        ):
+            assert phrase not in text
+        assert "multi-element" in text
+        assert "recorded mineral occurrences" in text
+
+    def test_rotation_source_descriptions_are_neutral(self) -> None:
+        text = "\n".join(str(source["description"]) for source in _SOURCES)
+        for phrase in (
+            "Au assays",
+            "known occurrences",
+            "known Au",
+            "Hosts most",
+            "Strong drillhole + surface coverage",
+        ):
+            assert phrase not in text
+        assert "WAMEX knowledge base" in text
+        assert "report context" in text
+
+    def test_workflow_prompts_use_project_not_basin_language(self) -> None:
+        task = FeatureHypothesisAustraliaTask.__new__(FeatureHypothesisAustraliaTask)
+        fallback = task._generate_explore_prompt({})
+        assert "project-scale feature opportunity" in fallback
+        assert "regional feature opportunity" not in fallback
+
+        variation = m.FeatureHypothesisAustraliaVariation(name="coe_fairbairn", description="test")
+        workflow = task._survey_workflow(variation, {})
+        all_prompts = "\n".join(step.prompt for step in workflow.steps)
+        assert "Australia basin analysis" not in all_prompts
+        assert "over the basin" not in all_prompts
+        assert "over the project grid" in all_prompts
+        assert "Coe Fairbairn project area" in all_prompts
+
+    def test_enhanced_data_spec_removes_target_recipe_language(self) -> None:
+        task = FeatureHypothesisAustraliaTask.__new__(FeatureHypothesisAustraliaTask)
+        out = task._enhance_data_spec({"files": []})
+        text = json.dumps(out, sort_keys=True)
+        for phrase in (
+            "PRIMARY",
+            "ground-truth",
+            "geologically validated",
+            "Known gold occurrences",
+            "commodity",
+            "pathfinder_elements",
+        ):
+            assert phrase not in text
+        assert "au_ppm" in text
+        assert "multi-element assay" in text
 
 
 class TestSftIdentity:

@@ -35,3 +35,10 @@ temp/
 experiments/
 playground/
 playgrounds/
+
+*.jsonl
+*.npy
+*.csv
+
+Australian_data/
+.au-*
