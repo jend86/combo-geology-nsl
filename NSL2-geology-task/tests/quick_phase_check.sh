@@ -3,12 +3,12 @@ echo "🔍 Quick Phase Transition Check"
 echo "==============================="
 
 echo "🚀 Running episode with short timeout..."
-timeout 60s uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml --rebuild-harness 2>&1 | grep -E "Phase [0-9]:|🎯 DEBUG.*scoring|scoring_create_feature_layer|submit_code|translate|rewrite" | tail -20
+timeout 60s uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml --rebuild-harness 2>&1 | grep -E "Phase [0-9]:|🎯 DEBUG.*scoring|scoring_create_feature_layer|submit_code|translate|rewrite" | tail -20
 
 echo ""
 echo "📊 Summary:"
 echo "----------"
-last_output=$(timeout 60s uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml --rebuild-harness 2>&1)
+last_output=$(timeout 60s uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml --rebuild-harness 2>&1)
 
 if echo "$last_output" | grep -q "Phase 3.*Code"; then
     echo "✅ Reached Phase 3 (Code)"

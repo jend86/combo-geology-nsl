@@ -16,7 +16,7 @@ echo ""
 
 # Run single episode with V2 workflow
 echo "🚀 Running single episode with V2 workflow..."
-uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml
+uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml
 
 echo ""
 echo "📊 Checking results..."

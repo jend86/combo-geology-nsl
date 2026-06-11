@@ -1,0 +1,66 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: docker/feature-hypothesis-australia-compose/Dockerfile.agent
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [agent-net]
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  vfm:
+    build:
+      # Context is combo-geology-nsl root (not NSL2-geology-task) so the
+      # Dockerfile can COPY voxel-features-mcp/voxel_features, which lives
+      # as a sibling of NSL2-geology-task. See Dockerfile.vfm.
+      context: ../../..
+      dockerfile: NSL2-geology-task/docker/feature-hypothesis-australia-compose/Dockerfile.vfm
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    environment:
+      - PYTHONPATH=/opt/vfm
+      - VFM_STORE_PATH=/workspace/store
+      - VFM_KG_PATH=/workspace/knowledge
+    volumes:
+      - ${FEATURE_STORE_DIR:-../../data/australia/feature-hypothesis/store}:/workspace/store:rw
+      - ${FEATURE_KG_DIR:-../../data/australia/feature-hypothesis/knowledge}:/workspace/knowledge:rw
+    tmpfs:
+      - /workspace/tmp:rw,size=1g
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+  analysis:
+    build:
+      context: ../..
+      dockerfile: docker/feature-hypothesis-australia-compose/Dockerfile.analysis
+    restart: unless-stopped
+    tty: true
+    stdin_open: true
+    networks: [task-net]
+    volumes:
+      # Resolved relative to this compose file
+      # (docker/feature-hypothesis-australia-compose/): three `..`s walk up
+      # to the repo root, where Australian_data lives as a sibling of
+      # NSL2-geology-task.
+      - ${AUSTRALIAN_DATA_DIR:-../../../Australian_data}:/workspace/input:ro
+      # Report-verified data corrections (2026-06-11), overlaid ON TOP of the
+      # read-only dataset so the ORIGINAL ../Australian_data stays pristine.
+      # File-level binds shadow just these two files (deeper dest path wins).
+      # See docs/design/australia-data-quality-audit-2026-06-11.md:
+      #   - geochemSurface au_ppm: 16 corrupt -5556 sentinels -> null
+      #   - geochemDrillhole au_ppm: 10 anumber-88396 "10LARC" holes ÷1000
+      #     (ppb mislabeled as ppm; the WAMEX report "Grade (g/t Au)" confirms)
+      - ./data-overlays/amalgamated_csvs/geochemDrillhole.csv:/workspace/input/amalgamated_csvs/geochemDrillhole.csv:ro
+      - ./data-overlays/amalgamated_csvs/geochemSurface.csv:/workspace/input/amalgamated_csvs/geochemSurface.csv:ro
+    tmpfs:
+      - /workspace/out:rw,size=512m
+    working_dir: /workspace
+    command: ["sh", "-c", "tail -f /dev/null"]
+
+networks:
+  agent-net:
+    internal: true
+  task-net:
+    internal: true

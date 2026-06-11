@@ -6,7 +6,7 @@ import re
 import sys
 
 # Run episode and capture all output
-cmd = ["uv", "run", "python", "scripts/run_episode.py", "config/config-feature-hypothesis-aiq.toml"]
+cmd = ["uv", "run", "python", "scripts/run_episode.py", "config/config-feature-hypothesis-australia.toml"]
 
 try:
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)

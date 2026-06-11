@@ -47,7 +47,7 @@ echo "------------------------------------"
 # episode does not fit in 300s. PYTHONUNBUFFERED=1: without it Python block-
 # buffers stdout through the pipe, so a timeout SIGTERM discards the whole
 # episode log and every indicator below reads as a false failure.
-PYTHONUNBUFFERED=1 timeout 900s uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml --rebuild-harness 2>&1 | tee test_output.log
+PYTHONUNBUFFERED=1 timeout 900s uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml --rebuild-harness 2>&1 | tee test_output.log
 
 echo ""
 echo "📊 Step 5: Analyze results" 

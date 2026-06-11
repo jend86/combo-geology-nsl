@@ -12,6 +12,6 @@ fi
 
 # Just run the episode
 echo "Running single episode..."
-uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml
+uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml
 
 echo "Test completed!"

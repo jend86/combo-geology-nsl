@@ -15,19 +15,19 @@ fi
 echo ""
 echo "Step 1: Building Docker containers..."
 echo "-------------------------------------"
-docker compose -f docker/feature-hypothesis-compose/docker-compose.yml build
+docker compose -f docker/feature-hypothesis-australia-compose/docker-compose.yml build
 
 # Step 2: Build harness images (if needed)
 echo ""
 echo "Step 2: Building harness images..."
 echo "----------------------------------"
-uv run python scripts/build_harness_images.py --config config/config-feature-hypothesis-aiq.toml
+uv run python scripts/build_harness_images.py --config config/config-feature-hypothesis-australia.toml
 
 # Step 3: Run the task
 echo ""
 echo "Step 3: Running feature hypothesis task..."
 echo "-----------------------------------------"
-uv run python scripts/run_episode.py --config config/config-feature-hypothesis-aiq.toml
+uv run python scripts/run_episode.py --config config/config-feature-hypothesis-australia.toml
 
 echo ""
 echo "Task completed!"

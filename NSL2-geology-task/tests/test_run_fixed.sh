@@ -17,7 +17,7 @@ echo ""
 
 # Run single episode with fixed workflow
 echo "🚀 Running single episode with fixed workflow..."
-uv run python scripts/run_episode.py config/config-feature-hypothesis-aiq.toml
+uv run python scripts/run_episode.py config/config-feature-hypothesis-australia.toml
 
 echo ""
 echo "📊 Checking results..."

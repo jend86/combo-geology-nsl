@@ -4,18 +4,18 @@
 import sys
 sys.path.append('.')
 
-from tasks.feature_hypothesis import FeatureHypothesisTask
-from tasks.feature_hypothesis import FeatureHypothesisVariation
+from tasks.feature_hypothesis_australia import FeatureHypothesisAustraliaTask
+from tasks.feature_hypothesis_australia import FeatureHypothesisAustraliaVariation
 
 # Create task with config and get workflow  
 from pathlib import Path
 
 task_config_path = Path("/home/jen/Desktop/geonsl/NSL2-geology-task/tasks/feature_hypothesis")
-task = FeatureHypothesisTask(task_config_path)
+task = FeatureHypothesisAustraliaTask(task_config_path)
 variations = task.list_variations()
 variation = variations[0]  # Get first variation
 
-if isinstance(variation, FeatureHypothesisVariation):
+if isinstance(variation, FeatureHypothesisAustraliaVariation):
     workflow = task.get_workflow(variation, crossbreed=False)
     
     print("🔍 WORKFLOW DEBUG")
@@ -37,4 +37,4 @@ if isinstance(variation, FeatureHypothesisVariation):
             prompt_mentions_mandatory = any(word in step.prompt.lower() for word in ['mandatory', 'required', 'must call'])
             print(f"   - Prompt mentions requirement: {prompt_mentions_mandatory}")
 else:
-    print("❌ Could not get FeatureHypothesisVariation")
+    print("❌ Could not get FeatureHypothesisAustraliaVariation")

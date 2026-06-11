@@ -21,7 +21,7 @@
 set -u
 cd "$(dirname "$0")"
 
-CONFIG="config/config-feature-hypothesis-aiq.toml"
+CONFIG="config/config-feature-hypothesis-australia.toml"
 KG="./data/feature-hypothesis/knowledge/coe_fairbairn/experiments.jsonl"
 MAX_EPISODES=8
 PER_EPISODE_TIMEOUT=900s
