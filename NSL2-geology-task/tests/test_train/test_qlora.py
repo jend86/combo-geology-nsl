@@ -807,6 +807,48 @@ class TestTrainSft(unittest.TestCase):
     @patch("src.train.qlora._save_training_artifact")
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
+    def test_train_sft_sets_dft_loss_type(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            self._run_train_sft(
+                train_sft,
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+                inner_loss="dft",
+            )
+
+            metadata = json.loads(
+                (output_dir.resolve() / "training_info.json").read_text()
+            )
+
+        args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(args.loss_type, "dft")
+        self.assertEqual(metadata["inner_loss"], "dft")
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
     def test_train_sft_writes_metadata(
         self,
         mock_load_base_model,
@@ -847,6 +889,7 @@ class TestTrainSft(unittest.TestCase):
         self.assertIn("training_data_paths", metadata)
         self.assertIn("exported_at", metadata)
         self.assertIn("max_steps", metadata)
+        self.assertEqual(metadata["inner_loss"], "sft")
 
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._save_training_artifact")
@@ -1059,11 +1102,14 @@ class TestTrainSft(unittest.TestCase):
                 "40",
                 "--resume-from-checkpoint",
                 "--group-by-length",
+                "--inner-loss",
+                "dft",
             ]
         )
         self.assertEqual(args.save_steps, 40)
         self.assertTrue(args.resume_from_checkpoint)
         self.assertTrue(args.group_by_length)
+        self.assertEqual(args.inner_loss, "dft")
 
     def test_train_sft_cli_multiple_training_data(self):
         """CLI should accept multiple --training-data arguments."""

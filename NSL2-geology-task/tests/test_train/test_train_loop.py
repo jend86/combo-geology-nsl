@@ -165,6 +165,7 @@ lora_alpha = 32
 seed = 3407
 rehearsal_dataset = "ClickNoow/5k-dataset-geogpt-fineweb"
 rehearsal_rows_per_epoch = 500
+inner_loss = "dft"
 gpu_wait_timeout_seconds = 90
 gpu_wait_min_free_memory_fraction = 0.85
 
@@ -196,6 +197,7 @@ training_window_size = 3
             "ClickNoow/5k-dataset-geogpt-fineweb",
         )
         self.assertEqual(config.training.rehearsal_rows_per_epoch, 500)
+        self.assertEqual(config.training.inner_loss, "dft")
 
     def test_collect_training_window_uses_latest_n_generations(self) -> None:
         from scripts.run_train_loop import _collect_training_window_paths
@@ -264,6 +266,7 @@ training_window_size = 3
             config.training.rehearsal_dataset = "ClickNoow/5k-dataset-geogpt-fineweb"
             config.training.rehearsal_rows_per_epoch = 500
             config.training.rehearsal_seed = 2026
+            config.training.inner_loss = "dft"
 
             proc = MagicMock()
             proc.stdout = iter([str(base_dir / "adapter") + "\n"])
@@ -295,6 +298,8 @@ training_window_size = 3
         self.assertIn("ClickNoow/5k-dataset-geogpt-fineweb", cmd)
         self.assertIn("--rehearsal-rows-per-epoch", cmd)
         self.assertIn("500", cmd)
+        self.assertIn("--inner-loss", cmd)
+        self.assertIn("dft", cmd)
 
     @patch("scripts.run_train_loop._invoke_train_sft")
     @patch("scripts.run_train_loop.run_generation_phase")

@@ -672,6 +672,7 @@ class AppConfig(BaseModel):
         warmup_ratio: float = 0.0
         lr_scheduler_type: str = "linear"
         weight_decay: float = 0.0
+        inner_loss: Literal["sft", "dft"] = "sft"
         lora_rank: int = 32
         lora_alpha: int = 32
         lora_dropout: float = 0.0

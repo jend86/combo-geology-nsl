@@ -18,6 +18,7 @@ DEFAULT_MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
 TrainingExportFormat = Literal["lora", "merged_16bit", "gguf"]
 ConfiguredTrainingExportFormat = Literal["auto", "lora", "merged_16bit", "gguf"]
+InnerLoss = Literal["sft", "dft"]
 SFTConfig: Any | None = None
 SFTTrainer: Any | None = None
 load_dataset: Any | None = None
@@ -821,6 +822,7 @@ def train_sft(
     save_steps: int = 0,
     resume_from_checkpoint: bool = False,
     group_by_length: bool = False,
+    inner_loss: InnerLoss = "sft",
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
@@ -934,6 +936,9 @@ def train_sft(
         **_mixed_precision_kwargs(),
         optim="paged_adamw_8bit",
     )
+    # Set post-init like group_by_length: this avoids depending on Unsloth's
+    # compiled SFTConfig wrapper accepting every upstream TRL constructor kwarg.
+    training_args.loss_type = "dft" if inner_loss == "dft" else "nll"
     # Set group_by_length AFTER construction: Unsloth's compiled SFTConfig wrapper
     # rejects it as an __init__ kwarg (TypeError) even though it is a standard
     # TrainingArguments field. The base Trainer reads args.group_by_length when it
@@ -992,6 +997,7 @@ def train_sft(
             "seed": seed,
             "row_count": row_count,
             "completion_only_loss": True,
+            "inner_loss": inner_loss,
             "masking": "completion_mask",
             "save_steps": save_steps,
             "group_by_length": group_by_length,
@@ -1062,6 +1068,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="batch similar-length rows together (needs per-device batch size > 1 "
         "to reduce padding waste on long-tailed data)",
     )
+    parser.add_argument(
+        "--inner-loss",
+        choices=("sft", "dft"),
+        default="sft",
+        help="inner-loop loss to use: standard SFT NLL or TRL Dynamic Fine-Tuning",
+    )
     return parser
 
 
@@ -1104,6 +1116,7 @@ def main(argv: list[str] | None = None) -> int:
         save_steps=args.save_steps,
         resume_from_checkpoint=args.resume_from_checkpoint,
         group_by_length=args.group_by_length,
+        inner_loss=args.inner_loss,
     )
 
     print(output_path)
