@@ -19,6 +19,7 @@ IGNORE_INDEX = -100
 TrainingExportFormat = Literal["lora", "merged_16bit", "gguf"]
 ConfiguredTrainingExportFormat = Literal["auto", "lora", "merged_16bit", "gguf"]
 InnerLoss = Literal["sft", "dft"]
+DftImpl = Literal["fused", "trl"]
 SFTConfig: Any | None = None
 SFTTrainer: Any | None = None
 load_dataset: Any | None = None
@@ -113,6 +114,12 @@ def _load_sft_classes() -> tuple[Any, Any]:
 
         SFTTrainer = _SFTTrainer
     return SFTConfig, SFTTrainer
+
+
+def _install_fused_dft() -> None:
+    from src.train.dft_fused import install_fused_dft
+
+    install_fused_dft(ignore_index=IGNORE_INDEX)
 
 
 def _load_dataset(name: str, *, split: str) -> Any:
@@ -823,6 +830,7 @@ def train_sft(
     resume_from_checkpoint: bool = False,
     group_by_length: bool = False,
     inner_loss: InnerLoss = "sft",
+    dft_impl: DftImpl = "fused",
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
@@ -835,6 +843,9 @@ def train_sft(
             "larger merged_16bit or GGUF export from the final adapter."
         )
 
+    if inner_loss == "dft" and dft_impl == "fused":
+        os.environ["UNSLOTH_ENABLE_CCE"] = "0"
+
     # Import unsloth FIRST — before trl/transformers/peft are pulled in by
     # _load_sft_classes / _load_base_model below. Unsloth patches the gemma-4
     # modeling code (incl. the VLM image-token path) at import time; if trl or
@@ -843,6 +854,9 @@ def train_sft(
     # embedding lookup). This restores the proven nsl2 import order. See memory
     # sft-qlora-prompt-completion-crash.
     import unsloth  # noqa: F401
+
+    if inner_loss == "dft" and dft_impl == "fused":
+        _install_fused_dft()
 
     if wandb_project:
         if not os.environ.get("WANDB_API_KEY"):
@@ -938,7 +952,9 @@ def train_sft(
     )
     # Set post-init like group_by_length: this avoids depending on Unsloth's
     # compiled SFTConfig wrapper accepting every upstream TRL constructor kwarg.
-    training_args.loss_type = "dft" if inner_loss == "dft" else "nll"
+    training_args.loss_type = (
+        "dft" if inner_loss == "dft" and dft_impl == "trl" else "nll"
+    )
     # Set group_by_length AFTER construction: Unsloth's compiled SFTConfig wrapper
     # rejects it as an __init__ kwarg (TypeError) even though it is a standard
     # TrainingArguments field. The base Trainer reads args.group_by_length when it
@@ -998,6 +1014,7 @@ def train_sft(
             "row_count": row_count,
             "completion_only_loss": True,
             "inner_loss": inner_loss,
+            "dft_impl": dft_impl if inner_loss == "dft" else None,
             "masking": "completion_mask",
             "save_steps": save_steps,
             "group_by_length": group_by_length,
@@ -1074,6 +1091,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="sft",
         help="inner-loop loss to use: standard SFT NLL or TRL Dynamic Fine-Tuning",
     )
+    parser.add_argument(
+        "--dft-impl",
+        choices=("fused", "trl"),
+        default="fused",
+        help=(
+            "DFT implementation: memory-efficient Unsloth fused patch or "
+            "TRL full-logit loss"
+        ),
+    )
     return parser
 
 
@@ -1117,6 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
         resume_from_checkpoint=args.resume_from_checkpoint,
         group_by_length=args.group_by_length,
         inner_loss=args.inner_loss,
+        dft_impl=args.dft_impl,
     )
 
     print(output_path)

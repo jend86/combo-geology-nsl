@@ -267,6 +267,7 @@ training_window_size = 3
             config.training.rehearsal_rows_per_epoch = 500
             config.training.rehearsal_seed = 2026
             config.training.inner_loss = "dft"
+            config.training.dft_impl = "fused"
 
             proc = MagicMock()
             proc.stdout = iter([str(base_dir / "adapter") + "\n"])
@@ -300,6 +301,8 @@ training_window_size = 3
         self.assertIn("500", cmd)
         self.assertIn("--inner-loss", cmd)
         self.assertIn("dft", cmd)
+        self.assertIn("--dft-impl", cmd)
+        self.assertIn("fused", cmd)
 
     @patch("scripts.run_train_loop._invoke_train_sft")
     @patch("scripts.run_train_loop.run_generation_phase")

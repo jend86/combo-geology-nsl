@@ -807,8 +807,10 @@ class TestTrainSft(unittest.TestCase):
     @patch("src.train.qlora._save_training_artifact")
     @patch("src.train.qlora._attach_lora_adapter")
     @patch("src.train.qlora._load_base_model")
-    def test_train_sft_sets_dft_loss_type(
+    @patch("src.train.qlora._install_fused_dft")
+    def test_train_sft_uses_fused_dft_by_default(
         self,
+        mock_install_fused_dft,
         mock_load_base_model,
         mock_attach_lora_adapter,
         mock_save_training_artifact,
@@ -828,14 +830,67 @@ class TestTrainSft(unittest.TestCase):
             output_dir = Path(tmpdir) / "adapter"
             mock_save_training_artifact.return_value = output_dir.resolve()
 
-            self._run_train_sft(
-                train_sft,
-                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
-                training_data_paths=[str(data_path)],
-                output_dir=str(output_dir),
-                max_steps=1,
-                inner_loss="dft",
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("UNSLOTH_ENABLE_CCE", None)
+                self._run_train_sft(
+                    train_sft,
+                    base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                    training_data_paths=[str(data_path)],
+                    output_dir=str(output_dir),
+                    max_steps=1,
+                    inner_loss="dft",
+                )
+                self.assertEqual(os.environ["UNSLOTH_ENABLE_CCE"], "0")
+
+            metadata = json.loads(
+                (output_dir.resolve() / "training_info.json").read_text()
             )
+
+        args = mock_sft_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(args.loss_type, "nll")
+        self.assertEqual(metadata["inner_loss"], "dft")
+        self.assertEqual(metadata["dft_impl"], "fused")
+        mock_install_fused_dft.assert_called_once()
+
+    @patch("src.train.qlora.SFTTrainer")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_keeps_trl_dft_impl_selectable(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_sft_trainer_cls,
+    ):
+        from src.train import qlora
+        from src.train.qlora import train_sft
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        mock_sft_trainer_cls.return_value = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            with patch(
+                "src.train.qlora._dataset_from_list",
+                side_effect=qlora._SimpleDataset.from_list,
+            ):
+                self._run_train_sft(
+                    train_sft,
+                    base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                    training_data_paths=[str(data_path)],
+                    output_dir=str(output_dir),
+                    max_steps=1,
+                    inner_loss="dft",
+                    dft_impl="trl",
+                )
 
             metadata = json.loads(
                 (output_dir.resolve() / "training_info.json").read_text()
@@ -844,6 +899,7 @@ class TestTrainSft(unittest.TestCase):
         args = mock_sft_trainer_cls.call_args.kwargs["args"]
         self.assertEqual(args.loss_type, "dft")
         self.assertEqual(metadata["inner_loss"], "dft")
+        self.assertEqual(metadata["dft_impl"], "trl")
 
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._save_training_artifact")
@@ -1110,6 +1166,28 @@ class TestTrainSft(unittest.TestCase):
         self.assertTrue(args.resume_from_checkpoint)
         self.assertTrue(args.group_by_length)
         self.assertEqual(args.inner_loss, "dft")
+        self.assertEqual(args.dft_impl, "fused")
+
+    def test_train_sft_cli_accepts_trl_dft_impl(self):
+        from src.train.qlora import _build_arg_parser
+
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--base-model",
+                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "--training-data",
+                "./data/sft.jsonl",
+                "--output",
+                "./adapter",
+                "--inner-loss",
+                "dft",
+                "--dft-impl",
+                "trl",
+            ]
+        )
+        self.assertEqual(args.inner_loss, "dft")
+        self.assertEqual(args.dft_impl, "trl")
 
     def test_train_sft_cli_multiple_training_data(self):
         """CLI should accept multiple --training-data arguments."""
