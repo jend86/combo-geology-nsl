@@ -6,6 +6,7 @@ import json
 import os
 import random
 from datetime import datetime, timezone
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, Sequence, cast
@@ -18,10 +19,17 @@ DEFAULT_MAX_SEQ_LENGTH = 2048
 IGNORE_INDEX = -100
 TrainingExportFormat = Literal["lora", "merged_16bit", "gguf"]
 ConfiguredTrainingExportFormat = Literal["auto", "lora", "merged_16bit", "gguf"]
-InnerLoss = Literal["sft", "dft"]
+InnerLoss = Literal["sft", "dft", "asft"]
 DftImpl = Literal["fused", "trl"]
+AsftMode = Literal["dft", "sft+kl", "asft"]
+AsftKlDirection = Literal["forward", "reverse"]
+AsftReferencePolicy = Literal["disable_adapter", "frozen_copy"]
+AsftStreamingMode = Literal["off", "auto", "batch", "seq", "hybrid"]
+AsftNormalizeBy = Literal["tokens", "weights"]
 SFTConfig: Any | None = None
 SFTTrainer: Any | None = None
+ASFTTrainer: Any | None = None
+ASFTStreamingConfig: Any | None = None
 load_dataset: Any | None = None
 SEQUENCE_FEATURE_KEYS = (
     "input_ids",
@@ -116,6 +124,29 @@ def _load_sft_classes() -> tuple[Any, Any]:
     return SFTConfig, SFTTrainer
 
 
+def _load_asft_classes() -> tuple[Any, Any, Any]:
+    global SFTConfig, ASFTTrainer, ASFTStreamingConfig
+    try:
+        if SFTConfig is None:
+            from trl.trainer.sft_config import SFTConfig as _SFTConfig
+
+            SFTConfig = _SFTConfig
+        if ASFTTrainer is None or ASFTStreamingConfig is None:
+            from unsloth.trainer import (
+                ASFTStreamingConfig as _ASFTStreamingConfig,
+                ASFTTrainer as _ASFTTrainer,
+            )
+
+            ASFTTrainer = _ASFTTrainer
+            ASFTStreamingConfig = _ASFTStreamingConfig
+    except ImportError as exc:
+        raise RuntimeError(
+            "inner_loss='asft' requires the rebased ASFT Unsloth fork. "
+            "Install/pin the forked unsloth commit before selecting ASFT."
+        ) from exc
+    return SFTConfig, ASFTTrainer, ASFTStreamingConfig
+
+
 def _install_fused_dft() -> None:
     from src.train.dft_fused import install_fused_dft
 
@@ -133,6 +164,61 @@ def _load_dataset(name: str, *, split: str) -> Any:
 
 def _export_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _package_version(distribution_name: str) -> str | None:
+    try:
+        return importlib_metadata.version(distribution_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _package_vcs_commit(distribution_name: str) -> str | None:
+    try:
+        distribution = importlib_metadata.distribution(distribution_name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+    direct_url = distribution.read_text("direct_url.json")
+    if not direct_url:
+        return None
+    try:
+        payload = json.loads(direct_url)
+    except json.JSONDecodeError:
+        return None
+    vcs_info = payload.get("vcs_info")
+    if not isinstance(vcs_info, dict):
+        return None
+    for key in ("commit_id", "requested_revision"):
+        value = vcs_info.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _training_package_versions() -> dict[str, str | None]:
+    return {
+        "unsloth_version": _package_version("unsloth"),
+        "unsloth_zoo_version": _package_version("unsloth-zoo"),
+        "trl_version": _package_version("trl"),
+        "transformers_version": _package_version("transformers"),
+        "peft_version": _package_version("peft"),
+        "torch_version": _package_version("torch"),
+        "bitsandbytes_version": _package_version("bitsandbytes"),
+        "triton_version": _package_version("triton"),
+    }
+
+
+def _unsloth_asft_fork_commit() -> str | None:
+    return os.environ.get("UNSLOTH_ASFT_FORK_COMMIT") or _package_vcs_commit("unsloth")
+
+
+def _qualified_name(obj: Any) -> str:
+    module = getattr(obj, "__module__", None)
+    name = getattr(obj, "__qualname__", None) or getattr(obj, "__name__", None)
+    if isinstance(module, str) and isinstance(name, str):
+        return f"{module}.{name}"
+    obj_type = type(obj)
+    return f"{obj_type.__module__}.{obj_type.__qualname__}"
 
 
 def _validate_training_base_model(base_model: str) -> None:
@@ -831,6 +917,14 @@ def train_sft(
     group_by_length: bool = False,
     inner_loss: InnerLoss = "sft",
     dft_impl: DftImpl = "fused",
+    asft_mode: AsftMode = "asft",
+    asft_kl_weight: float = 0.0,
+    asft_kl_direction: AsftKlDirection = "forward",
+    asft_reference_policy: AsftReferencePolicy = "disable_adapter",
+    asft_streaming: AsftStreamingMode = "off",
+    asft_ref_microbatch_size: int | None = None,
+    asft_seq_chunk_size: int | None = None,
+    asft_normalize_by: AsftNormalizeBy = "tokens",
 ) -> Path:
     """Run SFT on the provided generation window and save a trained LoRA adapter."""
 
@@ -845,6 +939,16 @@ def train_sft(
 
     if inner_loss == "dft" and dft_impl == "fused":
         os.environ["UNSLOTH_ENABLE_CCE"] = "0"
+        # Pin the fused-loss chunk count. Forcing UNSLOTH_ENABLE_CCE=0 routes DFT through
+        # Unsloth's DENSE chunked path (compute_fused_ce_loss), which materializes per-chunk
+        # [chunk, vocab] fp32 logits. Its default auto-sizer targets ~50% of *free* VRAM,
+        # which is wildly optimistic once the 31B-4bit shard fills the card → it barely chunks
+        # and OOMs (observed: a single ~6.5 GiB logits tile on a 24 GB 4090). The CCE/NLL path
+        # never hit this because it streams over vocab. UNSLOTH_CE_LOSS_N_CHUNKS is read at
+        # cross_entropy_loss import time, so it MUST be set before `import unsloth` below.
+        # 16 chunks @ seq 8192 ⇒ 512 tok/chunk ⇒ ~0.5 GiB logits/chunk; setdefault lets the
+        # launch override it. (gemma-4: vocab 262144.)
+        os.environ.setdefault("UNSLOTH_CE_LOSS_N_CHUNKS", "16")
 
     # Import unsloth FIRST — before trl/transformers/peft are pulled in by
     # _load_sft_classes / _load_base_model below. Unsloth patches the gemma-4
@@ -873,12 +977,57 @@ def train_sft(
     else:
         report_to = "none"
 
-    sft_config_cls, sft_trainer_cls = _load_sft_classes()
+    if inner_loss == "asft":
+        sft_config_cls, sft_trainer_cls, asft_streaming_config_cls = _load_asft_classes()
+    else:
+        sft_config_cls, sft_trainer_cls = _load_sft_classes()
+        asft_streaming_config_cls = None
+
+    trainer_class = _qualified_name(sft_trainer_cls)
+    package_versions = _training_package_versions()
+    logger.info(
+        "Training objective: inner_loss={}, dft_impl={}, trainer={}",
+        inner_loss,
+        dft_impl if inner_loss == "dft" else None,
+        trainer_class,
+    )
+    logger.info(
+        "Training package versions: unsloth={}, unsloth_zoo={}, trl={}, transformers={}, peft={}, torch={}",
+        package_versions["unsloth_version"],
+        package_versions["unsloth_zoo_version"],
+        package_versions["trl_version"],
+        package_versions["transformers_version"],
+        package_versions["peft_version"],
+        package_versions["torch_version"],
+    )
+    if inner_loss == "asft":
+        asft_kl_active = asft_mode in ("sft+kl", "asft") and asft_kl_weight != 0.0
+        logger.info(
+            "ASFT active: mode={}, kl_weight={}, kl_active={}, kl_direction={}, reference_policy={}, streaming={}, normalize_by={}",
+            asft_mode,
+            asft_kl_weight,
+            asft_kl_active,
+            asft_kl_direction,
+            asft_reference_policy,
+            asft_streaming,
+            asft_normalize_by,
+        )
+        if asft_mode == "asft" and asft_kl_weight == 0.0:
+            logger.warning(
+                "ASFT selected with kl_weight=0.0; this is a DFT-equivalent ablation."
+            )
 
     model, tokenizer = _load_base_model(
         base_model,
         max_seq_length=max_seq_length,
     )
+    if inner_loss == "dft" and dft_impl == "fused":
+        # Backstop: the per-model compiled module imports the loss fns by value at model-load.
+        # The source patch above runs first so it normally suffices; re-bind here in case the
+        # compiled module was already imported. The fail-loud engagement log confirms which ran.
+        from src.train.dft_fused import _repatch_generated_modules
+
+        _repatch_generated_modules()
     model = _attach_lora_adapter(
         model,
         {"rank": lora_rank, "alpha": lora_alpha, "dropout": lora_dropout},
@@ -962,6 +1111,24 @@ def train_sft(
     # stays at its "length" default, which matches the per-row length we attach.
     training_args.group_by_length = group_by_length
 
+    trainer_kwargs: dict[str, Any] = {}
+    if inner_loss == "asft":
+        assert asft_streaming_config_cls is not None
+        trainer_kwargs.update(
+            asft_enabled=True,
+            asft_mode=asft_mode,
+            kl_weight=asft_kl_weight,
+            kl_direction=asft_kl_direction,
+            reference_policy=asft_reference_policy,
+            asft_streaming=asft_streaming_config_cls(
+                mode=asft_streaming,
+                enabled=asft_streaming != "off",
+                ref_microbatch_size=asft_ref_microbatch_size,
+                seq_chunk_size=asft_seq_chunk_size,
+            ),
+            normalize_by=asft_normalize_by,
+        )
+
     trainer = sft_trainer_cls(
         model=model,
         args=training_args,
@@ -971,6 +1138,7 @@ def train_sft(
             tokenizer,
             max_seq_length=max_seq_length,
         ),
+        **trainer_kwargs,
     )
     last_checkpoint = None
     if resume_from_checkpoint:
@@ -993,42 +1161,56 @@ def train_sft(
         export_format=export_format,
         gguf_quantize=gguf_quantize,
     )
-    _write_metadata(
-        _training_metadata_path(artifact_path),
-        {
-            "base_model": base_model,
-            "max_steps": max_steps,
-            "configured_num_train_epochs": num_train_epochs,
-            "virtual_epochs": num_train_epochs,
-            "per_device_train_batch_size": per_device_train_batch_size,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
-            "learning_rate": learning_rate,
-            "warmup_steps": effective_warmup_steps,
-            "warmup_ratio": warmup_ratio,
-            "lr_scheduler_type": lr_scheduler_type,
-            "weight_decay": weight_decay,
-            "lora_rank": lora_rank,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": lora_dropout,
-            "seed": seed,
-            "row_count": row_count,
-            "completion_only_loss": True,
-            "inner_loss": inner_loss,
-            "dft_impl": dft_impl if inner_loss == "dft" else None,
-            "masking": "completion_mask",
-            "save_steps": save_steps,
-            "group_by_length": group_by_length,
-            "training_data_paths": resolved_training_paths,
-            "rehearsal_dataset": rehearsal_dataset,
-            "rehearsal_split": rehearsal_split,
-            "rehearsal_text_field": rehearsal_text_field,
-            "rehearsal_rows_per_epoch": rehearsal_rows_per_epoch,
-            "rehearsal_seed": rehearsal_seed if rehearsal_seed is not None else seed,
-            "export_format": export_format,
-            "wandb_project": wandb_project,
-            "exported_at": _export_timestamp(),
-        },
-    )
+    metadata: dict[str, Any] = {
+        "base_model": base_model,
+        "max_steps": max_steps,
+        "configured_num_train_epochs": num_train_epochs,
+        "virtual_epochs": num_train_epochs,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "learning_rate": learning_rate,
+        "warmup_steps": effective_warmup_steps,
+        "warmup_ratio": warmup_ratio,
+        "lr_scheduler_type": lr_scheduler_type,
+        "weight_decay": weight_decay,
+        "lora_rank": lora_rank,
+        "lora_alpha": lora_alpha,
+        "lora_dropout": lora_dropout,
+        "seed": seed,
+        "row_count": row_count,
+        "completion_only_loss": True,
+        "inner_loss": inner_loss,
+        "dft_impl": dft_impl if inner_loss == "dft" else None,
+        "masking": "completion_mask",
+        "save_steps": save_steps,
+        "group_by_length": group_by_length,
+        "training_data_paths": resolved_training_paths,
+        "rehearsal_dataset": rehearsal_dataset,
+        "rehearsal_split": rehearsal_split,
+        "rehearsal_text_field": rehearsal_text_field,
+        "rehearsal_rows_per_epoch": rehearsal_rows_per_epoch,
+        "rehearsal_seed": rehearsal_seed if rehearsal_seed is not None else seed,
+        "export_format": export_format,
+        "wandb_project": wandb_project,
+        "exported_at": _export_timestamp(),
+    }
+    if inner_loss == "asft":
+        metadata.update(
+            {
+                "asft_mode": asft_mode,
+                "asft_kl_weight": asft_kl_weight,
+                "asft_kl_direction": asft_kl_direction,
+                "asft_reference_policy": asft_reference_policy,
+                "asft_streaming": asft_streaming,
+                "asft_ref_microbatch_size": asft_ref_microbatch_size,
+                "asft_seq_chunk_size": asft_seq_chunk_size,
+                "asft_normalize_by": asft_normalize_by,
+                "trainer_class": trainer_class,
+                "unsloth_asft_fork_commit": _unsloth_asft_fork_commit(),
+                **package_versions,
+            }
+        )
+    _write_metadata(_training_metadata_path(artifact_path), metadata)
     return artifact_path
 
 
@@ -1087,9 +1269,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--inner-loss",
-        choices=("sft", "dft"),
+        choices=("sft", "dft", "asft"),
         default="sft",
-        help="inner-loop loss to use: standard SFT NLL or TRL Dynamic Fine-Tuning",
+        help="inner-loop loss to use: standard SFT NLL, DFT, or ASFT",
     )
     parser.add_argument(
         "--dft-impl",
@@ -1099,6 +1281,35 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "DFT implementation: memory-efficient Unsloth fused patch or "
             "TRL full-logit loss"
         ),
+    )
+    parser.add_argument(
+        "--asft-mode",
+        choices=("dft", "sft+kl", "asft"),
+        default="asft",
+        help="ASFT objective variant when --inner-loss asft is selected",
+    )
+    parser.add_argument("--asft-kl-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--asft-kl-direction",
+        choices=("forward", "reverse"),
+        default="forward",
+    )
+    parser.add_argument(
+        "--asft-reference-policy",
+        choices=("disable_adapter", "frozen_copy"),
+        default="disable_adapter",
+    )
+    parser.add_argument(
+        "--asft-streaming",
+        choices=("off", "auto", "batch", "seq", "hybrid"),
+        default="off",
+    )
+    parser.add_argument("--asft-ref-microbatch-size", type=int, default=None)
+    parser.add_argument("--asft-seq-chunk-size", type=int, default=None)
+    parser.add_argument(
+        "--asft-normalize-by",
+        choices=("tokens", "weights"),
+        default="tokens",
     )
     return parser
 
@@ -1144,6 +1355,14 @@ def main(argv: list[str] | None = None) -> int:
         group_by_length=args.group_by_length,
         inner_loss=args.inner_loss,
         dft_impl=args.dft_impl,
+        asft_mode=args.asft_mode,
+        asft_kl_weight=args.asft_kl_weight,
+        asft_kl_direction=args.asft_kl_direction,
+        asft_reference_policy=args.asft_reference_policy,
+        asft_streaming=args.asft_streaming,
+        asft_ref_microbatch_size=args.asft_ref_microbatch_size,
+        asft_seq_chunk_size=args.asft_seq_chunk_size,
+        asft_normalize_by=args.asft_normalize_by,
     )
 
     print(output_path)

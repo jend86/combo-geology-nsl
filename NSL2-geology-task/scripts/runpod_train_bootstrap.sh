@@ -28,7 +28,17 @@ do_install() {
   $PYBIN -m pip install --upgrade pip
   # Let unsloth resolve its own matched torch/transformers/peft/trl/bnb/triton set.
   # Pin bitsandbytes to the cu12-compatible 0.49.2 so a stray cu130 torch can't strand it.
-  $PYBIN -m pip install "unsloth" "bitsandbytes==0.49.2" "triton>=3.3.1"
+  local unsloth_package="unsloth"
+  if [ -n "${UNSLOTH_ASFT_PACKAGE:-}" ]; then
+    unsloth_package="$UNSLOTH_ASFT_PACKAGE"
+  elif [ -n "${UNSLOTH_ASFT_REF:-}" ]; then
+    if [ -z "${UNSLOTH_ASFT_REPO:-}" ]; then
+      echo "UNSLOTH_ASFT_REF requires UNSLOTH_ASFT_REPO, or set UNSLOTH_ASFT_PACKAGE to a full pip requirement" >&2
+      return 2
+    fi
+    unsloth_package="unsloth @ git+${UNSLOTH_ASFT_REPO}@${UNSLOTH_ASFT_REF}"
+  fi
+  $PYBIN -m pip install "$unsloth_package" "bitsandbytes==0.49.2" "triton>=3.3.1"
   # qlora.py's own non-ML deps.
   $PYBIN -m pip install python-dotenv loguru wandb hf_transfer
   phase "install done"
@@ -48,6 +58,13 @@ import transformers, trl, peft
 print("transformers", transformers.__version__, "trl", trl.__version__, "peft", peft.__version__)
 import unsloth
 print("unsloth", getattr(unsloth, "__version__", "?"))
+import importlib.metadata as im, json
+try:
+    direct_url = im.distribution("unsloth").read_text("direct_url.json")
+    vcs_info = json.loads(direct_url).get("vcs_info", {}) if direct_url else {}
+except Exception:
+    vcs_info = {}
+print("unsloth_vcs_commit", vcs_info.get("commit_id") or vcs_info.get("requested_revision") or "?")
 PY
   phase "smoke done"
 }
@@ -104,6 +121,19 @@ do_train() {
   # GROUP_BY_LENGTH=1 batches similar-length rows (use with BS>1 to cut padding waste).
   GROUP_FLAG=""
   [ -n "${GROUP_BY_LENGTH:-}" ] && GROUP_FLAG="--group-by-length"
+  INNER_LOSS="${INNER_LOSS:-sft}"
+  DFT_IMPL="${DFT_IMPL:-fused}"
+  ASFT_FLAGS=()
+  if [ "$INNER_LOSS" = "asft" ]; then
+    ASFT_FLAGS+=(--asft-mode "${ASFT_MODE:-asft}")
+    ASFT_FLAGS+=(--asft-kl-weight "${ASFT_KL_WEIGHT:-0.0}")
+    ASFT_FLAGS+=(--asft-kl-direction "${ASFT_KL_DIRECTION:-forward}")
+    ASFT_FLAGS+=(--asft-reference-policy "${ASFT_REFERENCE_POLICY:-disable_adapter}")
+    ASFT_FLAGS+=(--asft-streaming "${ASFT_STREAMING:-off}")
+    [ -n "${ASFT_REF_MICROBATCH_SIZE:-}" ] && ASFT_FLAGS+=(--asft-ref-microbatch-size "$ASFT_REF_MICROBATCH_SIZE")
+    [ -n "${ASFT_SEQ_CHUNK_SIZE:-}" ] && ASFT_FLAGS+=(--asft-seq-chunk-size "$ASFT_SEQ_CHUNK_SIZE")
+    ASFT_FLAGS+=(--asft-normalize-by "${ASFT_NORMALIZE_BY:-tokens}")
+  fi
 
   set -x
   $PYBIN "$QLORA" \
@@ -130,8 +160,11 @@ do_train() {
     --rehearsal-seed "${SEED:-3407}" \
     --wandb-project "${WANDB_PROJECT:-feature-hypothesis-kazakhstan-r128}" \
     --save-steps "${SAVE_STEPS:-0}" \
+    --inner-loss "$INNER_LOSS" \
+    --dft-impl "$DFT_IMPL" \
     $RESUME_FLAG \
     $GROUP_FLAG \
+    "${ASFT_FLAGS[@]}" \
     --export-format lora
   set +x
   phase "train done -> $OUT"

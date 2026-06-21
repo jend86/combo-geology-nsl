@@ -199,6 +199,42 @@ training_window_size = 3
         self.assertEqual(config.training.rehearsal_rows_per_epoch, 500)
         self.assertEqual(config.training.inner_loss, "dft")
 
+    def test_training_config_accepts_asft_fields(self) -> None:
+        from src.helper import unflatten_toml_dict
+        from src.typing.config import AppConfig
+
+        config_dict = toml.loads(
+            """
+model_name = "vllm:Qwen/Qwen2.5-Coder-7B-Instruct-AWQ"
+code_host_cache_path = "./code"
+container_ids = ["container-a"]
+train_data_save_folder = "./train-data"
+
+[training]
+inner_loss = "asft"
+asft_mode = "sft+kl"
+asft_kl_weight = 0.2
+asft_kl_direction = "reverse"
+asft_reference_policy = "frozen_copy"
+asft_streaming = "hybrid"
+asft_ref_microbatch_size = 3
+asft_seq_chunk_size = 256
+asft_normalize_by = "weights"
+"""
+        )
+
+        config = AppConfig(**unflatten_toml_dict(config_dict))
+
+        self.assertEqual(config.training.inner_loss, "asft")
+        self.assertEqual(config.training.asft_mode, "sft+kl")
+        self.assertEqual(config.training.asft_kl_weight, 0.2)
+        self.assertEqual(config.training.asft_kl_direction, "reverse")
+        self.assertEqual(config.training.asft_reference_policy, "frozen_copy")
+        self.assertEqual(config.training.asft_streaming, "hybrid")
+        self.assertEqual(config.training.asft_ref_microbatch_size, 3)
+        self.assertEqual(config.training.asft_seq_chunk_size, 256)
+        self.assertEqual(config.training.asft_normalize_by, "weights")
+
     def test_collect_training_window_uses_latest_n_generations(self) -> None:
         from scripts.run_train_loop import _collect_training_window_paths
 
@@ -303,6 +339,76 @@ training_window_size = 3
         self.assertIn("dft", cmd)
         self.assertIn("--dft-impl", cmd)
         self.assertIn("fused", cmd)
+
+    @patch("scripts.run_train_loop.subprocess.Popen")
+    def test_invoke_train_sft_passes_asft_flags_only_for_asft(
+        self,
+        mock_popen: MagicMock,
+    ) -> None:
+        from scripts.run_train_loop import _invoke_train_sft
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(base_dir)
+            config.training.inner_loss = "asft"
+            config.training.asft_mode = "asft"
+            config.training.asft_kl_weight = 0.25
+            config.training.asft_kl_direction = "reverse"
+            config.training.asft_reference_policy = "disable_adapter"
+            config.training.asft_streaming = "batch"
+            config.training.asft_ref_microbatch_size = 2
+            config.training.asft_seq_chunk_size = 128
+            config.training.asft_normalize_by = "weights"
+
+            proc = MagicMock()
+            proc.stdout = iter([str(base_dir / "adapter") + "\n"])
+            proc.wait.return_value = 0
+            mock_popen.return_value = proc
+
+            _invoke_train_sft(
+                config,
+                training_paths=[base_dir / "rows.jsonl"],
+                output_dir=base_dir / "adapter",
+                export_format="lora",
+            )
+
+        cmd = mock_popen.call_args.args[0]
+        self.assertIn("--inner-loss", cmd)
+        self.assertIn("asft", cmd)
+        self.assertIn("--asft-mode", cmd)
+        self.assertIn("asft", cmd)
+        self.assertIn("--asft-kl-weight", cmd)
+        self.assertIn("0.25", cmd)
+        self.assertIn("--asft-kl-direction", cmd)
+        self.assertIn("reverse", cmd)
+        self.assertIn("--asft-reference-policy", cmd)
+        self.assertIn("disable_adapter", cmd)
+        self.assertIn("--asft-streaming", cmd)
+        self.assertIn("batch", cmd)
+        self.assertIn("--asft-ref-microbatch-size", cmd)
+        self.assertIn("2", cmd)
+        self.assertIn("--asft-seq-chunk-size", cmd)
+        self.assertIn("128", cmd)
+        self.assertIn("--asft-normalize-by", cmd)
+        self.assertIn("weights", cmd)
+
+        config.training.inner_loss = "sft"
+        proc = MagicMock()
+        proc.stdout = iter([str(base_dir / "adapter") + "\n"])
+        proc.wait.return_value = 0
+        mock_popen.return_value = proc
+
+        _invoke_train_sft(
+            config,
+            training_paths=[base_dir / "rows.jsonl"],
+            output_dir=base_dir / "adapter",
+            export_format="lora",
+        )
+
+        sft_cmd = mock_popen.call_args.args[0]
+        self.assertNotIn("--asft-mode", sft_cmd)
+        self.assertNotIn("--asft-kl-weight", sft_cmd)
+        self.assertNotIn("--asft-reference-policy", sft_cmd)
 
     @patch("scripts.run_train_loop._invoke_train_sft")
     @patch("scripts.run_train_loop.run_generation_phase")

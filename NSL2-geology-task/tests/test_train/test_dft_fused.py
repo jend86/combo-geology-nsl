@@ -12,6 +12,15 @@ except Exception as exc:  # pragma: no cover - environment-dependent import guar
 else:
     TORCH_IMPORT_ERROR = None
 
+# Import cut_cross_entropy ONCE at module load. Importing it mid-process (e.g. lazily inside
+# install_fused_dft -> _cce_available during one test) re-triggers torch._inductor's TORCH_LIBRARY
+# registration and poisons later tests in the same process. In the real run Unsloth imports it
+# before our code, so this mirrors production. Guarded: it's CUDA/Triton-only.
+try:  # pragma: no cover - environment-dependent
+    import cut_cross_entropy  # noqa: F401
+except Exception:
+    pass
+
 
 IGNORE_INDEX = -100
 
@@ -60,15 +69,23 @@ def _reference_nll_loss(hidden, weight, bias, labels, *, n_items=None, softcap=3
 
 
 class TestFusedDftInstall(unittest.TestCase):
-    def test_install_fused_dft_patches_unsloth_compute_symbol(self):
-        from src.train.dft_fused import compute_fused_dft_loss, install_fused_dft
+    def test_install_fused_dft_patches_both_unsloth_symbols(self):
+        from src.train.dft_fused import (
+            compute_fused_dft_loss,
+            install_fused_dft,
+            unsloth_fused_dft_loss,
+        )
 
         ce_mod = types.ModuleType("unsloth_zoo.fused_losses.cross_entropy_loss")
 
-        def original_loss(*_args, **_kwargs):
-            raise AssertionError("original loss should be patched")
+        def original_compute(*_args, **_kwargs):
+            raise AssertionError("original compute loss should be patched")
 
-        ce_mod.compute_fused_ce_loss = original_loss
+        def original_fused(*_args, **_kwargs):
+            raise AssertionError("original fused loss should be patched")
+
+        ce_mod.compute_fused_ce_loss = original_compute
+        ce_mod.unsloth_fused_ce_loss = original_fused
         fused_losses_mod = types.ModuleType("unsloth_zoo.fused_losses")
         zoo_mod = types.ModuleType("unsloth_zoo")
 
@@ -81,8 +98,11 @@ class TestFusedDftInstall(unittest.TestCase):
             },
         ):
             install_fused_dft()
+            # Fast path (CCE) replaces unsloth_fused_ce_loss; dense fallback replaces the inner fn.
+            self.assertIs(ce_mod.unsloth_fused_ce_loss, unsloth_fused_dft_loss)
             self.assertIs(ce_mod.compute_fused_ce_loss, compute_fused_dft_loss)
-            install_fused_dft()
+            install_fused_dft()  # idempotent
+            self.assertIs(ce_mod.unsloth_fused_ce_loss, unsloth_fused_dft_loss)
             self.assertIs(ce_mod.compute_fused_ce_loss, compute_fused_dft_loss)
 
 
@@ -276,6 +296,64 @@ class TestFusedDftLoss(unittest.TestCase):
         self.assertTrue(
             torch.allclose(loss.detach(), changed_loss.detach(), rtol=1e-6, atol=1e-7)
         )
+
+
+@unittest.skipIf(
+    torch is None or not (torch is not None and torch.cuda.is_available()),
+    "CUDA + cut_cross_entropy required for the fused CCE path",
+)
+class TestUnslothFusedDftLossCCE(unittest.TestCase):
+    """The fast path: unsloth_fused_dft_loss runs CCE under NORMAL autograd (not functorch).
+
+    cut_cross_entropy is CUDA/Triton-only, so this is gated. It asserts the CCE-DFT gradient
+    equals the dense full-logit DFT reference AND differs from NLL — the same guard as the
+    dense path, on the path we actually run for speed.
+    """
+
+    def test_cce_fast_path_matches_dense_dft_and_differs_from_nll(self):
+        from src.train.dft_fused import unsloth_fused_dft_loss
+
+        dev = "cuda"
+        torch.manual_seed(11)
+        N, V, D = 256, 2048, 64
+        hidden = torch.randn(1, N, D, device=dev, dtype=torch.bfloat16)
+        weight = torch.randn(V, D, device=dev, dtype=torch.bfloat16) * 0.1
+        labels = torch.randint(0, V, (1, N), device=dev, dtype=torch.long)
+        labels[0, 5] = IGNORE_INDEX
+        labels[0, 100] = IGNORE_INDEX
+        shifted = _shift_labels(labels)
+        n_items = (shifted.view(-1) != IGNORE_INDEX).sum().to(torch.float32)
+
+        h = hidden.clone().requires_grad_(True)
+        loss = unsloth_fused_dft_loss(
+            None, h, weight, None, labels,
+            n_items=n_items, shift_labels=True,
+            logit_softcapping=30.0, ignore_index=IGNORE_INDEX,
+        )
+        loss.backward()
+        g_cce = h.grad.float().clone()
+
+        hr = hidden.float().clone().requires_grad_(True)
+        logits = torch.tanh((hr.view(-1, D) @ weight.float().t()) / 30.0) * 30.0
+        ce = torch.nn.functional.cross_entropy(
+            logits, shifted.view(-1), reduction="none", ignore_index=IGNORE_INDEX
+        )
+        loss_ref = ((-ce).exp().detach() * ce).sum() / n_items
+        loss_ref.backward()
+        g_ref = hr.grad.float().view_as(g_cce)
+
+        hn = hidden.float().clone().requires_grad_(True)
+        ln = torch.tanh((hn.view(-1, D) @ weight.float().t()) / 30.0) * 30.0
+        nll = torch.nn.functional.cross_entropy(
+            ln, shifted.view(-1), reduction="sum", ignore_index=IGNORE_INDEX
+        ) / n_items
+        nll.backward()
+        g_nll = hn.grad.float().view_as(g_cce)
+
+        scale = g_ref.abs().max().clamp_min(1e-12).item()
+        self.assertTrue(torch.allclose(loss.float(), loss_ref.float(), rtol=2e-2, atol=1e-4))
+        self.assertLess((g_cce - g_ref).abs().max().item(), max(3e-2 * scale, 1e-4))
+        self.assertGreater((g_cce - g_nll).abs().max().item(), 1e-2 * scale)
 
 
 if __name__ == "__main__":

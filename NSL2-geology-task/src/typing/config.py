@@ -672,8 +672,18 @@ class AppConfig(BaseModel):
         warmup_ratio: float = 0.0
         lr_scheduler_type: str = "linear"
         weight_decay: float = 0.0
-        inner_loss: Literal["sft", "dft"] = "sft"
+        inner_loss: Literal["sft", "dft", "asft"] = "sft"
         dft_impl: Literal["fused", "trl"] = "fused"
+        asft_mode: Literal["dft", "sft+kl", "asft"] = "asft"
+        asft_kl_weight: float = 0.0
+        asft_kl_direction: Literal["forward", "reverse"] = "forward"
+        asft_reference_policy: Literal["disable_adapter", "frozen_copy"] = (
+            "disable_adapter"
+        )
+        asft_streaming: Literal["off", "auto", "batch", "seq", "hybrid"] = "off"
+        asft_ref_microbatch_size: Optional[int] = None
+        asft_seq_chunk_size: Optional[int] = None
+        asft_normalize_by: Literal["tokens", "weights"] = "tokens"
         lora_rank: int = 32
         lora_alpha: int = 32
         lora_dropout: float = 0.0

@@ -901,6 +901,112 @@ class TestTrainSft(unittest.TestCase):
         self.assertEqual(metadata["inner_loss"], "dft")
         self.assertEqual(metadata["dft_impl"], "trl")
 
+    @patch("src.train.qlora._load_asft_classes")
+    @patch("src.train.qlora._install_fused_dft")
+    @patch("src.train.qlora._save_training_artifact")
+    @patch("src.train.qlora._attach_lora_adapter")
+    @patch("src.train.qlora._load_base_model")
+    def test_train_sft_asft_uses_asft_trainer_and_metadata(
+        self,
+        mock_load_base_model,
+        mock_attach_lora_adapter,
+        mock_save_training_artifact,
+        mock_install_fused_dft,
+        mock_load_asft_classes,
+    ):
+        from src.train import qlora
+        from src.train.qlora import train_sft
+
+        class FakeStreamingConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeASFTTrainer:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.train = MagicMock()
+
+        model = MagicMock()
+        tokenizer = self._make_tokenizer()
+        mock_load_base_model.return_value = (model, tokenizer)
+        mock_attach_lora_adapter.return_value = model
+        trainer_instance = FakeASFTTrainer()
+        fake_trainer_cls = MagicMock(return_value=trainer_instance)
+        fake_trainer_cls.__module__ = "unsloth.trainer"
+        fake_trainer_cls.__qualname__ = "ASFTTrainer"
+        mock_load_asft_classes.return_value = (
+            qlora._SimpleSFTConfig,
+            fake_trainer_cls,
+            FakeStreamingConfig,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data_path = Path(tmpdir) / "sft_training_rows.jsonl"
+            self._make_jsonl([self._make_row()], data_path)
+            output_dir = Path(tmpdir) / "adapter"
+            mock_save_training_artifact.return_value = output_dir.resolve()
+
+            self._run_train_sft(
+                train_sft,
+                base_model="Qwen/Qwen2.5-Coder-7B-Instruct",
+                training_data_paths=[str(data_path)],
+                output_dir=str(output_dir),
+                max_steps=1,
+                inner_loss="asft",
+                asft_mode="asft",
+                asft_kl_weight=0.25,
+                asft_kl_direction="reverse",
+                asft_reference_policy="disable_adapter",
+                asft_streaming="batch",
+                asft_ref_microbatch_size=2,
+                asft_seq_chunk_size=128,
+                asft_normalize_by="weights",
+            )
+
+            metadata = json.loads(
+                (output_dir.resolve() / "training_info.json").read_text()
+            )
+
+        args = fake_trainer_cls.call_args.kwargs["args"]
+        self.assertEqual(args.loss_type, "nll")
+        self.assertEqual(fake_trainer_cls.call_args.kwargs["asft_mode"], "asft")
+        self.assertEqual(fake_trainer_cls.call_args.kwargs["kl_weight"], 0.25)
+        self.assertEqual(fake_trainer_cls.call_args.kwargs["kl_direction"], "reverse")
+        self.assertEqual(
+            fake_trainer_cls.call_args.kwargs["reference_policy"],
+            "disable_adapter",
+        )
+        self.assertEqual(fake_trainer_cls.call_args.kwargs["normalize_by"], "weights")
+        streaming_config = fake_trainer_cls.call_args.kwargs["asft_streaming"]
+        self.assertEqual(
+            streaming_config.kwargs,
+            {
+                "mode": "batch",
+                "enabled": True,
+                "ref_microbatch_size": 2,
+                "seq_chunk_size": 128,
+            },
+        )
+        self.assertEqual(metadata["inner_loss"], "asft")
+        self.assertIsNone(metadata["dft_impl"])
+        self.assertEqual(metadata["asft_mode"], "asft")
+        self.assertEqual(metadata["asft_kl_weight"], 0.25)
+        self.assertEqual(metadata["asft_kl_direction"], "reverse")
+        self.assertEqual(metadata["asft_reference_policy"], "disable_adapter")
+        self.assertEqual(metadata["asft_streaming"], "batch")
+        self.assertEqual(metadata["asft_ref_microbatch_size"], 2)
+        self.assertEqual(metadata["asft_seq_chunk_size"], 128)
+        self.assertEqual(metadata["asft_normalize_by"], "weights")
+        self.assertEqual(metadata["trainer_class"], "unsloth.trainer.ASFTTrainer")
+        mock_install_fused_dft.assert_not_called()
+
+    def test_load_asft_classes_errors_without_asft_fork(self):
+        from src.train.qlora import _load_asft_classes
+
+        with patch.dict(sys.modules, {"unsloth": MagicMock()}):
+            with self.assertRaisesRegex(RuntimeError, "ASFT Unsloth fork"):
+                _load_asft_classes()
+
     @patch("src.train.qlora.SFTTrainer")
     @patch("src.train.qlora._save_training_artifact")
     @patch("src.train.qlora._attach_lora_adapter")
@@ -1188,6 +1294,48 @@ class TestTrainSft(unittest.TestCase):
         )
         self.assertEqual(args.inner_loss, "dft")
         self.assertEqual(args.dft_impl, "trl")
+
+    def test_train_sft_cli_accepts_asft_flags(self):
+        from src.train.qlora import _build_arg_parser
+
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--base-model",
+                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                "--training-data",
+                "./data/sft.jsonl",
+                "--output",
+                "./adapter",
+                "--inner-loss",
+                "asft",
+                "--asft-mode",
+                "sft+kl",
+                "--asft-kl-weight",
+                "0.2",
+                "--asft-kl-direction",
+                "reverse",
+                "--asft-reference-policy",
+                "frozen_copy",
+                "--asft-streaming",
+                "hybrid",
+                "--asft-ref-microbatch-size",
+                "3",
+                "--asft-seq-chunk-size",
+                "256",
+                "--asft-normalize-by",
+                "weights",
+            ]
+        )
+        self.assertEqual(args.inner_loss, "asft")
+        self.assertEqual(args.asft_mode, "sft+kl")
+        self.assertEqual(args.asft_kl_weight, 0.2)
+        self.assertEqual(args.asft_kl_direction, "reverse")
+        self.assertEqual(args.asft_reference_policy, "frozen_copy")
+        self.assertEqual(args.asft_streaming, "hybrid")
+        self.assertEqual(args.asft_ref_microbatch_size, 3)
+        self.assertEqual(args.asft_seq_chunk_size, 256)
+        self.assertEqual(args.asft_normalize_by, "weights")
 
     def test_train_sft_cli_multiple_training_data(self):
         """CLI should accept multiple --training-data arguments."""

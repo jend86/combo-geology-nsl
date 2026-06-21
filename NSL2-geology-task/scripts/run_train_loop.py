@@ -256,6 +256,10 @@ def _invoke_train_sft(
         training.lr_scheduler_type,
         "--weight-decay",
         str(training.weight_decay),
+        "--inner-loss",
+        training.inner_loss,
+        "--dft-impl",
+        training.dft_impl,
         "--lora-rank",
         str(training.lora_rank),
         "--lora-alpha",
@@ -283,6 +287,20 @@ def _invoke_train_sft(
             cmd += ["--rehearsal-seed", str(training.rehearsal_seed)]
     if training.wandb_project:
         cmd += ["--wandb-project", training.wandb_project]
+    if training.inner_loss == "asft":
+        cmd += ["--asft-mode", training.asft_mode]
+        cmd += ["--asft-kl-weight", str(training.asft_kl_weight)]
+        cmd += ["--asft-kl-direction", training.asft_kl_direction]
+        cmd += ["--asft-reference-policy", training.asft_reference_policy]
+        cmd += ["--asft-streaming", training.asft_streaming]
+        if training.asft_ref_microbatch_size is not None:
+            cmd += [
+                "--asft-ref-microbatch-size",
+                str(training.asft_ref_microbatch_size),
+            ]
+        if training.asft_seq_chunk_size is not None:
+            cmd += ["--asft-seq-chunk-size", str(training.asft_seq_chunk_size)]
+        cmd += ["--asft-normalize-by", training.asft_normalize_by]
     for path in training_paths:
         cmd += ["--training-data", str(path)]
 
