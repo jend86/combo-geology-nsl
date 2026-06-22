@@ -932,7 +932,7 @@ class TestTrainSft(unittest.TestCase):
         mock_attach_lora_adapter.return_value = model
         trainer_instance = FakeASFTTrainer()
         fake_trainer_cls = MagicMock(return_value=trainer_instance)
-        fake_trainer_cls.__module__ = "unsloth.trainer"
+        fake_trainer_cls.__module__ = "src.train.asft_trainer"
         fake_trainer_cls.__qualname__ = "ASFTTrainer"
         mock_load_asft_classes.return_value = (
             qlora._SimpleSFTConfig,
@@ -997,14 +997,21 @@ class TestTrainSft(unittest.TestCase):
         self.assertEqual(metadata["asft_ref_microbatch_size"], 2)
         self.assertEqual(metadata["asft_seq_chunk_size"], 128)
         self.assertEqual(metadata["asft_normalize_by"], "weights")
-        self.assertEqual(metadata["trainer_class"], "unsloth.trainer.ASFTTrainer")
+        self.assertEqual(
+            metadata["trainer_class"], "src.train.asft_trainer.ASFTTrainer"
+        )
         mock_install_fused_dft.assert_not_called()
 
-    def test_load_asft_classes_errors_without_asft_fork(self):
+    def test_load_asft_classes_errors_without_vendored_modules(self):
+        from src.train import qlora
         from src.train.qlora import _load_asft_classes
 
-        with patch.dict(sys.modules, {"unsloth": MagicMock()}):
-            with self.assertRaisesRegex(RuntimeError, "ASFT Unsloth fork"):
+        # Force the local-module import to fail and ensure the cached globals do
+        # not short-circuit the import attempt.
+        with patch.object(qlora, "ASFTTrainer", None), patch.object(
+            qlora, "ASFTStreamingConfig", None
+        ), patch.dict(sys.modules, {"src.train.asft_trainer": None}):
+            with self.assertRaisesRegex(RuntimeError, "vendored ASFT modules"):
                 _load_asft_classes()
 
     @patch("src.train.qlora.SFTTrainer")

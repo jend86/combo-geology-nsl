@@ -132,7 +132,7 @@ def _load_asft_classes() -> tuple[Any, Any, Any]:
 
             SFTConfig = _SFTConfig
         if ASFTTrainer is None or ASFTStreamingConfig is None:
-            from unsloth.trainer import (
+            from src.train.asft_trainer import (
                 ASFTStreamingConfig as _ASFTStreamingConfig,
                 ASFTTrainer as _ASFTTrainer,
             )
@@ -141,8 +141,8 @@ def _load_asft_classes() -> tuple[Any, Any, Any]:
             ASFTStreamingConfig = _ASFTStreamingConfig
     except ImportError as exc:
         raise RuntimeError(
-            "inner_loss='asft' requires the rebased ASFT Unsloth fork. "
-            "Install/pin the forked unsloth commit before selecting ASFT."
+            "inner_loss='asft' requires the vendored ASFT modules "
+            "(src/train/asft.py + src/train/asft_trainer.py); import failed."
         ) from exc
     return SFTConfig, ASFTTrainer, ASFTStreamingConfig
 
@@ -209,7 +209,17 @@ def _training_package_versions() -> dict[str, str | None]:
 
 
 def _unsloth_asft_fork_commit() -> str | None:
-    return os.environ.get("UNSLOTH_ASFT_FORK_COMMIT") or _package_vcs_commit("unsloth")
+    # Provenance of the vendored ASFT source (Approach D): prefer an explicit env
+    # override, else the commit the loss module was vendored from.
+    override = os.environ.get("UNSLOTH_ASFT_FORK_COMMIT")
+    if override:
+        return override
+    try:
+        from src.train.asft import ASFT_SOURCE_COMMIT
+
+        return ASFT_SOURCE_COMMIT
+    except Exception:
+        return _package_vcs_commit("unsloth")
 
 
 def _qualified_name(obj: Any) -> str:
