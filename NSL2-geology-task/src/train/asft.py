@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Literal, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as _grad_checkpoint
 
 from unsloth.kernels.cross_entropy_loss import Fast_CrossEntropyLoss
 from unsloth.utils.packing import mask_packed_sequence_boundaries
@@ -856,6 +857,63 @@ def _compute_kl_seq_kv_cache(
 # -----------------------------------------------------------------------------
 
 
+def _compute_kl_seq_chunked(
+    cur_logits: torch.Tensor,
+    ref_logits: torch.Tensor,
+    *,
+    model: Optional[nn.Module] = None,
+    logit_softcapping: float = 0,
+    logit_scaling: float = 0,
+    force_fp32: bool = True,
+    kl_direction: Literal["forward", "reverse"] = "forward",
+    seq_chunk_size: int = _DEFAULT_SEQ_CHUNK_SIZE,
+    checkpoint: bool = True,
+) -> torch.Tensor:
+    """Per-token KL over the sequence, computed in chunks of ``seq_chunk_size``.
+
+    ``ref_logits`` is a no-grad constant (a single full reference forward); only the
+    current-model side carries gradient. When ``checkpoint`` is set and the current logits
+    require grad, each chunk's KL is wrapped in ``torch.utils.checkpoint`` so its full-vocab
+    fp32 buffers (``effective_logits``/``log_softmax`` over the 262k vocab) are recomputed in
+    backward instead of retained — bounding both the transient (one chunk) and the retained
+    (~0) fp32 footprint, so full-vocab fp32 KL fits a 24GB GPU.
+
+    Mathematically identical to a single full ``_compute_kl_divergence`` (per-token KL is
+    independent across positions; checkpoint recompute is deterministic — no dropout/RNG).
+    Returns ``(B, T)``.
+    """
+    batch_size, seq_len, _ = cur_logits.shape
+    out = cur_logits.new_zeros((batch_size, seq_len), dtype = torch.float32)
+    use_ckpt = checkpoint and cur_logits.requires_grad
+    for start in range(0, seq_len, max(1, seq_chunk_size)):
+        end = min(start + seq_chunk_size, seq_len)
+        cur_chunk = cur_logits[:, start:end]
+        ref_chunk = ref_logits[:, start:end]
+        if use_ckpt:
+            # ref_logits comes from the reference forward run under torch.inference_mode();
+            # checkpoint SAVES its inputs for backward and inference-mode tensors cannot be
+            # saved, so clone the (chunk-sized, cheap) reference slice to a normal tensor. The
+            # current-model slice is a view of the grad-tracked logits and saves fine.
+            ref_chunk = ref_chunk.clone()
+
+            # Closure captures the non-tensor args so checkpoint only sees tensors (no
+            # "non-tensor input" warnings); recompute is exact (no RNG in the KL math).
+            def _kl_fn(cur_c, ref_c):
+                return _compute_kl_divergence(
+                    cur_c, ref_c, model, logit_softcapping, logit_scaling,
+                    force_fp32, kl_direction,
+                )
+
+            kl_chunk = _grad_checkpoint(_kl_fn, cur_chunk, ref_chunk, use_reentrant = False)
+        else:
+            kl_chunk = _compute_kl_divergence(
+                cur_chunk, ref_chunk, model, logit_softcapping, logit_scaling,
+                force_fp32, kl_direction,
+            )
+        out[:, start:end] = kl_chunk.reshape(batch_size, end - start)
+    return out
+
+
 def resolve_effective_mode(
     asft_mode: Literal["sft", "dft", "sft+kl", "asft"],
     kl_weight: float,
@@ -895,6 +953,7 @@ def compute_asft_loss(
     streaming_config: Optional[ASFTStreamingConfig] = None,
     original_model: Optional[nn.Module] = None,
     normalize_by: Literal["tokens", "weights"] = "tokens",
+    checkpoint_kl: bool = True,
     return_outputs: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
     """Compute ASFT loss.
@@ -1008,76 +1067,34 @@ def compute_asft_loss(
         token_loss = ce_losses * dft_weights
 
     elif effective_mode in ("sft+kl", "asft"):
-        # Need KL divergence
-        needs_outputs = streaming_enabled and ref_strategy == "seq_kv_cache"
+        # KL divergence to the reference policy. One full reference forward (no-grad), then the
+        # per-token KL is computed in sequence chunks, each gradient-checkpointed when
+        # ``checkpoint_kl`` is set so the full-vocab fp32 logit buffers are recomputed in
+        # backward rather than retained — this keeps gemma-4's 262k-vocab fp32 KL within a 24GB
+        # GPU. The legacy batch_micro / seq_kv_cache reference-streaming paths are subsumed by
+        # this (left defined above for reference); chunk size honours
+        # ``streaming_config.seq_chunk_size``.
         ref_forward = get_reference_forward_callable(
             model,
             reference_policy,
             original_model,
-            return_outputs = needs_outputs,
+            return_outputs = False,
         )
-
-        # Compute KL based on streaming strategy
-        # Use local variables to avoid mutating the input config
-        if streaming_enabled and ref_strategy == "batch_micro":
-            ref_microbatch_size = streaming_config.ref_microbatch_size
-            if ref_microbatch_size is None:
-                ref_microbatch_size = max(
-                    1, batch_size // _DEFAULT_REF_MICROBATCH_DIVISOR
-                )
-            kl = _compute_kl_batch_micro(
-                model,
-                logits,
-                shift_labels,
-                valid_mask,
-                ref_forward,
-                forward_inputs,
-                ref_microbatch_size,
-                logit_softcapping,
-                logit_scaling,
-                streaming_config.force_fp32_kl,
-                kl_direction,
-            )
-        elif streaming_enabled and ref_strategy == "seq_kv_cache":
-            seq_chunk_size = streaming_config.seq_chunk_size
-            if seq_chunk_size is None:
-                seq_chunk_size = _DEFAULT_SEQ_CHUNK_SIZE
-            ref_microbatch_size = streaming_config.ref_microbatch_size
-            if mode == "hybrid" and ref_microbatch_size is None:
-                ref_microbatch_size = max(
-                    1, batch_size // _DEFAULT_REF_MICROBATCH_DIVISOR
-                )
-            allow_auto_microbatch_fallback = True
-            kl = _compute_kl_seq_kv_cache(
-                model,
-                logits,
-                shift_labels,
-                valid_mask,
-                ref_forward,
-                forward_inputs,
-                seq_chunk_size,
-                microbatch_size = ref_microbatch_size,
-                allow_auto_microbatch_fallback = allow_auto_microbatch_fallback,
-                logit_softcapping = logit_softcapping,
-                logit_scaling = logit_scaling,
-                force_fp32 = streaming_config.force_fp32_kl,
-                kl_direction = kl_direction,
-            )
-        else:
-            # Full reference forward
-            ref_outputs = ref_forward(**forward_inputs)
-            ref_logits, _ = _unwrap_reference_outputs(ref_outputs)
-            kl = _compute_kl_divergence(
-                logits,
-                ref_logits,
-                model,
-                logit_softcapping,
-                logit_scaling,
-                streaming_config.force_fp32_kl,
-                kl_direction,
-            )
-            kl = kl.reshape(batch_size, seq_len)
-            del ref_logits
+        ref_outputs = ref_forward(**forward_inputs)
+        ref_logits, _ = _unwrap_reference_outputs(ref_outputs)
+        kl = _compute_kl_seq_chunked(
+            logits,
+            ref_logits,
+            model = model,
+            logit_softcapping = logit_softcapping,
+            logit_scaling = logit_scaling,
+            force_fp32 = streaming_config.force_fp32_kl,
+            kl_direction = kl_direction,
+            seq_chunk_size = streaming_config.seq_chunk_size or _DEFAULT_SEQ_CHUNK_SIZE,
+            checkpoint = checkpoint_kl,
+        )
+        kl = kl.reshape(batch_size, seq_len)
+        del ref_logits
 
         if effective_mode == "sft+kl":
             # SFT + KL

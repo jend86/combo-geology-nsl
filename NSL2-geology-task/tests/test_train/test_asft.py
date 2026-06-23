@@ -13,6 +13,7 @@ import torch
 from src.train.asft import (
     _compute_dft_weights,
     _compute_kl_divergence,
+    _compute_kl_seq_chunked,
     build_shift_labels,
     effective_logits,
     resolve_effective_mode,
@@ -101,6 +102,58 @@ class TestAsftTrainerWiring(unittest.TestCase):
         self.assertTrue(issubclass(ASFTTrainer, UnslothTrainer))
         # ASFTStreamingConfig is re-exported from the vendored loss module.
         self.assertIs(ASFTStreamingConfig, LossStreamingConfig)
+
+
+class TestKlSeqChunkedCheckpoint(unittest.TestCase):
+    """The chunked + gradient-checkpointed KL must equal the plain full KL in value and
+    gradient. This is the lever that makes gemma-4's full-vocab fp32 KL fit a 24GB GPU:
+    per-token KL is independent across positions (chunking is exact) and the checkpoint
+    recompute is deterministic (no dropout/RNG)."""
+
+    def _inputs(self):
+        torch.manual_seed(7)
+        cur = torch.randn(1, 9, 16)
+        ref = torch.randn(1, 9, 16)
+        return cur, ref
+
+    def test_chunked_equals_full_value(self):
+        cur, ref = self._inputs()
+        full = _compute_kl_divergence(cur, ref).reshape(1, 9)
+        chunked = _compute_kl_seq_chunked(cur, ref, seq_chunk_size=4, checkpoint=False)
+        self.assertEqual(tuple(chunked.shape), (1, 9))
+        self.assertTrue(torch.allclose(full, chunked, atol=1e-5))
+
+    def test_checkpoint_equals_noncheckpoint_value_and_grad(self):
+        cur, ref = self._inputs()
+        a_in = cur.clone().requires_grad_(True)
+        a = _compute_kl_seq_chunked(a_in, ref, seq_chunk_size=4, checkpoint=False)
+        (ga,) = torch.autograd.grad(a.sum(), a_in)
+        b_in = cur.clone().requires_grad_(True)
+        b = _compute_kl_seq_chunked(b_in, ref, seq_chunk_size=4, checkpoint=True)
+        (gb,) = torch.autograd.grad(b.sum(), b_in)
+        self.assertTrue(torch.allclose(a, b, atol=1e-5))
+        self.assertTrue(torch.allclose(ga, gb, atol=1e-5))
+
+    def test_checkpoint_requested_but_no_grad_is_still_correct(self):
+        # checkpoint=True but inputs don't require grad -> no checkpoint taken, value still exact.
+        cur, ref = self._inputs()
+        out = _compute_kl_seq_chunked(cur, ref, seq_chunk_size=4, checkpoint=True)
+        full = _compute_kl_divergence(cur, ref).reshape(1, 9)
+        self.assertTrue(torch.allclose(out, full, atol=1e-5))
+
+    def test_checkpoint_with_inference_mode_reference(self):
+        # The real reference forward runs under torch.inference_mode(); checkpoint must be able
+        # to save the reference slice for backward (we clone it). Regression for
+        # "Inference tensors cannot be saved for backward".
+        cur, _ = self._inputs()
+        with torch.inference_mode():
+            ref = torch.randn(1, 9, 16)
+        self.assertTrue(ref.is_inference())
+        cur_in = cur.clone().requires_grad_(True)
+        out = _compute_kl_seq_chunked(cur_in, ref, seq_chunk_size=4, checkpoint=True)
+        # backward must not raise
+        (grad,) = torch.autograd.grad(out.sum(), cur_in)
+        self.assertEqual(tuple(grad.shape), tuple(cur_in.shape))
 
 
 if __name__ == "__main__":

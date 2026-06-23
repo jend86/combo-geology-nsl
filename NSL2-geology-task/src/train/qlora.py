@@ -287,6 +287,30 @@ def _mixed_precision_kwargs() -> dict[str, bool]:
     return {"bf16": bf16, "fp16": not bf16}
 
 
+def _parse_max_memory_env() -> dict[int | str, str] | None:
+    """Optional per-device weight-placement cap, e.g. NSL_TRAIN_MAX_MEMORY="0=5GiB,1=22GiB".
+
+    Returned dict is passed straight to ``from_pretrained(max_memory=...)``, which
+    skews accelerate's ``device_map="balanced"`` placement: a LOW cap on a device
+    keeps fewer weight layers there, reserving runtime headroom. This is the lever
+    for the ASFT/KL path, whose full-vocab logits + their backward gradient pile
+    onto whichever GPU holds the ``lm_head`` — capping that GPU low pushes
+    transformer blocks onto the other GPU so the logits peak fits. Default (unset)
+    keeps the plain balanced split, so the SFT/DFT paths are unaffected.
+    """
+    raw = os.environ.get("NSL_TRAIN_MAX_MEMORY")
+    if not raw:
+        return None
+    out: dict[int | str, str] = {}
+    for pair in raw.split(","):
+        key, _, value = pair.partition("=")
+        key, value = key.strip(), value.strip()
+        if not key or not value:
+            continue
+        out[int(key) if key.isdigit() else key] = value
+    return out or None
+
+
 def _load_base_model(
     base_model: str,
     max_seq_length: int = DEFAULT_MAX_SEQ_LENGTH,
@@ -294,14 +318,20 @@ def _load_base_model(
     _validate_training_base_model(base_model)
     _cleanup_torch_cuda_state()
 
+    load_kwargs: dict[str, Any] = dict(
+        model_name=base_model,
+        max_seq_length=max_seq_length,
+        dtype=None,
+        load_in_4bit=True,
+        device_map="balanced",
+    )
+    max_memory = _parse_max_memory_env()
+    if max_memory is not None:
+        load_kwargs["max_memory"] = max_memory
+        logger.info("Skewed weight placement via NSL_TRAIN_MAX_MEMORY={}", max_memory)
+
     try:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model,
-            max_seq_length=max_seq_length,
-            dtype=None,
-            load_in_4bit=True,
-            device_map="balanced",
-        )
+        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
     except RuntimeError as exc:
         if "No config file found" in str(exc):
             examples = ", ".join(
@@ -312,6 +342,12 @@ def _load_base_model(
                 f"Use a Transformers-compatible training checkpoint or an Unsloth BnB checkpoint, for example {examples}."
             ) from exc
         raise
+    device_map_resolved = getattr(model, "hf_device_map", None)
+    if device_map_resolved:
+        per_device: dict[Any, int] = {}
+        for dev in device_map_resolved.values():
+            per_device[dev] = per_device.get(dev, 0) + 1
+        logger.info("Resolved hf_device_map module counts per device: {}", per_device)
     return model, tokenizer
 
 
