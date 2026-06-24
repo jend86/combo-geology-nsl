@@ -54,6 +54,59 @@ services:
       #     (ppb mislabeled as ppm; the WAMEX report "Grade (g/t Au)" confirms)
       - ./data-overlays/amalgamated_csvs/geochemDrillhole.csv:/workspace/input/amalgamated_csvs/geochemDrillhole.csv:ro
       - ./data-overlays/amalgamated_csvs/geochemSurface.csv:/workspace/input/amalgamated_csvs/geochemSurface.csv:ro
+      # Non-gold source patch (non-gold.zip, 2026-06-23). The 20 reports it
+      # touches already exist; 1081/1132 of its files only rewrote the JSON
+      # `source` prefix to a `non-gold/...` label the task never reads
+      # (provenance, not a path) — those inert relabels are DROPPED. Only the
+      # genuinely-different files are kept, with the provenance `source` segment
+      # STRIPPED (dataset-wide, via scripts/strip_chunk_source.py — drops the
+      # `non-gold/` label with it). Split into:
+      #   * 37 CORRECTIONS shadowed below (12 OCR content fixes + 8 repairs of
+      #     malformed-JSON `\escape` chunks live in the dataset + 17 regenerated
+      #     figure .description.md). Original ../Australian_data stays pristine.
+      #   * 12 brand-new files (assay/surface .txt, a .jpg, new .description.md)
+      #     CANNOT be file-bound under a read-only mount, so they are staged in
+      #     data-overlays/_dataset_additions/ for manual placement into the
+      #     dataset — see data-overlays/DATASET_ADDITIONS.md.
+      # Re-derive: scripts/build_nongold_overlay.py. Design doc:
+      # docs/design/australia-non-gold-overlay-2026-06-24.md
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_139.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_139.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_143.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_143.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_147.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_147.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_161.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_161.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_219.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_219.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_29.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/10996/a10996_a010996_pdf_(OCR)_chunk_29.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/11344/a11344_a011344_pdf_(OCR)_chunk_13.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/11344/a11344_a011344_pdf_(OCR)_chunk_13.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_10.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_10.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_11.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_11.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_12.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_12.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_19.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_19.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_24.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_24.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_26.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_26.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_27.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_27.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_28.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_28.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_29.json:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/A124755_v2_REPORT_chunk_29.json:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Exploration Index Map.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Exploration Index Map.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 1 _ 2/Annual Report 2020.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 1 _ 2/Annual Report 2020.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 1 _ 2/Nick's Regional Mineralisation 2.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 1 _ 2/Nick's Regional Mineralisation 2.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 3.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 3.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 4.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 4.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 5.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 3_4_5 and Table 2/Figure 5.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Emily Wells Auger Target Fig 8.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Emily Wells Auger Target Fig 8.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Figure 7.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Figure 7.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Regional Mullock Sampling, Fig 10.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figs 7_ 8_ 9_ 10./Regional Mullock Sampling, Fig 10.description.md:ro
+      - ./data-overlays/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figure 6.description.md:/workspace/input/E_20_tenement_A_bundle/wamex_downloads_E20_tenement_A/124755/Figure 6.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/2015-2016 exploration index.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/2015-2016 exploration index.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/Honeyview_regional geology plan for combined reporting.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/Honeyview_regional geology plan for combined reporting.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/Honeyview_regional location plan.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/109164/Honeyview_regional location plan.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Figure 1.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Figure 1.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 2.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 2.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 3.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 3.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 4.description.md:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/117899/Geology/Figure 4.description.md:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_19.json:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_19.json:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_26.json:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_26.json:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_4.json:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_4.json:ro
+      - ./data-overlays/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_8.json:/workspace/input/M_20_tenement_L_bundle/wamex_downloads_M20_tenement_L/64420/a64420_a064420_a64420_15224480_(OCR)_chunk_8.json:ro
     tmpfs:
       - /workspace/out:rw,size=512m
     working_dir: /workspace
